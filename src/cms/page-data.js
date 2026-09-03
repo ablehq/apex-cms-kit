@@ -237,6 +237,7 @@ export function projectBlocks(page, media) {
  * @param {unknown} page
  * @returns {{ title: string, description: string }}
  */
+/** @param {{ siteTitle?: string }} [options] */
 export function cmsPageMeta(page, options = {}) {
 	const record = /** @type {Record<string, any>} */ (page ?? {});
 	const properties = Array.isArray(record.meta_properties) ? record.meta_properties : [];
@@ -258,7 +259,8 @@ export function cmsPageMeta(page, options = {}) {
  * Nothing from the Apex record survives that is not named here.
  *
  * @param {unknown} page
- * @param {{ media?: Map<string, { url: string, alt: string, contentType: string }> }} [options]
+ * @param {{ media?: Map<string, { url: string, alt: string, contentType: string }>, siteTitle?: string }} [options]
+ *   `siteTitle` is the `<title>` fallback for a page with neither a meta title nor a title.
  */
 export function projectCmsPage(page, options = {}) {
 	const record = /** @type {Record<string, any>} */ (page ?? {});

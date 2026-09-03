@@ -179,15 +179,9 @@ export interface ApexAdminClient {
 	// Un-tagging one record is `deleteTagging`, which is correctly scoped (T7).
 
 	/** Authors / resources list. The schema filter is applied here, not by the caller. */
-	listContentLibrary(
-		slug: string,
-		query?: Record<string, string | number>
-	): Promise<ApexResponse>;
+	listContentLibrary(slug: string, query?: Record<string, string | number>): Promise<ApexResponse>;
 	getContentLibraryRecord(slug: string, id: string): Promise<ApexResponse>;
-	createContentLibraryRecord(
-		slug: string,
-		fields: ContentLibraryFields
-	): Promise<ApexResponse>;
+	createContentLibraryRecord(slug: string, fields: ContentLibraryFields): Promise<ApexResponse>;
 	updateContentLibraryRecord(
 		slug: string,
 		id: string,

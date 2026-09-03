@@ -3,7 +3,13 @@ import test from 'node:test';
 import { readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 
-import {getPageSlugValidationError, isPortableRouteSlug, isReservedSlug, normalizeSlugPath, bindReservedRoutes } from '../src/cms/page-slug-validation.js';
+import {
+	getPageSlugValidationError,
+	isPortableRouteSlug,
+	isReservedSlug,
+	normalizeSlugPath,
+	bindReservedRoutes
+} from '../src/cms/page-slug-validation.js';
 
 // A site's shape, bound the way its site module would.
 const { RESERVED_PREFIXES, RESERVED_ROUTES, PORTABLE_ROUTES } = bindReservedRoutes({
@@ -11,7 +17,6 @@ const { RESERVED_PREFIXES, RESERVED_ROUTES, PORTABLE_ROUTES } = bindReservedRout
 	routes: ['/contact'],
 	portable: ['/gospel', '/what-we-believe', '/who-we-are']
 });
-
 
 test('admin and api are reserved, as the admin location requires', () => {
 	for (const slug of ['/admin', 'admin/pages', '/api', 'api/ingest/anything']) {

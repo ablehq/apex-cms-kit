@@ -149,8 +149,7 @@ export function readTaggings(record: Record<string, unknown>): ArchetypeTagging[
 
 /** The strict read's verdict: the rows, or the reason the projection is unusable. */
 export type StrictTaggingsRead =
-	| { ok: true; taggings: ArchetypeTagging[] }
-	| { ok: false; reason: string };
+	{ ok: true; taggings: ArchetypeTagging[] } | { ok: false; reason: string };
 
 /**
  * The same rows as `readTaggings`, read STRICTLY — for callers that RECONCILE

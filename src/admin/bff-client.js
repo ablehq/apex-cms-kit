@@ -175,7 +175,7 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 		 */
 		deleteImage(imageId) {
 			return mutate(`/api/admin/images/${encodeURIComponent(imageId)}`, 'DELETE');
-		},
+		}
 	};
 	// A site adds its own methods over the same `get`/`mutate`, never a second transport.
 	return extend ? { ...base, ...extend({ get, mutate, readJson }) } : base;

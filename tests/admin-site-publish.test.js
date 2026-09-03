@@ -2,10 +2,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import {
-	handlePublishSite,
-	handleSiteStatus
-} from '../src/server/bff/operations/publish-site.ts';
+import { handlePublishSite, handleSiteStatus } from '../src/server/bff/operations/publish-site.ts';
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
 import { createMemorySessionStore } from './harness/session-store.ts';

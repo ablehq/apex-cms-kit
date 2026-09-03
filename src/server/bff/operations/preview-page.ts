@@ -47,10 +47,7 @@
 
 import { stringifyCanonical } from '../../../cms/canonical-json.js';
 import { buildMediaIndex } from '../../../cms/media.js';
-import {
-	isCmsPageRoutable,
-	projectCmsPage,
-	projectedPageBySlug  } from '../../../cms/page-data.js';
+import { isCmsPageRoutable, projectCmsPage, projectedPageBySlug } from '../../../cms/page-data.js';
 import type { ProjectedCmsPage } from '../../../cms/page-data.js';
 
 import { guardRequest } from '../guard';
@@ -112,11 +109,13 @@ export interface PagePreview {
 
 /** The site's renderer registry check: which of a page's blocks have a component. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export type PartitionRenderableBlocks = (blocks: any[]) => { renderable: any[]; unknownSlugs: string[] };
+export type PartitionRenderableBlocks = (blocks: any[]) => {
+	renderable: any[];
+	unknownSlugs: string[];
+};
 
 export type PagePreviewResult =
-	| { ok: true; preview: PagePreview }
-	| { ok: false; status: number; reason: string };
+	{ ok: true; preview: PagePreview } | { ok: false; status: number; reason: string };
 
 export async function loadPagePreview(
 	request: Request,
@@ -192,7 +191,10 @@ export async function loadPagePreview(
  * preview cannot quietly render a section the site would skip (or skip one it
  * would render).
  */
-function previewBlocks(projected: ProjectedCmsPage, partitionRenderableBlocks: PartitionRenderableBlocks) {
+function previewBlocks(
+	projected: ProjectedCmsPage,
+	partitionRenderableBlocks: PartitionRenderableBlocks
+) {
 	const { renderable, unknownSlugs } = partitionRenderableBlocks(projected.blocks);
 	return { renderable, unknownTemplates: unknownSlugs };
 }

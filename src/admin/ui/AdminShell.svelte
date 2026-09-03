@@ -55,7 +55,6 @@
 		return pathname === prefix || pathname.startsWith(`${prefix}/`);
 	}
 
-
 	async function signOut() {
 		if (signingOut) return;
 		signingOut = true;

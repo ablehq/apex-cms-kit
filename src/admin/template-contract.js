@@ -22,7 +22,6 @@
 export function createTemplateContract(contract) {
 	const BY_SLUG = new Map((contract.templates || []).map((template) => [template.slug, template]));
 
-
 	/**
 	 * Every root template that can be placed as a page section.
 	 *
@@ -71,7 +70,13 @@ export function createTemplateContract(contract) {
 			.map((childSlug) => getTemplate(childSlug))
 			.filter((child) => child !== null);
 	}
-	return { TEMPLATE_CONTRACT: contract, placeableTemplates, getTemplate, getFieldDefs, getChildTemplates };
+	return {
+		TEMPLATE_CONTRACT: contract,
+		placeableTemplates,
+		getTemplate,
+		getFieldDefs,
+		getChildTemplates
+	};
 }
 
 /**
@@ -100,7 +105,8 @@ export function isDerivedTemplate(slug) {
 	return current().derivedTemplates.has(slug);
 }
 function current() {
-	if (!bound) throw new Error('template contract not bound: import the site\'s template-contract.js first');
+	if (!bound)
+		throw new Error("template contract not bound: import the site's template-contract.js first");
 	return bound;
 }
 export function placeableTemplates(...args) {
