@@ -147,7 +147,8 @@ export interface AdminFieldDef {
 	field_name: string;
 	display_name: string;
 	validator_kind: string | null;
-	role: string | null;
+	/** GLC's page-block templates carry one; a content-library field def does not. */
+	role?: string | null;
 	text_inclusion: string[] | null;
 }
 
