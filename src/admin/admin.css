@@ -1,0 +1,1125 @@
+/*
+	The GLC admin stylesheet — the approved prototype
+	(transcript-studio/.ai/session-2026-07-29/16-admin-prototype.html) ported whole.
+	Its tokens, its rules, its idiom: a manuscript ground, a serif for anything a
+	human wrote, a mono for anything a machine reads (slugs, ids, anchors), ruled
+	lines instead of boxes, and gold for the one thing on screen that commits.
+
+	EVERYTHING is scoped under `.adm`. The public site loads Tailwind (preflight and
+	all) globally from `src/routes/layout.css`, including on /admin, so this file
+	both (a) never leaks a bare element rule onto a church page and (b) restates
+	every property preflight zeroes — font, border, background, colour — rather than
+	inheriting one. The tokens live on `.adm` for the same reason: `--ink` and
+	`--gold` are ours, and `:root` already belongs to somebody else.
+
+	Dark mode is the prototype's: the system preference by default, and an explicit
+	`data-theme` on the root element wins in either direction.
+*/
+
+.adm {
+	--ground: #f7f0de;
+	--sunk: #efe6ce;
+	--raised: #fbf6ea;
+	--ink: #2a1a0e;
+	--ink-soft: #5c4732;
+	--ink-faint: #94805f;
+	--rule: #ddcfab;
+	--rule-soft: #e7dcc0;
+	--gold: #8a6208;
+	--gold-bright: #b8860b;
+	--flag: #7a2e1a;
+	--flag-wash: rgba(122, 46, 26, 0.1);
+	--serif: Palatino, 'Palatino Linotype', 'Palatino LT STD', 'Book Antiqua', Georgia, serif;
+	--sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+	--mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+	--shadow: 0 18px 48px rgba(42, 26, 14, 0.18);
+
+	min-height: 100vh;
+	background: var(--ground);
+	color: var(--ink);
+	font: 14px/1.5 var(--sans);
+	-webkit-font-smoothing: antialiased;
+}
+
+@media (prefers-color-scheme: dark) {
+	.adm {
+		--ground: #191207;
+		--sunk: #120d05;
+		--raised: #221a0d;
+		--ink: #ede0c4;
+		--ink-soft: #bfad86;
+		--ink-faint: #8a7a5c;
+		--rule: #3a2c18;
+		--rule-soft: #2c2113;
+		--gold: #d4a843;
+		--gold-bright: #e8d08c;
+		--flag: #dd8a6b;
+		--flag-wash: rgba(221, 138, 107, 0.14);
+		--shadow: 0 18px 48px rgba(0, 0, 0, 0.6);
+	}
+}
+:root[data-theme='dark'] .adm {
+	--ground: #191207;
+	--sunk: #120d05;
+	--raised: #221a0d;
+	--ink: #ede0c4;
+	--ink-soft: #bfad86;
+	--ink-faint: #8a7a5c;
+	--rule: #3a2c18;
+	--rule-soft: #2c2113;
+	--gold: #d4a843;
+	--gold-bright: #e8d08c;
+	--flag: #dd8a6b;
+	--flag-wash: rgba(221, 138, 107, 0.14);
+	--shadow: 0 18px 48px rgba(0, 0, 0, 0.6);
+}
+:root[data-theme='light'] .adm {
+	--ground: #f7f0de;
+	--sunk: #efe6ce;
+	--raised: #fbf6ea;
+	--ink: #2a1a0e;
+	--ink-soft: #5c4732;
+	--ink-faint: #94805f;
+	--rule: #ddcfab;
+	--rule-soft: #e7dcc0;
+	--gold: #8a6208;
+	--gold-bright: #b8860b;
+	--flag: #7a2e1a;
+	--flag-wash: rgba(122, 46, 26, 0.1);
+	--shadow: 0 18px 48px rgba(42, 26, 14, 0.18);
+}
+
+.adm *:focus-visible {
+	outline: 2px solid var(--gold);
+	outline-offset: 2px;
+	border-radius: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+	.adm * {
+		transition: none !important;
+	}
+}
+.adm button,
+.adm input,
+.adm textarea,
+.adm select {
+	font: inherit;
+	color: inherit;
+}
+.adm p,
+.adm h1,
+.adm h2,
+.adm h3,
+.adm ul,
+.adm li {
+	margin: 0;
+	padding: 0;
+}
+
+/* ── shell ── */
+.adm .app {
+	display: grid;
+	grid-template-columns: 204px minmax(0, 1fr);
+	min-height: 100vh;
+}
+.adm .rail {
+	display: flex;
+	flex-direction: column;
+	gap: 1.75rem;
+	border-right: 1px solid var(--rule);
+	background: var(--sunk);
+	padding: 1.15rem 0.9rem 1.15rem 1.15rem;
+}
+.adm .mark {
+	font-family: var(--serif);
+	font-size: 14px;
+	letter-spacing: 0.17em;
+	text-transform: uppercase;
+	line-height: 1.5;
+}
+.adm .mark span {
+	display: block;
+	font-size: 10px;
+	letter-spacing: 0.22em;
+	color: var(--ink-faint);
+}
+.adm .rail nav {
+	display: flex;
+	flex-direction: column;
+	gap: 1px;
+}
+.adm .rail nav a {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	border-radius: 3px;
+	padding: 0.36rem 0.5rem 0.36rem 0.55rem;
+	color: var(--ink-soft);
+	text-decoration: none;
+	border-left: 2px solid transparent;
+}
+.adm .rail nav a:hover {
+	background: var(--ground);
+}
+.adm .rail nav a[aria-current] {
+	border-left-color: var(--gold);
+	background: var(--ground);
+	color: var(--ink);
+	font-weight: 500;
+}
+.adm .rail nav .count {
+	margin-left: auto;
+	font: 11px var(--mono);
+	color: var(--flag);
+}
+.adm .rail nav hr {
+	border: 0;
+	border-top: 1px solid var(--rule);
+	margin: 0.6rem 0.5rem;
+}
+.adm .rail-foot {
+	margin-top: auto;
+	display: flex;
+	flex-direction: column;
+	gap: 0.55rem;
+	border-top: 1px solid var(--rule);
+	padding-top: 0.9rem;
+}
+.adm .rail-foot small {
+	color: var(--ink-faint);
+	font-size: 12px;
+	line-height: 1.4;
+}
+.adm .rail-foot b {
+	font-weight: 500;
+	color: var(--ink-soft);
+}
+.adm .who {
+	display: block;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 12px;
+	color: var(--ink-soft);
+}
+
+/* ── buttons ── */
+.adm .btn {
+	border: 1px solid var(--rule);
+	border-radius: 3px;
+	background: none;
+	padding: 0.35rem 0.75rem;
+	color: var(--ink-soft);
+	font-size: 13px;
+	font-weight: 500;
+	cursor: pointer;
+	white-space: nowrap;
+	transition:
+		border-color 0.15s,
+		color 0.15s,
+		background-color 0.15s;
+}
+.adm a.btn {
+	display: inline-block;
+	text-decoration: none;
+}
+.adm .btn:hover:not(:disabled) {
+	border-color: var(--ink-faint);
+	color: var(--ink);
+}
+.adm .btn:disabled {
+	opacity: 0.42;
+	cursor: default;
+}
+.adm .btn-primary {
+	border-color: var(--gold);
+	background: var(--gold);
+	color: var(--ground);
+}
+.adm .btn-primary:hover:not(:disabled) {
+	border-color: var(--gold-bright);
+	background: var(--gold-bright);
+}
+.adm .btn-quiet {
+	border-color: transparent;
+	padding-inline: 0.35rem;
+	color: var(--ink-faint);
+}
+.adm .btn-quiet:hover:not(:disabled) {
+	border-color: transparent;
+	color: var(--ink);
+}
+.adm .btn-sm {
+	padding: 0.2rem 0.5rem;
+	font-size: 12px;
+}
+.adm .danger {
+	color: var(--flag);
+}
+
+/* ── screens ── */
+.adm .head {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.6rem 1rem;
+	border-bottom: 1px solid var(--rule);
+	padding: 0.85rem 1.6rem;
+}
+.adm .head h1 {
+	font-family: var(--serif);
+	font-size: 22px;
+	font-weight: 400;
+}
+.adm .head .crumb {
+	color: var(--ink-faint);
+	font-size: 13px;
+	text-decoration: none;
+}
+.adm .head .crumb:hover {
+	color: var(--ink);
+}
+.adm .head-end {
+	display: flex;
+	align-items: center;
+	gap: 0.6rem;
+	margin-left: auto;
+}
+.adm .state {
+	color: var(--ink-faint);
+	font-size: 12.5px;
+}
+.adm .state b {
+	font-weight: 500;
+	color: var(--ink-soft);
+}
+.adm .label {
+	font-size: 10.5px;
+	font-weight: 600;
+	letter-spacing: 0.13em;
+	text-transform: uppercase;
+	color: var(--ink-faint);
+}
+
+/* ── list screen ── */
+.adm .toolbar {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.5rem 1.25rem;
+	border-bottom: 1px solid var(--rule-soft);
+	padding: 0.7rem 1.6rem;
+}
+.adm .tabs {
+	display: flex;
+	gap: 0.2rem;
+}
+.adm .tab {
+	border: 0;
+	border-bottom: 2px solid transparent;
+	background: none;
+	padding: 0.3rem 0.6rem;
+	color: var(--ink-faint);
+	font-size: 13px;
+	cursor: pointer;
+}
+.adm .tab[aria-selected='true'] {
+	border-bottom-color: var(--gold);
+	color: var(--ink);
+	font-weight: 500;
+}
+.adm .search {
+	border: 1px solid var(--rule);
+	border-radius: 3px;
+	background: var(--raised);
+	padding: 0.3rem 0.6rem;
+	color: var(--ink);
+	font: 13px var(--sans);
+	width: 190px;
+}
+.adm .search::placeholder {
+	color: var(--ink-faint);
+}
+
+.adm table {
+	width: 100%;
+	border-collapse: collapse;
+}
+.adm thead th {
+	border-bottom: 1px solid var(--rule);
+	padding: 0.55rem 1rem;
+	text-align: left;
+	font-size: 10.5px;
+	font-weight: 600;
+	letter-spacing: 0.13em;
+	text-transform: uppercase;
+	color: var(--ink-faint);
+}
+.adm thead th:first-child,
+.adm tbody td:first-child {
+	padding-left: 1.6rem;
+}
+.adm thead th:last-child,
+.adm tbody td:last-child {
+	padding-right: 1.6rem;
+	text-align: right;
+}
+.adm tbody td {
+	border-bottom: 1px solid var(--rule-soft);
+	padding: 0.7rem 1rem;
+	vertical-align: middle;
+}
+.adm tbody tr:hover {
+	background: var(--sunk);
+}
+.adm .t-title {
+	font-family: var(--serif);
+	font-size: 17px;
+	color: var(--ink);
+	text-decoration: none;
+}
+.adm .t-title:hover {
+	text-decoration: underline;
+	text-underline-offset: 3px;
+}
+.adm .t-sub {
+	display: block;
+	font: 11.5px var(--mono);
+	color: var(--ink-faint);
+	margin-top: 2px;
+}
+.adm .muted {
+	color: var(--ink-faint);
+	font-size: 12.5px;
+}
+.adm .st {
+	display: inline-flex;
+	align-items: center;
+	gap: 0.4rem;
+	font-size: 12.5px;
+	color: var(--ink-faint);
+	white-space: nowrap;
+}
+.adm .st::before {
+	content: '';
+	width: 6px;
+	height: 6px;
+	border-radius: 999px;
+	background: var(--ink-faint);
+}
+.adm .st-live {
+	color: var(--ink-soft);
+}
+.adm .st-live::before {
+	background: var(--gold);
+}
+.adm .st-flag {
+	color: var(--flag);
+}
+.adm .st-flag::before {
+	background: var(--flag);
+}
+.adm .st-draft::before {
+	background: none;
+	box-shadow: inset 0 0 0 1px var(--ink-faint);
+}
+.adm .acts {
+	display: inline-flex;
+	gap: 0.15rem;
+	opacity: 0;
+	transition: opacity 0.12s;
+}
+.adm tr:hover .acts,
+.adm tr:focus-within .acts {
+	opacity: 1;
+}
+
+/* ── editor: outline + canvas ── */
+.adm .editor {
+	display: grid;
+	grid-template-columns: 264px minmax(0, 1fr);
+	align-items: start;
+}
+.adm .outline {
+	position: sticky;
+	top: 0;
+	border-right: 1px solid var(--rule);
+	padding: 1.1rem 0.9rem 1.5rem;
+	display: flex;
+	flex-direction: column;
+	gap: 0.75rem;
+	min-height: calc(100vh - 56px);
+}
+.adm .outline[hidden] {
+	display: none;
+}
+.adm .outline-head {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+}
+.adm .ol {
+	display: flex;
+	flex-direction: column;
+	gap: 2px;
+	list-style: none;
+}
+.adm .ol li {
+	display: grid;
+	grid-template-columns: 14px 1fr auto;
+	align-items: center;
+	gap: 0.45rem;
+	border-radius: 3px;
+	border-left: 2px solid transparent;
+	padding: 0.4rem 0.4rem 0.4rem 0.35rem;
+}
+.adm .ol li:hover {
+	background: var(--sunk);
+}
+.adm .ol li[data-selected='true'] {
+	border-left-color: var(--gold);
+	background: var(--sunk);
+}
+.adm .ol li.dragging {
+	opacity: 0.45;
+}
+.adm .grip {
+	color: var(--ink-faint);
+	font-size: 11px;
+	line-height: 1;
+	cursor: grab;
+	opacity: 0;
+	user-select: none;
+	background: none;
+	border: 0;
+	padding: 0;
+	touch-action: none;
+}
+.adm .ol li:hover .grip,
+.adm .ol li:focus-within .grip,
+.adm .child:hover .grip {
+	opacity: 1;
+}
+.adm .ol .nm {
+	min-width: 0;
+	font-size: 13.5px;
+	color: var(--ink);
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	text-align: left;
+	background: none;
+	border: 0;
+	padding: 0;
+	font-family: inherit;
+	cursor: pointer;
+}
+.adm .ol .kd {
+	font: 10.5px var(--mono);
+	color: var(--ink-faint);
+}
+
+.adm .canvas {
+	padding: 1.6rem 1.9rem 5rem;
+	max-width: 940px;
+}
+.adm .canvas h2 {
+	font-family: var(--serif);
+	font-size: 24px;
+	font-weight: 400;
+}
+.adm .canvas-head {
+	display: flex;
+	align-items: baseline;
+	gap: 0.75rem;
+	margin-bottom: 0.35rem;
+}
+.adm .tpl {
+	font: 11px var(--mono);
+	color: var(--ink-faint);
+}
+.adm .hint {
+	color: var(--ink-faint);
+	font-size: 13px;
+	margin-bottom: 1.75rem;
+}
+.adm .foot-acts {
+	display: flex;
+	gap: 0.6rem;
+	margin-top: 2.5rem;
+	border-top: 1px solid var(--rule-soft);
+	padding-top: 1rem;
+}
+
+/* fields: ruled lines, not boxes */
+.adm .fields {
+	display: grid;
+	gap: 1.35rem;
+}
+.adm .two {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+	gap: 1.35rem;
+}
+.adm .f .label {
+	display: block;
+	margin-bottom: 0.3rem;
+}
+.adm .inp {
+	display: block;
+	width: 100%;
+	border: 1px solid transparent;
+	border-bottom: 1px solid var(--rule);
+	border-radius: 0;
+	background: none;
+	padding: 0.28rem 0.1rem;
+	font: 15px var(--serif);
+	color: var(--ink);
+	min-height: 1.7em;
+	outline: none;
+	resize: vertical;
+	transition:
+		border-color 0.15s,
+		background-color 0.15s;
+}
+.adm .inp:hover:not(:disabled) {
+	background: var(--sunk);
+}
+.adm .inp:focus {
+	border-color: var(--rule);
+	border-bottom-color: var(--gold);
+	background: var(--raised);
+}
+.adm .inp:disabled {
+	color: var(--ink-faint);
+	cursor: not-allowed;
+}
+.adm .inp.mono {
+	font: 13px var(--mono);
+}
+.adm .rich {
+	border: 1px solid var(--rule);
+	border-radius: 3px;
+	background: var(--raised);
+}
+.adm .rich-bar {
+	display: flex;
+	gap: 0.1rem;
+	border-bottom: 1px solid var(--rule);
+	padding: 0.25rem 0.35rem;
+}
+.adm .rich-bar button {
+	border: 0;
+	border-radius: 2px;
+	background: none;
+	padding: 0.15rem 0.42rem;
+	color: var(--ink-faint);
+	font-size: 12.5px;
+	cursor: pointer;
+}
+.adm .rich-bar button:hover {
+	background: var(--sunk);
+	color: var(--ink);
+}
+.adm .rich-body {
+	padding: 0.6rem 0.7rem;
+	font: 15px/1.65 var(--serif);
+	outline: none;
+	min-height: 3.4em;
+}
+.adm .rich-body p {
+	margin: 0 0 0.6em;
+}
+.adm .rich-body p:last-child {
+	margin-bottom: 0;
+}
+.adm .rich-body h2 {
+	font: 400 19px var(--serif);
+	margin: 0 0 0.4em;
+}
+.adm .rich-body ul {
+	margin: 0 0 0.6em;
+	padding-left: 1.4em;
+	list-style: disc;
+}
+.adm .rich-body a {
+	color: var(--gold);
+	text-decoration: underline;
+}
+.adm .media {
+	display: flex;
+	align-items: center;
+	gap: 0.9rem;
+}
+.adm .thumb {
+	display: grid;
+	place-items: center;
+	width: 108px;
+	aspect-ratio: 16 / 10;
+	border: 1px solid var(--rule);
+	border-radius: 3px;
+	background: var(--sunk);
+	color: var(--ink-faint);
+	flex: none;
+}
+.adm .thumb svg {
+	width: 22px;
+	height: 22px;
+}
+/* A message's thumb is the video's own still; the glyph above is the fallback. */
+.adm .thumb img {
+	width: 100%;
+	height: 100%;
+	border-radius: 2px;
+	object-fit: cover;
+}
+.adm .bool {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	font-size: 13.5px;
+	color: var(--ink-soft);
+}
+.adm .bool input {
+	accent-color: var(--gold);
+}
+
+/* repeatable children */
+.adm .children {
+	display: flex;
+	flex-direction: column;
+	gap: 0;
+	border-top: 1px solid var(--rule);
+	margin-top: 0.5rem;
+}
+.adm .child {
+	border-bottom: 1px solid var(--rule-soft);
+}
+.adm .child-row {
+	display: grid;
+	grid-template-columns: 1fr auto;
+	align-items: center;
+	gap: 0.5rem;
+	padding: 0.6rem 0.2rem;
+}
+.adm .child-row .nm {
+	font: 15px var(--serif);
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.adm .child-body {
+	display: grid;
+	gap: 1.1rem;
+	padding: 0.3rem 0 1.1rem 1.6rem;
+}
+.adm .chev {
+	border: 0;
+	background: none;
+	color: var(--ink-faint);
+	cursor: pointer;
+	font-size: 11px;
+	padding: 0 0.3rem;
+}
+
+/* ── message screen ── */
+.adm .msg-id {
+	display: flex;
+	gap: 0.7rem;
+	align-items: flex-start;
+	border-bottom: 1px solid var(--rule);
+	padding-bottom: 0.9rem;
+	margin-bottom: 0.35rem;
+}
+.adm .msg-id .thumb {
+	width: 84px;
+}
+.adm .msg-id div {
+	min-width: 0;
+}
+.adm .msg-id b {
+	display: block;
+	font: 400 15px var(--serif);
+	color: var(--ink);
+}
+.adm .msg-id code {
+	font: 11px var(--mono);
+	color: var(--ink-faint);
+	word-break: break-all;
+}
+
+.adm .gate {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.6rem 1.2rem;
+	border: 1px solid var(--rule);
+	border-left: 2px solid var(--flag);
+	border-radius: 3px;
+	background: var(--raised);
+	padding: 0.75rem 0.9rem;
+	margin-bottom: 2rem;
+}
+.adm .gate.ok {
+	border-left-color: var(--gold);
+}
+.adm .gate-text {
+	font: 16px var(--serif);
+	color: var(--flag);
+}
+.adm .gate.ok .gate-text {
+	color: var(--ink);
+}
+.adm .gate-sub {
+	font: 12px var(--mono);
+	color: var(--ink-faint);
+}
+.adm .meter {
+	position: relative;
+	width: 140px;
+	height: 3px;
+	border-radius: 999px;
+	background: var(--rule-soft);
+}
+.adm .meter i {
+	position: absolute;
+	inset: 0 auto 0 0;
+	border-radius: 999px;
+	background: var(--flag);
+	transition: width 0.25s;
+}
+.adm .gate.ok .meter i {
+	background: var(--gold);
+}
+.adm .meter u {
+	position: absolute;
+	top: -4px;
+	bottom: -4px;
+	left: 50%;
+	width: 1px;
+	background: var(--ink-faint);
+}
+.adm .gate-end {
+	margin-left: auto;
+	display: flex;
+	align-items: center;
+	gap: 0.6rem;
+}
+
+.adm .sec {
+	margin-bottom: 2.5rem;
+}
+.adm .sec-head {
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+	margin-left: 5.5rem;
+	margin-bottom: 0.6rem;
+}
+.adm .sec-head .inp {
+	font: italic 400 19px var(--serif);
+	border-bottom-color: transparent;
+	width: auto;
+	min-width: 18ch;
+	flex: 1 1 auto;
+	max-width: 34ch;
+}
+.adm .sec-head .inp:hover,
+.adm .sec-head .inp:focus {
+	border-bottom-color: var(--rule);
+}
+.adm .line {
+	display: grid;
+	grid-template-columns: 5.5rem minmax(0, 1fr) auto;
+	/* The time and the paragraph's first line share a baseline; no hand-tuned
+	   padding survives a font-size change, baseline alignment does. */
+	align-items: baseline;
+}
+.adm .line time {
+	font: 11.5px var(--mono);
+	font-variant-numeric: tabular-nums;
+	color: var(--ink-faint);
+	text-align: right;
+	padding-right: 0.6rem;
+	opacity: 0;
+	transition: opacity 0.12s;
+}
+.adm .line:hover time,
+.adm .line:focus-within time {
+	opacity: 1;
+}
+.adm .line p {
+	font: 17px/1.72 var(--serif);
+	max-width: 62ch;
+	padding: 0.15rem 0.35rem;
+	/*
+		A row is a paragraph of speech, and the air between paragraphs is what makes
+		the canvas read as prose rather than as a list. The prototype gets this from
+		the browser's own 1em on <p>; ours is stated, because the reset above zeroes
+		it (Tailwind's preflight is loaded on this route too).
+	*/
+	margin: 1em 0 1em -0.35rem;
+	border-radius: 2px;
+	outline: none;
+	white-space: pre-wrap;
+}
+.adm .line p:hover {
+	background: var(--sunk);
+}
+.adm .line p:focus {
+	background: var(--raised);
+	box-shadow:
+		inset 0 -1px 0 var(--gold),
+		inset 0 0 0 1px var(--rule);
+}
+.adm .row-acts {
+	display: flex;
+	gap: 0.1rem;
+	align-self: start;
+	padding-top: 0.35rem;
+	opacity: 0;
+	transition: opacity 0.12s;
+}
+.adm .line:hover .row-acts,
+.adm .line:focus-within .row-acts {
+	opacity: 1;
+}
+.adm .flag {
+	background: none;
+	color: inherit;
+	border: 0;
+	border-bottom: 2px dotted var(--flag);
+	padding: 0 1px;
+	font: inherit;
+	cursor: pointer;
+}
+.adm .flag:hover,
+.adm .flag:focus-visible {
+	background: var(--flag-wash);
+	color: var(--flag);
+}
+
+/* ── dialogs ── */
+.adm-scrim {
+	position: fixed;
+	inset: 0;
+	z-index: 60;
+	display: grid;
+	place-items: center;
+	background: rgba(42, 26, 14, 0.35);
+	padding: 1.5rem;
+}
+.adm .dlg {
+	width: min(760px, 100%);
+	max-height: 82vh;
+	display: flex;
+	flex-direction: column;
+	border: 1px solid var(--rule);
+	border-radius: 4px;
+	background: var(--ground);
+	box-shadow: var(--shadow);
+}
+.adm .dlg header {
+	display: flex;
+	align-items: center;
+	gap: 0.75rem;
+	border-bottom: 1px solid var(--rule);
+	padding: 0.9rem 1.1rem;
+}
+.adm .dlg h2 {
+	font: 400 19px var(--serif);
+}
+.adm .dlg .body {
+	overflow: auto;
+	padding: 1.1rem;
+	display: grid;
+	gap: 1.4rem;
+}
+.adm .dlg .foot {
+	display: flex;
+	justify-content: flex-end;
+	gap: 0.6rem;
+	border-top: 1px solid var(--rule);
+	padding: 0.9rem 1.1rem;
+}
+.adm .grp .label {
+	margin-bottom: 0.55rem;
+	display: block;
+}
+.adm .cards {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+	gap: 0.5rem;
+}
+.adm .card {
+	text-align: left;
+	border: 1px solid var(--rule);
+	border-radius: 3px;
+	background: var(--raised);
+	padding: 0.65rem 0.75rem;
+	cursor: pointer;
+	transition:
+		border-color 0.12s,
+		background-color 0.12s;
+}
+.adm .card:hover:not(:disabled) {
+	border-color: var(--gold);
+	background: var(--sunk);
+}
+.adm .card:disabled {
+	opacity: 0.45;
+	cursor: default;
+}
+.adm .card b {
+	display: block;
+	font: 400 15px var(--serif);
+	color: var(--ink);
+}
+.adm .card small {
+	color: var(--ink-faint);
+	font-size: 12px;
+	line-height: 1.4;
+	display: block;
+	margin-top: 2px;
+}
+.adm .card em {
+	display: block;
+	margin-top: 4px;
+	font: 10.5px var(--mono);
+	font-style: normal;
+	color: var(--ink-faint);
+}
+
+/* ── what the prototype had no room for: errors, gaps, empties ── */
+.adm .err {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 0.6rem;
+	border: 1px solid var(--flag);
+	border-left-width: 2px;
+	border-radius: 3px;
+	background: var(--flag-wash);
+	padding: 0.6rem 0.8rem;
+	margin: 1rem 1.6rem;
+	color: var(--flag);
+	font-size: 13px;
+}
+.adm .canvas .err,
+.adm .dlg .err {
+	margin: 0 0 1.35rem;
+}
+.adm .notice {
+	border-left: 2px solid var(--rule);
+	padding-left: 0.7rem;
+	color: var(--ink-faint);
+	font-size: 12.5px;
+	line-height: 1.5;
+}
+.adm .pad {
+	padding: 1.6rem;
+}
+.adm .stub {
+	padding: 3.5rem 1.6rem;
+	max-width: 52ch;
+	display: grid;
+	gap: 0.7rem;
+}
+.adm .stub h2 {
+	font: 400 22px var(--serif);
+}
+.adm .stub p {
+	color: var(--ink-faint);
+	font-size: 13.5px;
+	line-height: 1.6;
+}
+
+/* ── login ── */
+.adm .login {
+	display: grid;
+	place-items: center;
+	min-height: 100vh;
+	padding: 1.5rem;
+}
+.adm .login-card {
+	width: min(340px, 100%);
+	display: flex;
+	flex-direction: column;
+	gap: 1rem;
+}
+.adm .login-card h1 {
+	font: 400 26px var(--serif);
+}
+.adm .login-card form {
+	display: flex;
+	flex-direction: column;
+	gap: 1.1rem;
+}
+.adm .login-card .btn-primary {
+	margin-top: 0.3rem;
+	padding-block: 0.5rem;
+}
+
+@media (max-width: 1000px) {
+	.adm .app {
+		grid-template-columns: 1fr;
+	}
+	.adm .rail {
+		flex-direction: row;
+		align-items: center;
+		gap: 1rem;
+		border-right: 0;
+		border-bottom: 1px solid var(--rule);
+		overflow-x: auto;
+	}
+	.adm .rail nav {
+		flex-direction: row;
+	}
+	.adm .rail nav hr {
+		display: none;
+	}
+	.adm .rail-foot {
+		margin: 0 0 0 auto;
+		flex-direction: row;
+		align-items: center;
+		border: 0;
+		padding: 0;
+	}
+	.adm .editor {
+		grid-template-columns: 1fr;
+	}
+	.adm .outline {
+		position: static;
+		min-height: 0;
+		border-right: 0;
+		border-bottom: 1px solid var(--rule);
+	}
+}
+
+/* The rail foot's "what's live" line. The digest is the identity of the snapshot
+   the public site is built from — the one durable fact `snapshot-meta.json`
+   records about its content, and what the rail names instead of a refresh time
+   the manifest deliberately does not keep. */
+.adm .rail-foot .digest {
+	font: 400 11px/1 var(--mono, ui-monospace, monospace);
+	letter-spacing: 0.02em;
+	color: var(--ink-faint);
+}
+
+/* A notice that is reporting a failure rather than a fact. */
+.adm .notice.danger {
+	border-left-color: var(--bad, #c0563c);
+	color: var(--bad, #c0563c);
+}
+
+/* A button that reads as a link, inside a notice. Used by the rail foot's "Why?". */
+.adm .linky {
+	background: none;
+	border: 0;
+	padding: 0;
+	color: inherit;
+	font: inherit;
+	text-decoration: underline;
+	cursor: pointer;
+}
