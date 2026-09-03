@@ -5,7 +5,7 @@ import { describe, it } from 'node:test';
 import { publishContent } from '../src/server/content/publish.ts';
 import { CONTENT_KEY, readContent, resetContentMemo } from '../src/server/content/read.ts';
 
-const ACCOUNT = '3b2540c8-5a1f-447a-8e48-3d7129cb43e7';
+const ACCOUNT = '11111111-2222-4333-8444-555555555555';
 
 /** A Map-backed stand-in for the KV namespace, with the two methods the module uses. */
 function memoryStore(seed = {}) {

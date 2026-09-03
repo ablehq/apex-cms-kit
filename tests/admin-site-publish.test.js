@@ -10,7 +10,7 @@ import { CONTENT_KEY, resetContentMemo } from '../src/server/content/read.ts';
 
 const ORIGIN = 'https://gospellife.in';
 const CSRF = 'csrf-publish';
-const ACCOUNT = '3b2540c8-5a1f-447a-8e48-3d7129cb43e7';
+const ACCOUNT = '11111111-2222-4333-8444-555555555555';
 
 function memoryStore() {
 	const map = new Map();
