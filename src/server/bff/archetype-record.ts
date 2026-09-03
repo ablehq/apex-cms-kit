@@ -197,6 +197,85 @@ export function readTaggingsStrict(record: Record<string, unknown>): StrictTaggi
 }
 
 /** `updated_at` as a plain string — the stale-save token for a single record. */
+/**
+ * Read a PRIMITIVE field's value, preferring the `archetype_item` row over
+ * `primitives`.
+ *
+ * That precedence is not a preference — it is what this site's own loaders do.
+ * They read `primitives` into the result and then OVERWRITE every key from
+ * `archetype_items` where a row exists (`collectionProcessors.ts:42-87`). Reading
+ * it the other way round would show an editor a value the public page does not
+ * render.
+ *
+ * The value is returned UNNARROWED. Godrej's content library holds rich text —
+ * `team_member.description` and `focus_area.our_approach` are
+ * `{html, editor, content}` objects — and coercing here is exactly the
+ * `[object Object]` defect §4.4 is about.
+ */
+export function readPrimitiveValue(record: Record<string, unknown>, name: string): unknown {
+	for (const item of readArchetypeItems(record)) {
+		if (item.relatable_type !== 'PropertySet') continue;
+		const schemaItem = isRecord(item.archetype_schema_item) ? item.archetype_schema_item : null;
+		if (!schemaItem) continue;
+		if (schemaItem.name !== name && schemaItem.slug !== name) continue;
+		const fieldsData = isRecord(item.fields_data) ? item.fields_data : null;
+		if (fieldsData && name in fieldsData) return fieldsData[name];
+	}
+	const primitives = readPrimitives(record);
+	return name in primitives ? primitives[name] : undefined;
+}
+
+/** One entry of a reference relation: the JOIN ROW and the record it points at. */
+export interface ArchetypeReference {
+	/**
+	 * The `archetype_item` (join row) id. This is what a REMOVE names —
+	 * `{item_id, _destroy: true}` — and it is NOT the id of the record being
+	 * pointed at. The two id spaces are easy to conflate and the payload silently
+	 * does the wrong thing when they are (SHARED-FACTS §14).
+	 */
+	itemId: string;
+	/** The referenced archetype's id. This is what an ADD names. */
+	targetId: string;
+}
+
+/**
+ * Every entry of a reference relation, in the order Apex returns them.
+ *
+ * The distinguishing mark is `relatable_type`, not the field name: a primitive's
+ * row is backed by a `PropertySet` and a reference's by a
+ * `Specification::Archetype`. Both carry `fields_data`, so matching on the name
+ * alone would happily return a primitive's text value as if it were an id.
+ *
+ * A `has_many` is simply several such rows with the same schema-item name —
+ * verified against `cms/data/partners.json`, where a partner's focus areas are one
+ * `archetype_item` each, every one carrying `{focus_area: "<target id>"}`.
+ *
+ * Note what is NOT here: the referenced record's display name. Apex sends
+ * `relatable_data: []` for a reference, so every caller resolves names by joining
+ * against the target collection by id — which is what the public site already does
+ * and why a list screen loads its reference targets alongside its own rows.
+ */
+export function readReferences(
+	record: Record<string, unknown>,
+	itemName: string
+): ArchetypeReference[] {
+	const references: ArchetypeReference[] = [];
+	for (const item of readArchetypeItems(record)) {
+		if (item.relatable_type !== 'Specification::Archetype') continue;
+		const schemaItem = isRecord(item.archetype_schema_item) ? item.archetype_schema_item : null;
+		if (!schemaItem) continue;
+		if (schemaItem.name !== itemName && schemaItem.slug !== itemName) continue;
+		const fieldsData = isRecord(item.fields_data) ? item.fields_data : null;
+		const targetId = cleanString(fieldsData ? fieldsData[itemName] : null);
+		const itemId = cleanString(item.id);
+		// A reference row that exists but holds no id is the same as no reference.
+		if (targetId && itemId) references.push({ itemId, targetId });
+	}
+	return references;
+}
+
+/** `updated_at` as a plain string — the stale-save token for a single record. */
+
 export function readUpdatedAt(record: Record<string, unknown>): string {
 	return cleanString(record.updated_at);
 }

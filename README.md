@@ -3,8 +3,9 @@
 The site-side mechanics of the Apex CMS, for SvelteKit sites on Cloudflare Workers:
 the admin BFF (session in D1, origin/CSRF boundary, audit, the Apex client and its
 operations), the content module (publish every collection to one KV value; read it per
-request), the sanitizer, the page draft model, the field editors and pickers as
-building blocks, and the D1 migrations. **Not** the admin's screens, shell, navigation
+request), the sanitizer, the page draft model, the generic record layer (list/get/create/update/delete over a
+site's `ContentContract`), the record draft, the write-boundary sanitizer, the field
+editors and pickers as building blocks, and the D1 migrations. **Not** the admin's screens, shell, navigation
 or stylesheet — every site owns how its admin looks and which screens it has, and
 composes them from these pieces. Extracted from `ablehq/gospel-life-church` in September 2026; consumed
 by gospel-life-church, poovayya and godrej-foundation.
@@ -19,7 +20,8 @@ step — and vite-plugin-svelte bundles it because of the `svelte` field.
 
 Import paths: `@ablehq/apex-cms-kit/server/bff/guard` (TS, no extension),
 `@ablehq/apex-cms-kit/admin/md5.js`, `@ablehq/apex-cms-kit/admin/ui/PageForm.svelte`,
-`@ablehq/apex-cms-kit/admin/admin.css`.
+`@ablehq/apex-cms-kit/admin/ui/BlockFieldEditor.svelte`. (The kit ships no CSS — a
+site's admin stylesheet is its own.)
 
 ## A site adds
 

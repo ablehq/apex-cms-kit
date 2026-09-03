@@ -12,6 +12,11 @@ export interface ApexAdminClientOptions {
 	 * callers: no timeout is imposed at this layer.
 	 */
 	signal?: AbortSignal;
+	/**
+	 * The content-library schema slugs this site may read and write through the
+	 * content-library methods. Omitted: no narrowing (GLC's behaviour today).
+	 */
+	allowedSchemaSlugs?: readonly string[];
 }
 
 export interface ApexResponse {
@@ -89,7 +94,16 @@ export type PostStatusEvent = 'publish' | 'unpublish';
  * runtime for values that arrive over the wire; this type enforces it for values
  * written in our own code.
  */
-export type ContentLibraryFields = Record<string, string>;
+export type ContentLibraryFields = Record<string, unknown>;
+
+/**
+ * One entry of a `has_many` reference write. Apex's upsert takes the WHOLE desired
+ * set as hashes: an entry that names only the target keeps or adds it, and
+ * `{item_id, _destroy: true}` removes one — where `item_id` is the JOIN ROW's id,
+ * never the referenced record's. Sending only the additions silently drops the
+ * removals; sending target ids where join ids belong removes the wrong rows.
+ */
+export type HasManyEntry = Record<string, string> | { item_id: string; _destroy: true };
 
 /**
  * The four scalars `POST /api/platform/v1/media/signed_upload_url` wants, at the TOP
@@ -206,11 +220,16 @@ export interface ApexAdminClient {
 	/** Authors / resources list. The schema filter is applied here, not by the caller. */
 	listContentLibrary(slug: string, query?: Record<string, string | number>): Promise<ApexResponse>;
 	getContentLibraryRecord(slug: string, id: string): Promise<ApexResponse>;
-	createContentLibraryRecord(slug: string, fields: ContentLibraryFields): Promise<ApexResponse>;
+	createContentLibraryRecord(
+		slug: string,
+		fields: ContentLibraryFields,
+		references?: Record<string, HasManyEntry[] | string | null>
+	): Promise<ApexResponse>;
 	updateContentLibraryRecord(
 		slug: string,
 		id: string,
-		fields: ContentLibraryFields
+		fields: ContentLibraryFields,
+		references?: Record<string, HasManyEntry[] | string | null>
 	): Promise<ApexResponse>;
 	deleteContentLibraryRecord(slug: string, id: string): Promise<ApexResponse>;
 	getDocument(documentId: string): Promise<ApexResponse>;
@@ -280,6 +299,19 @@ function flattenQuery(query: Record<string, unknown>, prefix = '', into = new UR
  * tripwire half lives on `sweepSermonCatalogue` in `ingest-reservation.ts`.
  */
 export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdminClient {
+	/**
+	 * Narrow a schema slug to the site's content-library set at RUNTIME as well as at
+	 * compile time — so a `@ts-nocheck` module, a test, or a future JS caller cannot
+	 * reach a POST archetype, whose fields must never be written on this surface. A
+	 * site that passes no allowlist gets today's behaviour: any slug.
+	 */
+	function contentLibrarySlug(slug: string): string {
+		const allowed = options.allowedSchemaSlugs;
+		if (allowed && !allowed.includes(slug)) {
+			throw new Error(`not a content-library archetype schema: ${slug}`);
+		}
+		return encodeURIComponent(slug);
+	}
 	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
 	if (!options.baseUrl) throw new Error('Apex base URL is not configured');
 	if (!options.token) throw new Error('Apex admin token is not configured');
@@ -458,7 +490,7 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			// catalogue by passing its own `q[archetype_schema_slug_eq]`.
 			return call(
 				`${ARCHETYPES_BASE}/search_and_filter?${searchParams(query, {
-					'q[archetype_schema_slug_eq]': encodeURIComponent(slug)
+					'q[archetype_schema_slug_eq]': contentLibrarySlug(slug)
 				})}`,
 				{ method: 'GET' }
 			);
@@ -468,24 +500,27 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			// The READ surface — the same one the snapshot pipeline hydrates from. It
 			// is read-only here BY CONSTRUCTION: no method in this client PATCHes it.
 			return call(
-				`${ARCHETYPE_SCHEMAS_BASE}/${encodeURIComponent(slug)}/archetypes/${encodeURIComponent(id)}`,
+				`${ARCHETYPE_SCHEMAS_BASE}/${contentLibrarySlug(slug)}/archetypes/${encodeURIComponent(id)}`,
 				{ method: 'GET' }
 			);
 		},
-		async createContentLibraryRecord(slug, fields) {
-			return call(`${ARCHETYPE_SCHEMAS_BASE}/${encodeURIComponent(slug)}/archetype_models`, {
+		async createContentLibraryRecord(slug, fields, references = {}) {
+			return call(`${ARCHETYPE_SCHEMAS_BASE}/${contentLibrarySlug(slug)}/archetype_models`, {
 				method: 'POST',
-				body: JSON.stringify(fields)
+				body: JSON.stringify({ ...fields, ...references })
 			});
 		},
-		async updateContentLibraryRecord(slug, id, fields) {
+		async updateContentLibraryRecord(slug, id, fields, references = {}) {
 			assertUuid(id);
 			// FLAT keys on `archetype_models` — the one write of the five that persists
 			// (probes W1–W5). The other four are documented on `updateSermonTranscript`
 			// above; two of them answer 200 and drop the payload on the floor.
 			return call(
-				`${ARCHETYPE_SCHEMAS_BASE}/${encodeURIComponent(slug)}/archetype_models/${encodeURIComponent(id)}`,
-				{ method: 'PATCH', body: JSON.stringify(fields) }
+				`${ARCHETYPE_SCHEMAS_BASE}/${contentLibrarySlug(slug)}/archetype_models/${encodeURIComponent(id)}`,
+				// Reference values ride in the same body under their item name: a `has_one`
+				// is a bare id (or `null` to clear), a `has_many` the all-hash diff array
+				// documented on `HasManyEntry`.
+				{ method: 'PATCH', body: JSON.stringify({ ...fields, ...references }) }
 			);
 		},
 		async deleteContentLibraryRecord(slug, id) {
@@ -495,7 +530,7 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			// will not stop you, so the delete-author OPERATION counts references first
 			// and refuses without an explicit confirmation. This method is the raw call.
 			return call(
-				`${ARCHETYPE_SCHEMAS_BASE}/${encodeURIComponent(slug)}/archetype_models/${encodeURIComponent(id)}`,
+				`${ARCHETYPE_SCHEMAS_BASE}/${contentLibrarySlug(slug)}/archetype_models/${encodeURIComponent(id)}`,
 				{ method: 'DELETE' }
 			);
 		},

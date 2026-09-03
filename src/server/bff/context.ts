@@ -6,6 +6,7 @@ import { parseAllowedOrigins } from './boundary';
 import { createD1SessionStore } from './session';
 import type { SessionStore } from './session';
 import type { ContentStore } from '../content/read';
+import type { ContentContract } from './content-contract';
 import type { SiteProjection } from '../content/publish';
 import type { BffDatabase } from './d1';
 
@@ -72,6 +73,12 @@ export interface BffContext {
 	 * makes still go through the editor's client.
 	 */
 	content?: ContentStore;
+	/**
+	 * The site's content model, for the generic record operations (§ content-contract).
+	 * Optional: a site with only bespoke screens never sets it, and the record
+	 * operations refuse rather than guess when it is absent.
+	 */
+	contract?: ContentContract;
 	/** The site's projection of raw Apex collections into what its loaders read (plan §2.3). */
 	project?: SiteProjection;
 	/** The fixed Apex account the operations target, recorded on audit rows. */
