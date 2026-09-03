@@ -29,6 +29,7 @@
 	export let brand = 'Apex';
 	/** Rail entries: `{ href, label, count? }`; a `null` entry is a divider. */
 	export let nav = [];
+	/** @type {{ email: string, name: string | null } | null} */
 	export let editor = null;
 
 	/**

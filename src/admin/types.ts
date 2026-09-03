@@ -323,15 +323,7 @@ export interface BffClient {
 /** The 2xx body of `GET /api/admin/site/publish` (`operations/publish-site.ts`). */
 export interface SiteStatus {
 	/** The manifest of the published snapshot, or null when nothing is published. */
-	published: {
-		version: string;
-		publishedAt: string;
-		publishedBy: string;
-		accountId: string;
-		projectionVersion: number;
-		counts: Record<string, number>;
-		warnings: string[];
-	} | null;
+	published: import('../server/content/read').ContentManifest | null;
 }
 
 /** What `savePage()` resolves to (`save-page.js`). */

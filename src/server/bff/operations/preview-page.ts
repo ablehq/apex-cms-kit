@@ -95,7 +95,8 @@ export interface PagePreview {
 	/** Exactly what `[...slug]`'s load hands its renderer, built the same way. */
 	page: ProjectedCmsPage;
 	/** Whatever the site's `messages` hook derives for this page's blocks — e.g. GLC's sermon strip. */
-	messages: unknown;
+	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	messages: any;
 	/** Sections whose template has no component — named, not silently missing. */
 	unknownTemplates: string[];
 	/** Apex's own status: `published`, `draft`, `editing`, `scheduled`, `archived`. */
