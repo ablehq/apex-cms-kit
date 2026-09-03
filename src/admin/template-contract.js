@@ -79,9 +79,25 @@ export function createTemplateContract(contract) {
  * this at import time); the kit's components read through these accessors.
  */
 let bound = null;
-export function bindTemplateContract(contract) {
+/**
+ * @param {unknown} contract the committed page-block template contract
+ * @param {{ sectionGroups?: Array<[string, string[]]>, derivedTemplates?: string[] }} [options]
+ *   how the add-section dialog groups the placeable templates, and which of them
+ *   are derived (their content computed at publish, not authored).
+ */
+export function bindTemplateContract(contract, options = {}) {
 	bound = createTemplateContract(contract);
+	bound.sectionGroups = options.sectionGroups ?? null;
+	bound.derivedTemplates = new Set(options.derivedTemplates ?? []);
 	return bound;
+}
+/** The dialog's groups; null means one flat list of everything placeable. */
+export function sectionGroups() {
+	return current().sectionGroups;
+}
+/** @param {string} slug */
+export function isDerivedTemplate(slug) {
+	return current().derivedTemplates.has(slug);
 }
 function current() {
 	if (!bound) throw new Error('template contract not bound: import the site\'s template-contract.js first');

@@ -128,10 +128,16 @@ const ALLOWED_URL_SCHEMES = new Set(['http', 'https', 'mailto', 'tel']);
  * drop cap) are authored with it. Unknown tokens are dropped rather than the
  * whole attribute, so `class="ql-align-center evil"` keeps the alignment.
  */
+/**
+ * A site's own typographic classes (a drop cap, a lede) join the allowlist once,
+ * from its site module — the editor-wide `ql-*` alignment classes are always in.
+ * @param {string[]} classes
+ */
+export function allowRichTextClasses(classes) {
+	for (const name of classes) ALLOWED_CLASSES.add(name);
+}
+
 const ALLOWED_CLASSES = new Set([
-	'glc-dropcap',
-	'glc-lede',
-	'glc-scripture',
 	'ql-align-center',
 	'ql-align-justify',
 	'ql-align-right',

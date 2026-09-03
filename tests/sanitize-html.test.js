@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+	allowRichTextClasses,
 	decodeReferences,
 	isSafeUrl,
 	plainTextForAttribute,
@@ -104,6 +105,9 @@ test('the class allowlist keeps known tokens and drops the rest', () => {
 		sanitizeHtml('<p class="ql-align-center evil">x</p>'),
 		'<p class="ql-align-center">x</p>'
 	);
+	// A site's own class is dropped until the site allows it, then kept.
+	assert.equal(sanitizeHtml('<span class="glc-dropcap">W</span>'), '<span>W</span>');
+	allowRichTextClasses(['glc-dropcap']);
 	assert.equal(
 		sanitizeHtml('<span class="glc-dropcap">W</span>'),
 		'<span class="glc-dropcap">W</span>'

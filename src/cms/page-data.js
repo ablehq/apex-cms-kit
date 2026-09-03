@@ -237,7 +237,7 @@ export function projectBlocks(page, media) {
  * @param {unknown} page
  * @returns {{ title: string, description: string }}
  */
-export function cmsPageMeta(page) {
+export function cmsPageMeta(page, options = {}) {
 	const record = /** @type {Record<string, any>} */ (page ?? {});
 	const properties = Array.isArray(record.meta_properties) ? record.meta_properties : [];
 	/** @param {string} name */
@@ -248,7 +248,7 @@ export function cmsPageMeta(page) {
 
 	const description = value('description') || (record.summary ?? '');
 	return {
-		title: value('title') || record.title || 'Gospel Life Church',
+		title: value('title') || record.title || options.siteTitle || '',
 		description: plainTextForAttribute(typeof description === 'string' ? description : '')
 	};
 }

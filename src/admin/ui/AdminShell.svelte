@@ -70,7 +70,7 @@
 
 	/**
 	 * Publish. The one control in the admin that changes what a visitor sees: it
-	 * refreshes the committed snapshot from Apex and rebuilds the site.
+	 * fetches everything from Apex and writes the KV snapshot the site reads.
 	 *
 	 * The server's answer is reported verbatim. When this deployment has no way to
 	 * publish, that answer is a 501 whose `detail` names the binding that is missing,

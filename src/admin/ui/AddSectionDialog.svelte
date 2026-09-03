@@ -17,7 +17,12 @@
 	Legacy Svelte mode.
 -->
 <script>
-	import { placeableTemplates, getChildTemplates } from '../template-contract.js';
+	import {
+		placeableTemplates,
+		getChildTemplates,
+		sectionGroups,
+		isDerivedTemplate
+	} from '../template-contract.js';
 
 	export let open = false;
 	/** @type {import('../types').AdminTemplateRegistry} slug → provisioned Apex template. */
@@ -30,18 +35,10 @@
 	 * @typedef {import('../types').AdminBlockTemplateContract} AdminBlockTemplateContract
 	 */
 
-	const GROUPS = [
-		[
-			'Page structure',
-			['glc-hero', 'glc-page-heading', 'glc-section-heading', 'glc-prose', 'glc-pullquote']
-		],
-		['Church', ['glc-service-times', 'glc-sermons-strip', 'glc-doctrine-list', 'glc-contact-form']],
-		['Lists and media', ['glc-link-list', 'glc-video-grid']]
-	];
-
-	// The one section whose content is not written but derived — the strip of recent
-	// messages, filled from the published sermons.
-	const DERIVED = new Set(['glc-sermons-strip']);
+	// The site decides how templates are grouped (bound with its contract); without
+	// groups the dialog is one flat list of everything placeable.
+	const GROUPS = sectionGroups() ?? [['Sections', placeableTemplates().map((t) => t.slug)]];
+	const DERIVED = { has: isDerivedTemplate };
 
 	let query = '';
 	/** The search box, from `bind:this` — only read after mount. @type {HTMLInputElement} */

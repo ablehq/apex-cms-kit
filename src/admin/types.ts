@@ -166,10 +166,6 @@ export interface AdminTemplateSummary {
 /** slug → provisioned template. A slug the account has not provisioned is absent. */
 export type AdminTemplateRegistry = Record<string, AdminTemplateSummary>;
 
-// ── Sermon transcripts (plan §8, 3b) ────────────────────────────────────────
-
-// ── Articles, authors, resources (plan §8, 3d) ──────────────────────────────
-
 /**
  * One item of an asset-library gallery.
  *

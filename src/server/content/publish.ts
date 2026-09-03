@@ -170,11 +170,12 @@ export async function publishContent(options: PublishOptions): Promise<PublishRe
 	};
 	// `version` is the first property, which is what lets `readContent` skip the parse.
 	const serialised = JSON.stringify(snapshot);
-	if (serialised.length > MAX_BYTES) {
+	const bytes = new TextEncoder().encode(serialised).byteLength;
+	if (bytes > MAX_BYTES) {
 		return {
 			ok: false,
 			error: 'too_large',
-			detail: `the snapshot is ${(serialised.length / 1_048_576).toFixed(1)} MiB; KV holds 25 MiB per value and this refuses above 20.`
+			detail: `the snapshot is ${(bytes / 1_048_576).toFixed(1)} MiB; KV holds 25 MiB per value and this refuses above 20.`
 		};
 	}
 	await kv.put(CONTENT_KEY, serialised);

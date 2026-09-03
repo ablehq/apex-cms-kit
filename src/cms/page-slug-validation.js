@@ -13,43 +13,31 @@
 import { RESERVED_SLUG_PREFIX } from './slug.js';
 
 /**
- * Prefixes that are code, not content, and can never become CMS pages: the admin
- * and its API (the login page, the session routes and every BFF operation live
- * here), and the data-type routes, whose index and detail pages are generated from
- * archetype records. `/blogs/anything` is a blog post, not a page.
- *
+ * Which paths are code, not content. Every site reserves `/admin` and `/api`; a
+ * site adds its own generated trees (`/blogs`, `/sermons`, …), exact routes, and
+ * the static routes it is still porting to the CMS, with `bindReservedRoutes`.
  */
-export const RESERVED_PREFIXES = Object.freeze([
-	'/admin',
-	'/api',
-	'/blogs',
-	'/resources',
-	'/sermons'
-]);
+const bound = { prefixes: ['/admin', '/api'], routes: [], portable: [] };
 
 /**
- * Exact routes that are code, not content.
- *
- * `/` used to be here. It is not any more: the home page IS a CMS page (§2),
- * authored at `/`, and its hand-built route was deleted in the commit that put
- * that page live — so the catch-all answers `/` and a page authored there is
- * content, not a collision.
+ * @param {{ prefixes?: string[], routes?: string[], portable?: string[] }} config
+ *   `prefixes` — trees whose index and detail pages are generated (a page can never
+ *   be authored under them); `routes` — exact routes that are code; `portable` —
+ *   static routes being ported, which a CMS page may legitimately shadow.
  */
-export const RESERVED_ROUTES = Object.freeze([
-	// A form with a server action; nothing about it is authorable yet.
-	'/contact'
-]);
-
-/**
- * Static routes that are being ported to the CMS. A published CMS page may
- * legitimately exist at one of these slugs while the filesystem route still
- * shadows it — that is the correct temporary state (plan §7), and deleting the
- * route is a separate later commit, gated on the production page existing.
- *
- * They are listed rather than merely absent so that "is this slug free?" and
- * "does a route already answer here?" stay two different questions.
- */
-export const PORTABLE_ROUTES = Object.freeze(['/gospel', '/what-we-believe', '/who-we-are']);
+export function bindReservedRoutes(config) {
+	bound.prefixes = ['/admin', '/api', ...(config.prefixes ?? [])];
+	bound.routes = [...(config.routes ?? [])];
+	bound.portable = [...(config.portable ?? [])];
+	return reservedRoutes();
+}
+export function reservedRoutes() {
+	return {
+		RESERVED_PREFIXES: Object.freeze([...bound.prefixes]),
+		RESERVED_ROUTES: Object.freeze([...bound.routes]),
+		PORTABLE_ROUTES: Object.freeze([...bound.portable])
+	};
+}
 
 /**
  * @param {unknown} rawSlug
@@ -65,13 +53,13 @@ export function normalizeSlugPath(rawSlug) {
 /** @param {unknown} rawSlug */
 export function isReservedSlug(rawSlug) {
 	const slug = normalizeSlugPath(rawSlug);
-	if (RESERVED_ROUTES.includes(slug)) return true;
-	return RESERVED_PREFIXES.some((prefix) => slug === prefix || slug.startsWith(`${prefix}/`));
+	if (bound.routes.includes(slug)) return true;
+	return bound.prefixes.some((prefix) => slug === prefix || slug.startsWith(`${prefix}/`));
 }
 
 /** @param {unknown} rawSlug */
 export function isPortableRouteSlug(rawSlug) {
-	return PORTABLE_ROUTES.includes(normalizeSlugPath(rawSlug));
+	return bound.portable.includes(normalizeSlugPath(rawSlug));
 }
 
 /**

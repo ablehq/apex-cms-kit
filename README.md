@@ -29,6 +29,9 @@ Import paths: `@ablehq/apex-cms-kit/server/bff/guard` (TS, no extension),
 - `src/lib/admin/template-contract.js` — `bindTemplateContract(contract)`.
 - `src/hooks.server.ts` — `export const handle = adminHooks();`
 - `migrations/` — copy the kit's; apply with `wrangler d1 migrations apply`.
+- `src/kit-svelte.d.ts` — an ambient `declare module '@ablehq/apex-cms-kit/*.svelte'`
+  (the kit ships component source, not declaration files; copy gospel-life-church's).
+- `tsconfig.json` — `"maxNodeModuleJsDepth": 2`, so svelte-check reads the kit's JSDoc.
 - `.npmrc` — `install-links=true` when depending on a local checkout (`file:`), so
   the kit is copied, not symlinked, and resolves one copy of svelte/kit/zod.
 
