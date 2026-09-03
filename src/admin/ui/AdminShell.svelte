@@ -15,7 +15,6 @@
 	tracks inside a legacy-compiled component.
 -->
 <script>
-	import { onMount } from 'svelte';
 	import { page } from '$app/stores';
 	import { createBffClient } from '../bff-client.js';
 
@@ -56,8 +55,6 @@
 		return pathname === prefix || pathname.startsWith(`${prefix}/`);
 	}
 
-	onMount(() => {
-		void 	});
 
 	async function signOut() {
 		if (signingOut) return;
