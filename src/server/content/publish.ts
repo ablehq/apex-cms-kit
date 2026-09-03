@@ -149,6 +149,18 @@ export async function publishContent(options: PublishOptions): Promise<PublishRe
 		files.map((file) => [file.name, Array.isArray(file.records) ? file.records.length : 0])
 	);
 	if (!options.allowEmpty) {
+		// A collection the previous snapshot had and this one does not is the same
+		// hazard as one that emptied — the site's pages would render nothing and say
+		// nothing — so it is refused the same way rather than defaulting to `[]`.
+		for (const name of Object.keys(previous ?? {})) {
+			if (!(name in counts) && (previous?.[name] ?? 0) > 0) {
+				return {
+					ok: false,
+					error: 'empty_collection',
+					detail: `${name} is no longer published at all (the site has ${previous?.[name]}); publish again with allowEmpty to confirm.`
+				};
+			}
+		}
 		for (const [name, count] of Object.entries(counts)) {
 			const before = previous?.[name] ?? 0;
 			if (count === 0 && before > 0) {

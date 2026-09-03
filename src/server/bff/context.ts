@@ -44,6 +44,7 @@ export interface BffEnv {
 	PRIVATE_APEX_APPLICATION_ID?: string;
 	PRIVATE_APEX_APPLICATION_SECRET?: string;
 	PRIVATE_BFF_ALLOWED_ORIGINS?: string;
+	PUBLIC_ASSETS_PREFIX?: string;
 }
 
 /**
@@ -79,6 +80,8 @@ export interface BffContext {
 	 * operations refuse rather than guess when it is absent.
 	 */
 	contract?: ContentContract;
+	/** The site's public asset prefix, for composing media URLs the admin shows. */
+	assetsPrefix?: string;
 	/** The site's projection of raw Apex collections into what its loaders read (plan §2.3). */
 	project?: SiteProjection;
 	/** The fixed Apex account the operations target, recorded on audit rows. */
@@ -107,6 +110,7 @@ export function buildContext(event: { platform?: { env?: BffEnv } }): BffContext
 		}),
 		createApexClient: (token: string) => createApexAdminClient({ baseUrl, token }),
 		content: env.CONTENT,
+		assetsPrefix: env.PUBLIC_ASSETS_PREFIX,
 		accountId: env.PRIVATE_APEX_ACCOUNT_ID || env.PRIVATE_APEX_INGEST_ACCOUNT_ID || undefined,
 		db: env.DB
 	};

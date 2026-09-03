@@ -6,7 +6,7 @@ import { rejectMutation } from '../reject';
 import { cleanString, unwrapArchetypeRecord } from '../archetype-record';
 import { recordBodySchema, referenceFieldNames, summarizeRecord } from './record-shape';
 import { toApexFields } from './update-record';
-import { requireContract } from '../content-contract-guard';
+import { contractOf, noContractResponse } from '../content-contract-guard';
 import type { BffContext } from '../context';
 
 /**
@@ -35,7 +35,8 @@ export async function handleCreateRecord(
 	ctx: BffContext,
 	params: { schema: string }
 ): Promise<Response> {
-	const contract = requireContract(ctx);
+	const contract = contractOf(ctx);
+	if (!contract) return noContractResponse();
 	const meta = {
 		action: 'records.create',
 		method: 'POST',

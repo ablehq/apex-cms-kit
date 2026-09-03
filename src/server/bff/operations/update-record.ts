@@ -13,7 +13,7 @@ import {
 import { recordIdSchema } from './get-record';
 import { sanitizeFieldValue } from '../../../sanitize/write-boundary';
 import type { ContentLibraryFields, HasManyEntry } from '../apex-admin-client';
-import { requireContract } from '../content-contract-guard';
+import { contractOf, noContractResponse } from '../content-contract-guard';
 import type { BffContext } from '../context';
 
 /**
@@ -45,7 +45,8 @@ export async function handleUpdateRecord(
 	ctx: BffContext,
 	params: { schema: string; recordId: string }
 ): Promise<Response> {
-	const contract = requireContract(ctx);
+	const contract = contractOf(ctx);
+	if (!contract) return noContractResponse();
 	const meta = {
 		action: 'records.update',
 		method: 'PATCH',

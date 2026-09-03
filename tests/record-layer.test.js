@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 
 import { hasManyDiff, countReferencesTo } from '../src/server/bff/operations/record-shape.ts';
 import { handleDeleteRecord } from '../src/server/bff/operations/delete-record.ts';
+import { handleCreateRecord } from '../src/server/bff/operations/create-record.ts';
 import { createApexAdminClient } from '../src/server/bff/apex-admin-client.ts';
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
@@ -325,5 +326,133 @@ describe('allowedSchemaSlugs — a post archetype is unreachable, not merely dis
 			fetchImpl: async () => new Response('{}', { headers: { 'content-type': 'application/json' } })
 		});
 		assert.equal((await open.listContentLibrary('anything')).ok, true);
+	});
+});
+
+describe('the write path refuses what must never reach Apex', () => {
+	function apexRecording() {
+		const writes = [];
+		return {
+			writes,
+			async createContentLibraryRecord(slug, fields) {
+				writes.push({ slug, fields });
+				return { status: 201, ok: true, body: { data: { id: 'new-1', updated_at: 'now' } } };
+			},
+			async listContentLibrary() {
+				return {
+					status: 200,
+					ok: true,
+					body: { data: [], pagination: { total_count: 0, current_page: 1, total_pages: 1 } }
+				};
+			},
+			async getContentLibraryRecord() {
+				return { status: 200, ok: true, body: { data: { id: 'new-1', updated_at: 'now' } } };
+			}
+		};
+	}
+	const fieldContract = {
+		...contract,
+		primitiveFieldDefs: (slug) =>
+			slug === 'focus_area'
+				? [
+						{
+							field_name: 'title',
+							display_name: 'Title',
+							validator_kind: null,
+							text_inclusion: null,
+							is_required: false,
+							place_holder: null,
+							default_value: null
+						}
+					]
+				: [],
+		referenceItems: () => []
+	};
+	function ctxWith(apex) {
+		return {
+			allowedOrigins: parseAllowedOrigins(ORIGIN),
+			sessions: createMemorySessionStore(),
+			auth: {
+				async passwordGrant() {
+					return null;
+				},
+				async refreshGrant() {
+					return null;
+				},
+				async staffsMe() {
+					return null;
+				},
+				async revoke() {}
+			},
+			createApexClient: () => apex,
+			contract: fieldContract
+		};
+	}
+	async function signIn(ctx) {
+		const secret = createSessionSecret();
+		const now = Date.now();
+		await ctx.sessions.create({
+			id: await sessionIdFor(secret),
+			createdAt: now,
+			lastSeenAt: now,
+			expiresAt: now + 3600_000,
+			staffEmail: 'e@site.test',
+			staffId: 'aaaaaaaa-1111-4222-8333-444444444444',
+			staffName: 'E',
+			accessToken: 't',
+			tokenType: 'Bearer',
+			accessExpiresAt: now + 3600_000,
+			refreshToken: 'r'
+		});
+		return secret;
+	}
+	function post(session, body) {
+		return new Request(`${ORIGIN}/api/admin/records/focus_area`, {
+			method: 'POST',
+			headers: {
+				origin: ORIGIN,
+				'sec-fetch-site': 'same-origin',
+				'x-csrf-token': CSRF,
+				'content-type': 'application/json',
+				cookie: `apex_admin_session=${session}; apex_bff_csrf=${CSRF}`
+			},
+			body: JSON.stringify(body)
+		});
+	}
+
+	it('refuses a null primitive — it destroys the row upstream and strands the old value', async () => {
+		const apex = apexRecording();
+		const ctx = ctxWith(apex);
+		const response = await handleCreateRecord(
+			post(await signIn(ctx), { fields: { title: null } }),
+			ctx,
+			{
+				schema: 'focus_area'
+			}
+		);
+		assert.equal(response.status, 400);
+		assert.equal(apex.writes.length, 0, 'nothing was written');
+	});
+
+	it('sanitizes authored HTML on CREATE, not only on update', async () => {
+		const apex = apexRecording();
+		const ctx = ctxWith(apex);
+		const response = await handleCreateRecord(
+			post(await signIn(ctx), { fields: { title: '<a href="javascript:alert(1)">x</a>' } }),
+			ctx,
+			{ schema: 'focus_area' }
+		);
+		assert.equal(response.status, 201);
+		assert.equal(apex.writes.length, 1);
+		assert.doesNotMatch(String(apex.writes[0].fields.title), /javascript:/);
+	});
+
+	it('answers a JSON 500 — not a framework error page — when no contract is configured', async () => {
+		const ctx = { ...ctxWith(apexRecording()), contract: undefined };
+		const response = await handleCreateRecord(post(await signIn(ctx), { fields: {} }), ctx, {
+			schema: 'focus_area'
+		});
+		assert.equal(response.status, 500);
+		assert.equal(response.headers.get('content-type'), 'application/json');
 	});
 });

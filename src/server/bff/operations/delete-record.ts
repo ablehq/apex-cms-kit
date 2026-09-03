@@ -4,7 +4,7 @@ import { guardRequest } from '../guard';
 import { rejectMutation } from '../reject';
 import { countReferencesTo } from './record-shape';
 import { recordIdSchema } from './get-record';
-import { requireContract } from '../content-contract-guard';
+import { contractOf, noContractResponse } from '../content-contract-guard';
 import type { BffContext } from '../context';
 
 /**
@@ -52,7 +52,8 @@ export async function handleDeleteRecord(
 	ctx: BffContext,
 	params: { schema: string; recordId: string }
 ): Promise<Response> {
-	const contract = requireContract(ctx);
+	const contract = contractOf(ctx);
+	if (!contract) return noContractResponse();
 	const meta = {
 		action: 'records.delete',
 		method: 'DELETE',

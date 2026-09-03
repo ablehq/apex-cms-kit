@@ -3,7 +3,7 @@ import { guardRequest } from '../guard';
 import { archetypeIdSchema, readUpdatedAt, unwrapArchetypeRecord } from '../archetype-record';
 import { summarizeRecord } from './record-shape';
 import { loadReferenceTargets } from './list-records';
-import { requireContract } from '../content-contract-guard';
+import { contractOf, noContractResponse } from '../content-contract-guard';
 import type { BffContext } from '../context';
 
 /**
@@ -29,9 +29,10 @@ export async function handleGetRecord(
 	ctx: BffContext,
 	params: { schema: string; recordId: string }
 ): Promise<Response> {
-	const contract = requireContract(ctx);
 	const guard = await guardRequest(request, ctx, { mutation: false });
 	if (!guard.ok) return guard.response;
+	const contract = contractOf(ctx);
+	if (!contract) return noContractResponse();
 
 	if (!contract.isContentLibrarySlug(params.schema)) return bffError(404, 'unknown collection');
 	const idResult = recordIdSchema.safeParse(params.recordId);
@@ -61,9 +62,10 @@ export async function handleReadRecordVersion(
 	ctx: BffContext,
 	params: { schema: string; recordId: string }
 ): Promise<Response> {
-	const contract = requireContract(ctx);
 	const guard = await guardRequest(request, ctx, { mutation: false });
 	if (!guard.ok) return guard.response;
+	const contract = contractOf(ctx);
+	if (!contract) return noContractResponse();
 
 	if (!contract.isContentLibrarySlug(params.schema)) return bffError(404, 'unknown collection');
 	const idResult = recordIdSchema.safeParse(params.recordId);

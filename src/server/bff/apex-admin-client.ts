@@ -94,7 +94,7 @@ export type PostStatusEvent = 'publish' | 'unpublish';
  * runtime for values that arrive over the wire; this type enforces it for values
  * written in our own code.
  */
-export type ContentLibraryFields = Record<string, unknown>;
+export type ContentLibraryFields = Record<string, NonNullable<unknown>>;
 
 /**
  * One entry of a `has_many` reference write. Apex's upsert takes the WHOLE desired

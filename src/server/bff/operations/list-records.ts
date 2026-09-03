@@ -5,7 +5,7 @@ import { PAGE_SIZE, summarizeRecord } from './record-shape';
 import type { AdminRecord } from './record-shape';
 import type { ApexAdminClient } from '../apex-admin-client';
 import type { ContentContract } from '../content-contract';
-import { requireContract } from '../content-contract-guard';
+import { contractOf, noContractResponse } from '../content-contract-guard';
 import type { BffContext } from '../context';
 
 /**
@@ -13,7 +13,7 @@ import type { BffContext } from '../context';
  *
  * A read, so no CSRF, but the full boundary + session + Apex-token guard.
  *
- * None of Godrej's four content-library types has a status of any kind: no draft,
+ * No content-library type carries a status of any kind: no draft,
  * no publish, no archive. Everything in these collections is part of the next
  * deploy the moment it is saved, and the list screen says so where the status tabs
  * would be rather than implying a draft state that does not exist.
@@ -31,9 +31,10 @@ export async function handleListRecords(
 	ctx: BffContext,
 	params: { schema: string }
 ): Promise<Response> {
-	const contract = requireContract(ctx);
 	const guard = await guardRequest(request, ctx, { mutation: false });
 	if (!guard.ok) return guard.response;
+	const contract = contractOf(ctx);
+	if (!contract) return noContractResponse();
 
 	if (!contract.isContentLibrarySlug(params.schema)) return bffError(404, 'unknown collection');
 	const schema = contract.schema(params.schema);

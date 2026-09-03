@@ -8,7 +8,7 @@
 // ── WHAT IS DIFFERENT FROM GLC'S, AND WHY (plan §4.4) ──────────────────────────
 // GLC's version declares its schemas as hard-coded name lists and coerces every
 // value through `String(value)`. It gets away with that because neither of its two
-// content-library schemas has a non-string field. Godrej's have three:
+// content-library schemas has a non-string field. the site's have three:
 // `team_member.description` and `focus_area.our_approach` are rich text
 // (`{html, editor, content}`), and every one of the four types has at least one
 // gallery reference. `String({html: …})` is `"[object Object]"` — in the form, and
@@ -40,10 +40,13 @@
 // References are the exception, and they have their own setters that say so.
 
 function clone(value) {
-	// Rich text and reference arrays are plain JSON, so `structuredClone` is exact.
-	// It also throws on a `$state` proxy, which is why the admin subtree is pinned
-	// to legacy compile mode (svelte.config.js).
-	return typeof value === 'object' && value !== null ? structuredClone(value) : value;
+	try {
+		return structuredClone(value);
+	} catch {
+		// A `$state` proxy (or anything else structuredClone refuses) — fall back to a
+		// structural copy rather than throwing inside a draft the editor is typing into.
+		return JSON.parse(JSON.stringify(value));
+	}
 }
 
 /**

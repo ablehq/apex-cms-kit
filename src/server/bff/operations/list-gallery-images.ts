@@ -76,18 +76,37 @@ export interface AdminGalleryImageRecord {
 	alt: string;
 	position: number;
 	createdAt: string;
+	/**
+	 * A thumbnail to draw, when the site can compose one. `null` is the honest
+	 * answer for a deployment with no assets prefix — the picker then shows the id,
+	 * which is what it did before any site could resolve a URL.
+	 */
+	url: string | null;
 }
 
 /** Normalize one `Cms::GalleryItem`. Rows without an id are dropped, not rendered blank. */
-export function summarizeGalleryImage(row: Record<string, unknown>): AdminGalleryImageRecord {
+export function summarizeGalleryImage(
+	row: Record<string, unknown>,
+	assetsPrefix = ''
+): AdminGalleryImageRecord {
+	const medium = isPlainRecord(row.medium) ? row.medium : null;
+	const file = medium && isPlainRecord(medium.file) ? medium.file : null;
+	const key = file ? cleanString(file.key) : '';
 	return {
 		id: cleanString(row.id),
 		galleryId: cleanString(row.gallery_id),
 		caption: cleanString(row.caption),
 		alt: cleanString(row.alt),
 		position: typeof row.position === 'number' ? row.position : 0,
-		createdAt: cleanString(row.created_at)
+		createdAt: cleanString(row.created_at),
+		// The same transform the public pages use, so the picker shows what the site
+		// will show.
+		url: assetsPrefix && key ? `${assetsPrefix}/cdn-cgi/image/f=auto,w=auto/${key}` : null
 	};
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 /** The account's `images` gallery id, resolved by name from `cms_config`. */
@@ -115,7 +134,8 @@ export async function readImagesGalleryId(apex: ApexAdminClient): Promise<string
  * the screen says something different about each.
  */
 export async function loadImagesGallery(
-	apex: ApexAdminClient
+	apex: ApexAdminClient,
+	assetsPrefix = ''
 ): Promise<{ galleryId: string; images: AdminGalleryImageRecord[] } | null> {
 	const galleryId = await readImagesGalleryId(apex);
 	if (!galleryId) return null;
@@ -124,7 +144,7 @@ export async function loadImagesGallery(
 	if (!listed.ok) return null;
 
 	const images = unwrapArchetypeCollection(listed.body)
-		.map(summarizeGalleryImage)
+		.map((row) => summarizeGalleryImage(row, assetsPrefix))
 		.filter((image) => image.id.length > 0)
 		// Newest first, like every other collection in this admin. `position` is what
 		// Apex sorts a gallery by for RENDERING; the library screen is a filing
@@ -137,9 +157,10 @@ export async function loadImagesGallery(
 /** The item with this id, only if it is in the IMAGES gallery. `null` otherwise. */
 export async function findImage(
 	apex: ApexAdminClient,
-	imageId: string
+	imageId: string,
+	assetsPrefix = ''
 ): Promise<AdminGalleryImageRecord | null> {
-	const gallery = await loadImagesGallery(apex);
+	const gallery = await loadImagesGallery(apex, assetsPrefix);
 	if (!gallery) return null;
 	return gallery.images.find((image) => image.id === imageId) ?? null;
 }
@@ -148,7 +169,9 @@ export async function handleListImages(request: Request, ctx: BffContext): Promi
 	const guard = await guardRequest(request, ctx, { mutation: false });
 	if (!guard.ok) return guard.response;
 
-	const gallery = await loadImagesGallery(guard.apex);
+	// The site's CDN prefix, when it has one: with it the picker browses thumbnails,
+	// without it the ids, which is what it did before any site could resolve a URL.
+	const gallery = await loadImagesGallery(guard.apex, ctx.assetsPrefix ?? '');
 	if (!gallery) return bffError(502, 'upstream error');
 
 	// The gate travels WITH the data, so the button's state is a server fact rather

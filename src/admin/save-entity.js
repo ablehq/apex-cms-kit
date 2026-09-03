@@ -4,7 +4,7 @@
 // the stale guard checked ONCE before any write, stop on the first failure,
 // re-baseline at the end, no autosave anywhere.
 //
-// It is shorter than GLC's because a Godrej content-library record is ONE Apex
+// It is shorter than GLC's because a the site content-library record is ONE Apex
 // record. GLC's `saveEntity` also reconciles a resource's tags, and its
 // `saveArticle` sequences three endpoints; neither applies here. What replaces them
 // is a single PATCH that carries the dirty fields AND the reference selections
