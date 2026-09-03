@@ -207,7 +207,7 @@ export function readTaggingsStrict(record: Record<string, unknown>): StrictTaggi
  * it the other way round would show an editor a value the public page does not
  * render.
  *
- * The value is returned UNNARROWED. Godrej's content library holds rich text —
+ * The value is returned UNNARROWED. A content library may hold rich text —
  * `team_member.description` and `focus_area.our_approach` are
  * `{html, editor, content}` objects — and coercing here is exactly the
  * `[object Object]` defect §4.4 is about.

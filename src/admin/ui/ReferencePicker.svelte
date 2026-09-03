@@ -16,7 +16,7 @@
 
 	── THE ONE DEVIATION THIS PLAN MAKES (§5.0, deviation 1) ─────────────────────
 	GLC's picker is SINGLE-select: one `selectedId`, a one-id callback, used only as
-	the article author picker. Godrej's `partner.focus_area` is `has_many`, and so
+	the article author picker. A `has_many` relation needs a set, and so
 	are both post types' `focus_area` and `partner`. That is an ARITY change to this
 	component, not a new component: the same `.card` grid, the same dialog markup,
 	with a SET instead of an id.
