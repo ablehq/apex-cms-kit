@@ -22,9 +22,17 @@
 	export let galleryId = '';
 	/** @type {import('../types').BffClient | null} the same-origin BFF client */
 	export let client = null;
+	/**
+	 * Images to BROWSE, when the site has already listed them. Empty means upload
+	 * only, which is what a site whose BFF has no media list can offer.
+	 * @type {Array<{ id: string, url?: string | null, caption?: string, alt?: string }>}
+	 */
+	export let images = [];
 	/** @type {(galleryItemId: string) => void} */
 	export let onSelect = () => {};
 	export let onClose = () => {};
+	/** Called after a successful upload, so a caller can refresh its list. */
+	export let onUploaded = () => {};
 
 	/** @type {File | null} */
 	let file = null;

@@ -22,6 +22,28 @@
 	/** @type {Record<string, unknown>} */
 	export let fieldsData = {};
 	export let editable = true;
+	/** Every control read-only while a save is in flight. */
+	export let disabled = false;
+	/**
+	 * Resolve a gallery-item id to a thumbnail URL, when the site can. Returning
+	 * `null` (the default) draws the placeholder frame and the id, which is the
+	 * honest answer for a site whose BFF has no media read.
+	 * @type {(id: string) => string | null}
+	 */
+	export let mediaUrl = () => null;
+	/**
+	 * What Remove emits on a media field. Apex's delete marker by default — the one
+	 * spelling that clears a value rather than being merged away as "no change". A
+	 * site whose fields are archetype primitives passes `''`.
+	 * @type {string}
+	 */
+	export let emptyValue = DELETE_MARKER;
+	/**
+	 * Optional per-field help, by field name — for fields whose NAME does not say
+	 * what they are for.
+	 * @type {Record<string, string>}
+	 */
+	export let hints = {};
 	/** @type {(name: string, value: unknown) => void} */
 	export let onChange = () => {};
 	/** @type {((name: string) => void) | null} */
@@ -163,13 +185,22 @@
 							and goes through the BFF.
 						-->
 						<div class="media">
-							<span class="thumb" aria-hidden="true">
-								<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.25">
-									<rect x="3" y="4" width="18" height="16" rx="2" />
-									<circle cx="8.5" cy="9.5" r="1.6" />
-									<path d="M3 16.5l5-4 4 3 3-2.5 6 5" />
-								</svg>
-							</span>
+							{#if mediaIdOf(def.field_name) && mediaUrl(mediaIdOf(def.field_name))}
+								<img
+									class="thumb"
+									src={mediaUrl(mediaIdOf(def.field_name))}
+									alt=""
+									aria-hidden="true"
+								/>
+							{:else}
+								<span class="thumb" aria-hidden="true">
+									<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.25">
+										<rect x="3" y="4" width="18" height="16" rx="2" />
+										<circle cx="8.5" cy="9.5" r="1.6" />
+										<path d="M3 16.5l5-4 4 3 3-2.5 6 5" />
+									</svg>
+								</span>
+							{/if}
 							<div>
 								<div class="tpl">{mediaIdOf(def.field_name) || 'No image yet'}</div>
 								<div style="display:flex;gap:.35rem;margin-top:.4rem">
@@ -177,15 +208,15 @@
 										class="btn btn-sm"
 										type="button"
 										on:click={() => onPickMedia && onPickMedia(def.field_name)}
-										disabled={!onPickMedia}
+										disabled={disabled || !onPickMedia}
 									>
 										{mediaIdOf(def.field_name) ? 'Replace' : 'Upload'}
 									</button>
 									<button
 										class="btn btn-sm btn-quiet danger"
 										type="button"
-										disabled={!mediaIdOf(def.field_name)}
-										on:click={() => onChange(def.field_name, DELETE_MARKER)}
+										disabled={disabled || !mediaIdOf(def.field_name)}
+										on:click={() => onChange(def.field_name, emptyValue)}
 									>
 										Remove
 									</button>
