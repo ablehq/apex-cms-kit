@@ -39,7 +39,6 @@
 //
 // References are the exception, and they have their own setters that say so.
 
-
 function clone(value) {
 	// Rich text and reference arrays are plain JSON, so `structuredClone` is exact.
 	// It also throws on a `$state` proxy, which is why the admin subtree is pinned
