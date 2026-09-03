@@ -124,7 +124,11 @@ export async function publishContent(options: PublishOptions): Promise<PublishRe
 	const references = collectArchetypeReferences(
 		raw as Parameters<typeof collectArchetypeReferences>[0]
 	);
-	const archetypes = await inBatches(references, 5, async ({ archetypeSlug, archetypeId }) => {
+	const archetypes = await inBatches(references, 5, async (reference) => {
+		const { archetypeSlug, archetypeId } = reference as {
+			archetypeSlug: string;
+			archetypeId: string;
+		};
 		const path = `${PLATFORM}/specification/archetype_schemas/${encodeURIComponent(archetypeSlug)}/archetypes/${encodeURIComponent(archetypeId)}`;
 		const response = await apex.get(path, {});
 		if (!response.ok)
