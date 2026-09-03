@@ -39,7 +39,6 @@
 //
 // References are the exception, and they have their own setters that say so.
 
-import { archetypeSchema, primitiveFieldDefs, referenceItems } from './contract';
 
 function clone(value) {
 	// Rich text and reference arrays are plain JSON, so `structuredClone` is exact.
