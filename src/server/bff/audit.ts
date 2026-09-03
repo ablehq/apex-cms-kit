@@ -25,6 +25,11 @@ export interface AuditEntry {
 	 * mistaken for a person even when the email half looks like one. Absent/null
 	 * means a legacy row, which was always a human.
 	 */
+	/**
+	 * Who acted. Defaults to `'human'`: every admin operation is a person, and the
+	 * column is NOT NULL, so an omitted value must resolve to something true rather
+	 * than to a constraint failure at the moment of the write it was auditing.
+	 */
 	actorKind?: 'human' | 'service' | null;
 	action: string;
 	method: string;
@@ -70,7 +75,7 @@ export async function appendAuditEntry(db: BffDatabase, entry: AuditEntry): Prom
 			entry.occurredAt,
 			entry.actorEmail,
 			entry.actorSub ?? null,
-			entry.actorKind ?? null,
+			entry.actorKind ?? 'human',
 			entry.action,
 			entry.method,
 			entry.path,
