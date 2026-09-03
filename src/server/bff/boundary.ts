@@ -20,7 +20,7 @@
  * carrying only the signed-in editor's own bearer token, which the browser never sees.
  */
 
-const CSRF_COOKIE = 'apex_bff_csrf';
+import { CSRF_COOKIE } from '../../cookies';
 const SAFE_METHODS = new Set(['GET', 'HEAD']);
 
 export type BoundaryResult = { ok: true } | { ok: false; status: number; reason: string };

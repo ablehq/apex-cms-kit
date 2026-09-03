@@ -17,7 +17,8 @@ import { RESERVED_SLUG_PREFIX } from './slug.js';
  * site adds its own generated trees (`/blogs`, `/sermons`, …), exact routes, and
  * the static routes it is still porting to the CMS, with `bindReservedRoutes`.
  */
-const bound = { prefixes: ['/admin', '/api'], routes: [], portable: [] };
+/** @type {{ prefixes: string[], routes: string[], portable: string[] } | null} */
+let bound = null;
 
 /**
  * @param {{ prefixes?: string[], routes?: string[], portable?: string[] }} config
@@ -26,16 +27,24 @@ const bound = { prefixes: ['/admin', '/api'], routes: [], portable: [] };
  *   static routes being ported, which a CMS page may legitimately shadow.
  */
 export function bindReservedRoutes(config) {
-	bound.prefixes = ['/admin', '/api', ...(config.prefixes ?? [])];
-	bound.routes = [...(config.routes ?? [])];
-	bound.portable = [...(config.portable ?? [])];
+	bound = {
+		prefixes: ['/admin', '/api', ...(config.prefixes ?? [])],
+		routes: [...(config.routes ?? [])],
+		portable: [...(config.portable ?? [])]
+	};
 	return reservedRoutes();
 }
+/** Fails closed: a site that never bound its routes cannot validate a slug. */
+function current() {
+	if (!bound) throw new Error("reserved routes not bound: import the site's site.js first");
+	return bound;
+}
 export function reservedRoutes() {
+	const b = current();
 	return {
-		RESERVED_PREFIXES: Object.freeze([...bound.prefixes]),
-		RESERVED_ROUTES: Object.freeze([...bound.routes]),
-		PORTABLE_ROUTES: Object.freeze([...bound.portable])
+		RESERVED_PREFIXES: Object.freeze([...b.prefixes]),
+		RESERVED_ROUTES: Object.freeze([...b.routes]),
+		PORTABLE_ROUTES: Object.freeze([...b.portable])
 	};
 }
 
@@ -53,13 +62,13 @@ export function normalizeSlugPath(rawSlug) {
 /** @param {unknown} rawSlug */
 export function isReservedSlug(rawSlug) {
 	const slug = normalizeSlugPath(rawSlug);
-	if (bound.routes.includes(slug)) return true;
-	return bound.prefixes.some((prefix) => slug === prefix || slug.startsWith(`${prefix}/`));
+	if (current().routes.includes(slug)) return true;
+	return current().prefixes.some((prefix) => slug === prefix || slug.startsWith(`${prefix}/`));
 }
 
 /** @param {unknown} rawSlug */
 export function isPortableRouteSlug(rawSlug) {
-	return bound.portable.includes(normalizeSlugPath(rawSlug));
+	return current().portable.includes(normalizeSlugPath(rawSlug));
 }
 
 /**

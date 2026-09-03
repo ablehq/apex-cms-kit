@@ -1,6 +1,6 @@
 // @ts-nocheck — legacy-mode admin browser module (plan §8, 3a compile-mode (a)).
 // Deliberately untyped JS to sit beside the legacy-compiled admin components; its
-// behavior is covered by tests/admin-save-page.test.js + tests/bff-realapex.test.js.
+// behavior is covered by the consuming site's page-form tests.
 
 // The admin's field-definition source is the COMMITTED template contract (plan §8,
 // 3a: "BlockFieldEditor edits block field values per the template contract's field
@@ -120,7 +120,4 @@ export function getFieldDefs(...args) {
 }
 export function getChildTemplates(...args) {
 	return current().getChildTemplates(...args);
-}
-export function templateContract() {
-	return current().TEMPLATE_CONTRACT;
 }

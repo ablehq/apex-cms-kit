@@ -8,8 +8,6 @@
  * isolate already holds it from the first bytes, without parsing megabytes again.
  */
 
-import { error } from '@sveltejs/kit';
-
 export const CONTENT_KEY = 'content';
 
 /** The subset of a KV namespace this module uses, so tests can pass a Map. */
@@ -63,21 +61,6 @@ export async function readContent(kv: ContentStore | undefined): Promise<Content
 		});
 	}
 	return inflight;
-}
-
-/** For loaders: the collections, keyed by snapshot file name (`pages`, `youtube_videos`, …). */
-export async function siteContent(
-	platform: { env?: { CONTENT?: ContentStore } } | undefined
-): Promise<Record<string, unknown[]>> {
-	try {
-		return (await readContent(platform?.env?.CONTENT)).collections;
-	} catch (cause) {
-		// A site with nothing published is a 503 with a sentence, not a stack trace —
-		// and a public one: the binding's name stays in the thrown error for the logs.
-		if (cause instanceof ContentUnavailableError)
-			error(503, 'This site has not been published yet.');
-		throw cause;
-	}
 }
 
 export function manifestOf(snapshot: ContentSnapshot): ContentManifest {

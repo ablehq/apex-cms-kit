@@ -36,6 +36,31 @@ export const PAGES_BASE = '/api/platform/v1/cms/pages';
 export const ENTITY_TYPES_BASE = '/api/platform/v1/content_library/entity_types';
 export const GALLERY_BASE = '/api/platform/v1/cms/gallery_items';
 export const MEDIA_BASE = '/api/platform/v1/media';
+/**
+ * PLATFORM route, not `/api/v1/…`. Read this before "simplifying" either half.
+ *
+ * BOTH routes exist upstream and BOTH work — but each takes a DIFFERENT body, and
+ * the route and the body must be changed together or not at all. Measured against
+ * local Apex on 2026-07-31, all four combinations:
+ *
+ *   /api/v1/media/signed_upload_url           {file:{…}} envelope  → 200
+ *   /api/v1/media/signed_upload_url           flat scalars         → 422 "param is
+ *                                                  missing … : file"   (probe G4)
+ *   /api/platform/v1/media/signed_upload_url  {file:{…}} envelope  → 422 "Filename
+ *                                                  can't be blank, …"
+ *   /api/platform/v1/media/signed_upload_url  flat scalars         → 200 (G5/G6)
+ *
+ * So the earlier `/api/v1` + envelope pairing was NOT broken; it was one of the two
+ * self-consistent pairs. It moved here for one reason: the FINALIZE leg of this same
+ * upload (`MEDIA_BASE`, below) is `/api/platform/v1/media`, so the flow used to mint
+ * a `signed_id` on one API tree and redeem it on another. Both legs now live on the
+ * platform tree, which is also the surface the 3d probe matrix records as canonical
+ * and the tree every other route in this file already uses.
+ *
+ * The mismatched pairs both fail LOUDLY (422), never silently — so a half-applied
+ * change here cannot lose data the way the `archetypes`-vs-`archetype_models` write
+ * hazard documented on `updateSermonTranscript` can.
+ */
 export const SIGNED_UPLOAD = '/api/platform/v1/media/signed_upload_url';
 export const ARCHETYPES_BASE = '/api/platform/v1/specification/archetypes';
 export const ARCHETYPE_SCHEMAS_BASE = '/api/platform/v1/specification/archetype_schemas';
@@ -227,6 +252,33 @@ function flattenQuery(query: Record<string, unknown>, prefix = '', into = new UR
 	return into;
 }
 
+/**
+ * The Apex client (plan §8, 3a; ADR-1 as revised 2026-07-31). Every Apex call the
+ * BFF makes runs server-side with the SIGNED-IN EDITOR's own Apex staff token,
+ * taken from their server-side session — which is why Apex's own audit now names
+ * the person who made a change instead of a shared `glc-admin-bff` machine login.
+ * NO Apex token of any kind ever reaches the browser.
+ *
+ * The token is a plain constructor argument, so this client is not tied to how the
+ * caller got one. PHASE 3c's INGEST path is a machine caller by design and will
+ * construct this same client with a machine token of its own — nothing here needs
+ * to change for it, and nothing it needs has been removed (see
+ * `src/routes/api/ingest/+server.ts` and `docs/runbooks/glc-admin-bff-token.md` §2).
+ * What no longer exists is a machine principal in the ADMIN path.
+ *
+ * Boundary hygiene on the upstream side: a fresh `Headers` (inbound cookies and
+ * arbitrary headers are never forwarded), a FIXED origin the request can never be
+ * redirected off of (`redirect: 'manual'`, origin re-checked), and upstream
+ * `Set-Cookie` is never propagated (only the JSON body is read).
+ *
+ * ONE read here carries a correctness obligation beyond transport: the ingest
+ * catalogue page (`listSermonsPage`) is read under a FIXED ASCENDING ORDER —
+ * Arpan's ruling of 2026-08-09, option B (stable ordering plus a tripwire), on
+ * codex round-3 blocker #2. Apex serves `search_and_filter` from a live table
+ * with no ordering guarantee, so stable pagination TOTALS never proved the pages
+ * came from one snapshot. `CATALOGUE_SORTS` below is the ordering half; the
+ * tripwire half lives on `sweepSermonCatalogue` in `ingest-reservation.ts`.
+ */
 export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdminClient {
 	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
 	if (!options.baseUrl) throw new Error('Apex base URL is not configured');

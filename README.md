@@ -33,7 +33,12 @@ Import paths: `@ablehq/apex-cms-kit/server/bff/guard` (TS, no extension),
   (the kit ships component source, not declaration files; copy gospel-life-church's).
 - `tsconfig.json` — `"maxNodeModuleJsDepth": 2`, so svelte-check reads the kit's JSDoc.
 - `.npmrc` — `install-links=true` when depending on a local checkout (`file:`), so
-  the kit is copied, not symlinked, and resolves one copy of svelte/kit/zod.
+  the kit is copied, not symlinked, and resolves one copy of svelte/kit/zod. The copy
+  is stale until `npm run kit:sync` (rm the copy, `npm install`) — `vite dev` will not
+  see a kit edit before that.
+- `src/lib/site.js` — binds what the kit leaves to the site: `bindReservedRoutes`,
+  `allowRichTextClasses`, and the template contract (`bindTemplateContract`); import it
+  from the root `+layout.svelte` and `hooks.server.ts`.
 
 Cookies are `apex_admin_session` and `apex_bff_csrf` on every site.
 

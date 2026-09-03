@@ -31,7 +31,12 @@
 		isDirty
 	} from '../page-draft.js';
 	import { savePage } from '../save-page.js';
-	import { getFieldDefs, getTemplate, getChildTemplates } from '../template-contract.js';
+	import {
+		getFieldDefs,
+		getTemplate,
+		getChildTemplates,
+		isDerivedTemplate
+	} from '../template-contract.js';
 	import { getOutlineInsertionIndex } from '../outline-drag.js';
 	import BlockFieldEditor from './BlockFieldEditor.svelte';
 	import AddSectionDialog from './AddSectionDialog.svelte';
@@ -56,7 +61,6 @@
 
 	// The one section whose content is derived rather than written — the strip of
 	// recent messages, filled from the published sermons.
-	const DERIVED = new Set(['glc-sermons-strip']);
 
 	let draft = createDraft(initialPage, initialVersion);
 	let tab = 'sections';
@@ -111,7 +115,7 @@
 	 */
 	function badgeOf(block) {
 		const slug = slugOf(block);
-		if (DERIVED.has(slug)) return 'auto';
+		if (isDerivedTemplate(slug)) return 'auto';
 		const children = block?.blockable?.child_template_instances;
 		if (getChildTemplates(slug).length > 0) return `${children ? children.length : 0} items`;
 		return '';
@@ -564,7 +568,7 @@
 				</div>
 				<p class="hint">
 					{selectedTemplate ? (selectedTemplate.description ?? '') : ''}
-					{#if DERIVED.has(selectedSlug)}
+					{#if isDerivedTemplate(selectedSlug)}
 						The messages themselves come from published sermons — there is nothing to write here.
 					{/if}
 				</p>

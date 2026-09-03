@@ -7,11 +7,14 @@
 	"repository": "github:ablehq/apex-cms-kit",
 	"svelte": "./src/index.js",
 	"exports": {
+		".": {
+			"svelte": "./src/index.js",
+			"default": "./src/index.js"
+		},
 		"./*.svelte": "./src/*.svelte",
 		"./*.js": "./src/*.js",
 		"./*.ts": "./src/*.ts",
 		"./*.css": "./src/*.css",
-		"./*.d.ts": "./src/*.d.ts",
 		"./migrations/*": "./migrations/*",
 		"./*": "./src/*.ts"
 	},

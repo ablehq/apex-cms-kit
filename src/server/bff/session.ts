@@ -31,7 +31,8 @@
 import type { BffDatabase } from './d1';
 
 /** The opaque session cookie. httpOnly — the browser's JS must never read it. */
-export const SESSION_COOKIE = 'apex_admin_session';
+export { SESSION_COOKIE } from '../../cookies';
+import { SESSION_COOKIE } from '../../cookies';
 
 /**
  * How long a session may live at most, regardless of activity. Twelve hours is one

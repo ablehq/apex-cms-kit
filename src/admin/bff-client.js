@@ -13,7 +13,7 @@
 // session + CSRF cookies. Reads throw on failure (savePage catches); mutations resolve
 // to a normalized `{ ok, status, ... }` so the caller can branch without a try/catch.
 
-const CSRF_COOKIE = 'apex_bff_csrf';
+import { CSRF_COOKIE } from '../cookies.js';
 
 function readCsrfToken() {
 	if (typeof document === 'undefined') return '';
