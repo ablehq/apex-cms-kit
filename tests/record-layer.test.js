@@ -109,7 +109,8 @@ describe('countReferencesTo — fails closed', () => {
 								]
 							},
 							{ id: 'p2', archetype_items: [] }
-						]
+						],
+						pagination: { total_count: 2, current_page: 1, total_pages: 1 }
 					}
 				}
 			}),
@@ -118,6 +119,40 @@ describe('countReferencesTo — fails closed', () => {
 		);
 		assert.equal(counted.ok, true);
 		assert.equal(counted.count, 1);
+	});
+
+	it('reads EVERY page — a reference on page two is not zero', async () => {
+		const ref = (targetId) => ({
+			id: 'p',
+			archetype_items: [
+				{
+					id: 'join',
+					relatable_type: 'Specification::Archetype',
+					archetype_schema_item: { name: 'focus_area' },
+					fields_data: { focus_area: targetId }
+				}
+			]
+		});
+		const pages = {
+			1: { data: [ref('other')], pagination: { total_count: 2, current_page: 1, total_pages: 2 } },
+			2: { data: [ref('fa-1')], pagination: { total_count: 2, current_page: 2, total_pages: 2 } }
+		};
+		const apex = {
+			async listContentLibrary(_slug, query) {
+				return { status: 200, ok: true, body: pages[query.page] };
+			}
+		};
+		const counted = await countReferencesTo(contract, apex, 'focus_area', 'fa-1');
+		assert.deepEqual([counted.ok, counted.count], [true, 1]);
+	});
+
+	it('missing pagination metadata is {ok:false} — we cannot know there is no page two', async () => {
+		const apex = {
+			async listContentLibrary() {
+				return { status: 200, ok: true, body: { data: [] } };
+			}
+		};
+		assert.equal((await countReferencesTo(contract, apex, 'focus_area', 'fa-1')).ok, false);
 	});
 
 	it('a leg that will not read is {ok:false}, never a partial count read as complete', async () => {
@@ -230,7 +265,8 @@ describe('DELETE /records/:schema/:id — the in-use refusal', () => {
 									}
 								]
 							}
-						]
+						],
+						pagination: { total_count: 1, current_page: 1, total_pages: 1 }
 					}
 				};
 			},

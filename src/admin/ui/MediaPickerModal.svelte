@@ -103,6 +103,7 @@
 				return;
 			}
 			onSelect(signed.galleryItemId);
+			onUploaded(signed.galleryItemId);
 			close();
 		} catch {
 			error = 'The upload failed. Try again.';
@@ -122,7 +123,7 @@
 	<div class="adm-scrim">
 		<div class="dlg" role="dialog" aria-modal="true" aria-labelledby="media-dialog-title">
 			<header>
-				<h2 id="media-dialog-title">Upload an image</h2>
+				<h2 id="media-dialog-title">{images.length ? 'Choose an image' : 'Upload an image'}</h2>
 				<button
 					class="btn btn-sm btn-quiet"
 					type="button"
@@ -135,6 +136,35 @@
 			</header>
 
 			<div class="body">
+				{#if images.length}
+					<!--
+						Browse: a site that can list its gallery shows what is already there,
+						because uploading a second copy of an image you already have is the
+						thing an editor does when a picker only offers Upload.
+					-->
+					<ul class="media-grid">
+						{#each images as image (image.id)}
+							<li>
+								<button
+									class="media-tile"
+									type="button"
+									title={image.caption || image.alt || image.id}
+									on:click={() => {
+										onSelect(image.id);
+										close();
+									}}
+								>
+									{#if image.url}
+										<img src={image.url} alt={image.alt || ''} loading="lazy" />
+									{:else}
+										<span class="tpl">{image.id}</span>
+									{/if}
+								</button>
+							</li>
+						{/each}
+					</ul>
+					<p class="notice">…or upload a new one.</p>
+				{/if}
 				{#if !galleryId}
 					<p class="notice">No upload destination is configured for this workspace yet.</p>
 				{:else}

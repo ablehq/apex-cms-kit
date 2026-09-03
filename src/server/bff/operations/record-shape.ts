@@ -172,14 +172,27 @@ export async function countReferencesTo(
 	const { countable } = contract.referrersTo(targetSlug);
 	let count = 0;
 	for (const referrer of countable) {
-		const listed = await apex.listContentLibrary(referrer.slug, {
-			per_page: PAGE_SIZE,
-			page: 1
-		});
-		if (!listed.ok) return { ok: false };
-		for (const record of unwrapArchetypeCollection(listed.body)) {
-			const references = readReferences(record, referrer.itemName);
-			if (references.some((reference) => reference.targetId === targetId)) count += 1;
+		// EVERY page. A referrer on page two counted as zero is the one answer that
+		// must never be a guess: it reads as "nothing uses this" and talks an editor
+		// into a delete that silently strips the reference.
+		let page = 1;
+		for (;;) {
+			const listed = await apex.listContentLibrary(referrer.slug, {
+				per_page: PAGE_SIZE,
+				page
+			});
+			if (!listed.ok) return { ok: false };
+			for (const record of unwrapArchetypeCollection(listed.body)) {
+				const references = readReferences(record, referrer.itemName);
+				if (references.some((reference) => reference.targetId === targetId)) count += 1;
+			}
+			const pagination = (listed.body as { pagination?: { total_pages?: unknown } } | null)
+				?.pagination;
+			const totalPages = pagination?.total_pages;
+			// No pagination metadata means we cannot know there is no page two.
+			if (!Number.isInteger(totalPages)) return { ok: false };
+			if (page >= Math.max(1, totalPages as number)) break;
+			page += 1;
 		}
 	}
 	return { ok: true, count };
