@@ -1,10 +1,12 @@
 # @ablehq/apex-cms-kit
 
-The site-side half of the Apex CMS, for SvelteKit sites on Cloudflare Workers: the
-admin BFF (session in D1, origin/CSRF boundary, audit, the Apex client), the admin
-UI (shell, page editor, field editors, media picker), the content module (publish
-every collection to one KV value; read it per request), sanitizers, and the D1
-migrations. Extracted from `ablehq/gospel-life-church` in September 2026; consumed
+The site-side mechanics of the Apex CMS, for SvelteKit sites on Cloudflare Workers:
+the admin BFF (session in D1, origin/CSRF boundary, audit, the Apex client and its
+operations), the content module (publish every collection to one KV value; read it per
+request), the sanitizer, the page draft model, the field editors and pickers as
+building blocks, and the D1 migrations. **Not** the admin's screens, shell, navigation
+or stylesheet — every site owns how its admin looks and which screens it has, and
+composes them from these pieces. Extracted from `ablehq/gospel-life-church` in September 2026; consumed
 by gospel-life-church, poovayya and godrej-foundation.
 
 The plan it implements: `sites/.ai/session-2026-09-02/01-workers-and-full-admin-plan.md` §2.4.
@@ -26,7 +28,6 @@ Import paths: `@ablehq/apex-cms-kit/server/bff/guard` (TS, no extension),
 - `src/lib/server/bff/apex-admin-client.ts` — `createApexAdminClient` = the kit's
   plus the site's methods over `request()`/`get()`.
 - `src/lib/admin/bff-client.js` — `createBffClient` = the kit's with `extend`.
-- `src/lib/admin/template-contract.js` — `bindTemplateContract(contract)`.
 - `src/hooks.server.ts` — `export const handle = adminHooks();`
 - `migrations/` — copy the kit's; apply with `wrangler d1 migrations apply`.
 - `src/kit-svelte.d.ts` — an ambient `declare module '@ablehq/apex-cms-kit/*.svelte'`
@@ -36,9 +37,10 @@ Import paths: `@ablehq/apex-cms-kit/server/bff/guard` (TS, no extension),
   the kit is copied, not symlinked, and resolves one copy of svelte/kit/zod. The copy
   is stale until `npm run kit:sync` (rm the copy, `npm install`) — `vite dev` will not
   see a kit edit before that.
-- `src/lib/site.js` — binds what the kit leaves to the site: `bindReservedRoutes`,
-  `allowRichTextClasses`, and the template contract (`bindTemplateContract`); import it
-  from the root `+layout.svelte` and `hooks.server.ts`.
+- `src/lib/site.js` — binds what the kit leaves to the site: `bindReservedRoutes` and
+  `allowRichTextClasses`; import it from the root `+layout.svelte` and `hooks.server.ts`.
+- its own admin: shell, stylesheet, navigation, screens, the page form and its template
+  contract (gospel-life-church's `src/lib/admin/` is the reference).
 
 Cookies are `apex_admin_session` and `apex_bff_csrf` on every site.
 
