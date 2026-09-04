@@ -23,6 +23,7 @@ import { entityPatch, hasEntityChanges, reconcileEntity } from './entity-draft.j
 export const STALE_MESSAGE =
 	'This was changed somewhere else since you opened it. Reload to get the latest version, then re-apply your changes.';
 
+/** @param {number} [status] */
 function fieldsMessage(status) {
 	return status === 422
 		? 'A field was rejected (check required values). Fix it and Save again.'
@@ -32,8 +33,19 @@ function fieldsMessage(status) {
 /**
  * Save one content-library record.
  *
- * @param {object} draft from `createEntityDraft`
- * @param {object} client the ONLY thing that touches the network
+ * The two parameters were `{object}`, which types nothing — every property read off
+ * them was an error the moment `checkJs` was switched on. They now say what this
+ * function actually touches, and nothing more.
+ *
+ * @typedef {import('./entity-draft.js').EntityDraft} EntityDraftLike
+ * @typedef {{
+ *   readRecordVersion: (slug: string, id: string) => Promise<{ version?: unknown } | null>,
+ *   updateRecord: (slug: string, id: string, patch: unknown) => Promise<any>,
+ *   getRecord: (slug: string, id: string) => Promise<any>
+ * }} EntityClient
+ *
+ * @param {EntityDraftLike} draft from `createEntityDraft`
+ * @param {EntityClient} client the ONLY thing that touches the network
  * @returns {Promise<{ok: boolean, stage?: string, status?: number, stale?: boolean, message?: string, refreshed?: boolean}>}
  */
 export async function saveEntity(draft, client) {

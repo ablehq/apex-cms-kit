@@ -39,6 +39,35 @@
 //
 // References are the exception, and they have their own setters that say so.
 
+/**
+ * The shapes this module works in, declared once. Every function below took
+ * implicitly-`any` parameters until `checkJs` was switched on, which meant the
+ * careful prose in these comments was the ONLY thing describing them.
+ *
+ * @typedef {{ field_name: string }} FieldDef
+ * @typedef {{ name: string, relationship_kind?: string }} ReferenceItemDef
+ * @typedef {{ itemId: string, targetId: string }} HeldReference
+ * @typedef {{
+ *   schema: (slug: string) => unknown,
+ *   primitiveFieldDefs: (slug: string) => FieldDef[],
+ *   referenceItems: (slug: string) => ReferenceItemDef[]
+ * }} EntityContract
+ * @typedef {{ id?: string, fields?: Record<string, any>, references?: Record<string, HeldReference[]> }} EntityRecord
+ * @typedef {{
+ *   schemaSlug: string,
+ *   contract: EntityContract,
+ *   entityId: string,
+ *   baselineVersion: string,
+ *   fields: Record<string, any>,
+ *   baselineFields: Record<string, any>,
+ *   dirtyFields: Set<string>,
+ *   references: Record<string, any>,
+ *   baselineReferences: Record<string, any>,
+ *   dirtyReferences: Set<string>
+ * }} EntityDraft
+ */
+
+/** @param {any} value @returns {any} */
 function clone(value) {
 	try {
 		return structuredClone(value);
@@ -58,6 +87,13 @@ function clone(value) {
  * Deliberately narrow: these values are JSON out of Apex, so there are no dates,
  * maps, cycles or class instances to get wrong.
  */
+/**
+ * Structural equality over arbitrary stored JSON, so `any` is the honest annotation:
+ * the values are whatever a field holds, and narrowing every branch would say less
+ * than this comment does.
+ *
+ * @param {any} a @param {any} b @returns {boolean}
+ */
 export function sameValue(a, b) {
 	if (a === b) return true;
 	if (a === null || b === null) return false;
@@ -76,10 +112,11 @@ export function sameValue(a, b) {
 }
 
 /** Two id sets are the same selection when they hold the same ids, in any order. */
+/** @param {any} a @param {any} b @returns {boolean} */
 function sameIdSet(a, b) {
 	if (a.length !== b.length) return false;
 	const held = new Set(a);
-	return b.every((id) => held.has(id));
+	return b.every((/** @type {any} */ id) => held.has(id));
 }
 
 /**
@@ -90,13 +127,16 @@ function sameIdSet(a, b) {
  * does not have cannot be written even if the server sent one.
  *
  * @param {string} schemaSlug the archetype schema slug, e.g. 'team_member'
- * @param {{ id: string, fields?: Record<string, unknown>, references?: Record<string, {itemId: string, targetId: string}[]> }} record
+ * @param {EntityRecord} record
  * @param {string} version
+ * @param {EntityContract} contract the site's content contract
+ * @returns {EntityDraft}
  */
 export function createEntityDraft(schemaSlug, record, version, contract) {
 	if (!contract) throw new Error('createEntityDraft needs the site content contract');
 	if (!contract.schema(schemaSlug)) throw new Error(`unknown schema: ${schemaSlug}`);
 
+	/** @type {Record<string, any>} */
 	const fields = {};
 	for (const def of contract.primitiveFieldDefs(schemaSlug)) {
 		const value = record?.fields ? record.fields[def.field_name] : undefined;
@@ -107,6 +147,7 @@ export function createEntityDraft(schemaSlug, record, version, contract) {
 	// ids the server needs for a removal are not the browser's business: it sends
 	// the set, and the BFF diffs it against a fresh read (see `update-record.ts`).
 	// That is what keeps the two id spaces from ever being conflated here.
+	/** @type {Record<string, any>} */
 	const references = {};
 	for (const item of contract.referenceItems(schemaSlug)) {
 		const held = record?.references ? (record.references[item.name] ?? []) : [];
@@ -149,6 +190,7 @@ export function createEntityDraft(schemaSlug, record, version, contract) {
  * media control's Remove is given `''` to emit on these screens rather than GLC's
  * `null` (plan §6): a `null` here would be the destructive write.
  */
+/** @param {EntityDraft} draft @param {string} name @param {any} value @returns {boolean} */
 export function setEntityField(draft, name, value) {
 	if (!draft || !Object.prototype.hasOwnProperty.call(draft.fields, name)) return false;
 	const next = value === null || value === undefined ? '' : value;
@@ -167,6 +209,7 @@ export function setEntityField(draft, name, value) {
  * record points at nothing", and nothing is stranded because a reference
  * contributes no primitive.
  */
+/** @param {EntityDraft} draft @param {string} name @param {any} value @returns {boolean} */
 export function setEntityReference(draft, name, value) {
 	if (!draft || !Object.prototype.hasOwnProperty.call(draft.references, name)) return false;
 	const item = draft.contract.referenceItems(draft.schemaSlug).find((entry) => entry.name === name);
@@ -187,6 +230,7 @@ export function setEntityReference(draft, name, value) {
 	return true;
 }
 
+/** @param {EntityDraft} draft @returns {boolean} */
 export function isEntityDirty(draft) {
 	return Boolean(draft) && (draft.dirtyFields.size > 0 || draft.dirtyReferences.size > 0);
 }
@@ -198,22 +242,27 @@ export function isEntityDirty(draft) {
  * is no path from here that can express the destructive `null` on a primitive,
  * because `setEntityField` cannot store one.
  */
+/** @param {EntityDraft} draft */
 export function entityPatch(draft) {
+	/** @type {Record<string, any>} */
 	const fields = {};
 	for (const def of draft.contract.primitiveFieldDefs(draft.schemaSlug)) {
 		if (draft.dirtyFields.has(def.field_name))
 			fields[def.field_name] = draft.fields[def.field_name];
 	}
+	/** @type {Record<string, any>} */
 	const references = {};
 	for (const item of draft.contract.referenceItems(draft.schemaSlug)) {
 		if (draft.dirtyReferences.has(item.name)) references[item.name] = draft.references[item.name];
 	}
+	/** @type {Record<string, any>} */
 	const patch = {};
 	if (Object.keys(fields).length > 0) patch.fields = fields;
 	if (Object.keys(references).length > 0) patch.references = references;
 	return patch;
 }
 
+/** @param {EntityDraft} draft @returns {boolean} */
 export function hasEntityChanges(draft) {
 	return Object.keys(entityPatch(draft)).length > 0;
 }
@@ -227,6 +276,7 @@ export function hasEntityChanges(draft) {
  * with the next keystroke and the field would read as clean while it was being
  * edited — GLC's bug (3) and (4), reintroduced on every save.
  */
+/** @param {EntityDraft} draft @param {EntityRecord} record @param {string} version */
 export function reconcileEntity(draft, record, version) {
 	const fresh = createEntityDraft(
 		draft.schemaSlug,

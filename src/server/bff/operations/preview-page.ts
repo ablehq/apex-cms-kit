@@ -3,13 +3,15 @@
  * RIGHT NOW rather than from the committed snapshot the public routes are built
  * from.
  *
- * Why this exists. `src/routes/[...slug]/+page.server.js` is `prerender = true`
- * and reads `cms/data/pages.json` — the committed snapshot (plan §2, the hermetic
- * build). That is deliberate and stays. The consequence is that the admin's
- * "Preview" button, which pointed at the page's PUBLIC address, showed the last
- * published snapshot and never the editor's work — a control named Preview that
- * previews nothing you just did, with the caveat in a tooltip. This is the path
- * that makes the name true.
+ * Why this exists. The public catch-all route reads the PUBLISHED snapshot out of
+ * KV at request time. The consequence is that the admin's "Preview" button, which
+ * pointed at the page's PUBLIC address, showed the last published state and never
+ * the editor's work — a control named Preview that previews nothing you just did.
+ * This is the path that makes the name true.
+ *
+ * (This paragraph used to describe `prerender = true` reading `cms/data/pages.json`.
+ * Neither has been true since the move to runtime KV content; the route does not
+ * prerender and that file does not exist.)
  *
  * ── Reuse is the design, not a convenience ──────────────────────────────────
  * The projection is `projectCmsPage` / `projectBlocks` / `projectFields` from

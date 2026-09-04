@@ -206,9 +206,9 @@ export function projectBlocks(page, media) {
 
 /**
  * @param {unknown} page
+ * @param {{ siteTitle?: string }} [options]
  * @returns {{ title: string, description: string }}
  */
-/** @param {{ siteTitle?: string }} [options] */
 export function cmsPageMeta(page, options = {}) {
 	const record = /** @type {Record<string, any>} */ (page ?? {});
 	const properties = Array.isArray(record.meta_properties) ? record.meta_properties : [];

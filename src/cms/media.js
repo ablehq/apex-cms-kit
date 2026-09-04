@@ -51,4 +51,3 @@ export function buildMediaIndex(collections) {
 	}
 	return index;
 }
-
