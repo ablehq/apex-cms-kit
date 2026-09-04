@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { cleanString, unwrapArchetypeCollection } from '../archetype-record';
+import { cleanString, isRecord, unwrapArchetypeCollection } from '../archetype-record';
 import type { ApexAdminClient } from '../apex-admin-client';
 import type { BffContext } from '../context';
 
@@ -65,8 +65,8 @@ export function summarizeGalleryImage(
 	row: Record<string, unknown>,
 	assetsPrefix = ''
 ): AdminGalleryImageRecord {
-	const medium = isPlainRecord(row.medium) ? row.medium : null;
-	const file = medium && isPlainRecord(medium.file) ? medium.file : null;
+	const medium = isRecord(row.medium) ? row.medium : null;
+	const file = medium && isRecord(medium.file) ? medium.file : null;
 	const key = file ? cleanString(file.key) : '';
 	return {
 		id: cleanString(row.id),
@@ -79,10 +79,6 @@ export function summarizeGalleryImage(
 		// will show.
 		url: assetsPrefix && key ? `${assetsPrefix}/cdn-cgi/image/f=auto,w=auto/${key}` : null
 	};
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 /** The account's `images` gallery id, resolved by name from `cms_config`. */

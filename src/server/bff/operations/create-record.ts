@@ -1,4 +1,4 @@
-import { appendAuditEntry } from '../audit';
+import { auditOutcome } from '../audit';
 import { containsNullPrimitive } from '../authorization';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
@@ -76,26 +76,10 @@ export async function handleCreateRecord(
 	const fields = toApexFields(parsed.data.fields ?? {});
 	const apexResponse = await guard.apex.createContentLibraryRecord(params.schema, fields);
 
-	if (ctx.db) {
-		await appendAuditEntry(ctx.db, {
-			id: crypto.randomUUID(),
-			occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-			actorEmail: guard.actor.email,
-			actorSub: guard.actor.sub,
-			action: meta.action,
-			method: meta.method,
-			path: meta.path,
-			accountId: ctx.accountId ?? null,
-			pageId: null,
-			requestId: meta.requestId,
-			outcome: apexResponse.ok ? 'accepted' : 'apex_error',
-			detail: {
-				schema: params.schema,
-				fields: Object.keys(fields),
-				apexStatus: apexResponse.status
-			}
-		});
-	}
+	await auditOutcome(ctx, meta, guard.actor, {
+		outcome: apexResponse.ok ? 'accepted' : 'apex_error',
+		detail: { schema: params.schema, fields: Object.keys(fields), apexStatus: apexResponse.status }
+	});
 
 	if (!apexResponse.ok) {
 		const status =

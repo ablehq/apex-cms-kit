@@ -1,4 +1,4 @@
-import { appendAuditEntry } from '../audit';
+import { auditOutcome } from '../audit';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
 import { rejectMutation } from '../reject';
@@ -52,28 +52,12 @@ export async function handleDeleteImage(
 
 	const apexResponse = await guard.apex.deleteGalleryItem(idResult.data);
 
-	if (ctx.db) {
-		await appendAuditEntry(ctx.db, {
-			id: crypto.randomUUID(),
-			occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-			actorEmail: guard.actor.email,
-			actorSub: guard.actor.sub,
-			action: 'images.delete',
-			method: 'DELETE',
-			path: actorMeta.path,
-			accountId: ctx.accountId ?? null,
-			pageId: null,
-			requestId: request.headers.get('cf-ray'),
-			outcome: apexResponse.ok ? 'accepted' : 'apex_error',
-			// The caption is recorded because it is the only human-readable name this
-			// record ever had, and after the delete there is nowhere else to read it.
-			detail: {
-				imageId: idResult.data,
-				caption: existing.caption,
-				apexStatus: apexResponse.status
-			}
-		});
-	}
+	await auditOutcome(ctx, meta, guard.actor, {
+		outcome: apexResponse.ok ? 'accepted' : 'apex_error',
+		// The caption is recorded because it is the only human-readable name this
+		// record ever had, and after the delete there is nowhere else to read it.
+		detail: { imageId: idResult.data, caption: existing.caption, apexStatus: apexResponse.status }
+	});
 
 	if (!apexResponse.ok) {
 		const status =

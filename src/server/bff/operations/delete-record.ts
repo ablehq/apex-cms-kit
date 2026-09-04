@@ -1,4 +1,4 @@
-import { appendAuditEntry } from '../audit';
+import { auditOutcome } from '../audit';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
 import { rejectMutation } from '../reject';
@@ -85,27 +85,15 @@ export async function handleDeleteRecord(
 	// is before the count read on purpose: the answer does not depend on it, and
 	// there is no version of this request that may proceed.
 	if (uncounted.length > 0) {
-		if (ctx.db) {
-			await appendAuditEntry(ctx.db, {
-				id: crypto.randomUUID(),
-				occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-				actorEmail: guard.actor.email,
-				actorSub: guard.actor.sub,
-				action: meta.action,
-				method: meta.method,
-				path: meta.path,
-				accountId: ctx.accountId ?? null,
-				pageId: null,
-				requestId: meta.requestId,
-				outcome: 'rejected',
-				detail: {
-					schema: params.schema,
-					recordId: idResult.data,
-					reason: 'uncountable-references',
-					uncountedReferrers: uncounted
-				}
-			});
-		}
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'rejected',
+			detail: {
+				schema: params.schema,
+				recordId: idResult.data,
+				reason: 'uncountable-references',
+				uncountedReferrers: uncounted
+			}
+		});
 		return noStoreJson(
 			{
 				error: 'uncountable-references',
@@ -126,22 +114,10 @@ export async function handleDeleteRecord(
 	const referenceCount = counted.count;
 
 	if (referenceCount > 0 && !confirmed) {
-		if (ctx.db) {
-			await appendAuditEntry(ctx.db, {
-				id: crypto.randomUUID(),
-				occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-				actorEmail: guard.actor.email,
-				actorSub: guard.actor.sub,
-				action: meta.action,
-				method: meta.method,
-				path: meta.path,
-				accountId: ctx.accountId ?? null,
-				pageId: null,
-				requestId: meta.requestId,
-				outcome: 'rejected',
-				detail: { schema: params.schema, recordId: idResult.data, reason: 'in-use', referenceCount }
-			});
-		}
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'rejected',
+			detail: { schema: params.schema, recordId: idResult.data, reason: 'in-use', referenceCount }
+		});
 		// A 409 with the count IN THE BODY, not a bare error code: the number is the
 		// whole message, and the screen re-asks the question with it.
 		return noStoreJson(
@@ -158,32 +134,20 @@ export async function handleDeleteRecord(
 
 	const apexResponse = await guard.apex.deleteContentLibraryRecord(params.schema, idResult.data);
 
-	if (ctx.db) {
-		await appendAuditEntry(ctx.db, {
-			id: crypto.randomUUID(),
-			occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-			actorEmail: guard.actor.email,
-			actorSub: guard.actor.sub,
-			action: meta.action,
-			method: meta.method,
-			path: meta.path,
-			accountId: ctx.accountId ?? null,
-			pageId: null,
-			requestId: meta.requestId,
-			outcome: apexResponse.ok ? 'accepted' : 'apex_error',
-			// `strippedReferences` is recorded because it is the part of this action
-			// that leaves no other trace anywhere: the references are gone from Apex,
-			// and this row is the only place that says how many there were.
-			detail: {
-				schema: params.schema,
-				recordId: idResult.data,
-				confirmed,
-				strippedReferences: referenceCount,
-				uncountedReferrers: uncounted,
-				apexStatus: apexResponse.status
-			}
-		});
-	}
+	await auditOutcome(ctx, meta, guard.actor, {
+		outcome: apexResponse.ok ? 'accepted' : 'apex_error',
+		// `strippedReferences` is recorded because it is the part of this action that
+		// leaves no other trace anywhere: the references are gone from Apex, and this
+		// row is the only place that says how many there were.
+		detail: {
+			schema: params.schema,
+			recordId: idResult.data,
+			confirmed,
+			strippedReferences: referenceCount,
+			uncountedReferrers: uncounted,
+			apexStatus: apexResponse.status
+		}
+	});
 
 	if (!apexResponse.ok) {
 		const status =

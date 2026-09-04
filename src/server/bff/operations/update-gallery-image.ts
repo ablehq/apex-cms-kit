@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { appendAuditEntry } from '../audit';
+import { auditOutcome } from '../audit';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
 import { rejectMutation } from '../reject';
@@ -78,26 +78,14 @@ export async function handleUpdateImage(
 
 	const apexResponse = await guard.apex.updateGalleryItem(idResult.data, parsed.data);
 
-	if (ctx.db) {
-		await appendAuditEntry(ctx.db, {
-			id: crypto.randomUUID(),
-			occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-			actorEmail: guard.actor.email,
-			actorSub: guard.actor.sub,
-			action: 'images.update',
-			method: 'PATCH',
-			path: actorMeta.path,
-			accountId: ctx.accountId ?? null,
-			pageId: null,
-			requestId: request.headers.get('cf-ray'),
-			outcome: apexResponse.ok ? 'accepted' : 'apex_error',
-			detail: {
-				imageId: idResult.data,
-				fields: Object.keys(parsed.data),
-				apexStatus: apexResponse.status
-			}
-		});
-	}
+	await auditOutcome(ctx, meta, guard.actor, {
+		outcome: apexResponse.ok ? 'accepted' : 'apex_error',
+		detail: {
+			imageId: idResult.data,
+			fields: Object.keys(parsed.data),
+			apexStatus: apexResponse.status
+		}
+	});
 
 	if (!apexResponse.ok) {
 		const status =

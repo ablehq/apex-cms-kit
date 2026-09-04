@@ -45,6 +45,7 @@
  * result type — is the same pattern.
  */
 
+import { unwrapArchetypeRecord } from '../archetype-record';
 import { stringifyCanonical } from '../../../cms/canonical-json.js';
 import { buildMediaIndex } from '../../../cms/media.js';
 import { isCmsPageRoutable, projectCmsPage, projectedPageBySlug } from '../../../cms/page-data.js';
@@ -52,7 +53,7 @@ import type { ProjectedCmsPage } from '../../../cms/page-data.js';
 
 import { guardRequest } from '../guard';
 import { ContentUnavailableError, readContent } from '../../content/read';
-import { pageIdSchema, unwrapPage } from './get-page';
+import { pageIdSchema } from './get-page';
 import type { BffContext } from '../context';
 
 /**
@@ -141,7 +142,7 @@ export async function loadPagePreview(
 	if (apexResponse.status === 404) return { ok: false, status: 404, reason: 'no such page' };
 	if (!apexResponse.ok) return { ok: false, status: 502, reason: 'upstream error' };
 
-	const raw = unwrapPage(apexResponse.body);
+	const raw = unwrapArchetypeRecord(apexResponse.body);
 	if (!raw) return { ok: false, status: 502, reason: 'unexpected upstream shape' };
 
 	let site: Awaited<ReturnType<typeof siteSnapshot>>;

@@ -125,21 +125,6 @@ export interface GalleryItemFields {
 	position?: number;
 }
 
-/**
- * Read the record out of an Apex envelope: `{ data: {...} }`, or the object
- * itself when Apex answered flat. Lived in `operations/media.ts` while it was
- * the only caller; `operations/ingest-audio.ts` is the second use, so it moves
- * here — one reader, so the two cannot drift about what an Apex body is.
- */
-export function unwrapData(body: unknown): Record<string, unknown> | null {
-	if (body && typeof body === 'object') {
-		const maybe = body as { data?: unknown };
-		if (maybe.data && typeof maybe.data === 'object') return maybe.data as Record<string, unknown>;
-		if ('id' in (body as object)) return body as Record<string, unknown>;
-	}
-	return null;
-}
-
 export function assertUuid(id: string): void {
 	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(id)) {
 		// Belt-and-suspenders: the route already zod-validates the id, but the client

@@ -1,6 +1,6 @@
 import { z } from 'zod';
-import { unwrapData } from '../apex-admin-client';
-import { appendAuditEntry } from '../audit';
+import { unwrapArchetypeRecord } from '../archetype-record';
+import { auditOutcome } from '../audit';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
 import { rejectMutation } from '../reject';
@@ -76,30 +76,19 @@ export async function handleSignMediaUpload(request: Request, ctx: BffContext): 
 		parsed.data.alt ?? ''
 	);
 	if (!galleryItem.ok) return noStoreJson({ error: 'upstream error' }, 502);
-	const item = unwrapData(galleryItem.body);
+	const item = unwrapArchetypeRecord(galleryItem.body);
 	const galleryItemId = typeof item?.id === 'string' ? item.id : null;
 	if (!galleryItemId) return noStoreJson({ error: 'unexpected upstream shape' }, 502);
 
 	const signed = await guard.apex.createSignedUploadUrl(parsed.data.file);
 	if (!signed.ok) return noStoreJson({ error: 'upstream error' }, 502);
-	const signedData = unwrapData(signed.body) ?? (signed.body as Record<string, unknown> | null);
+	const signedData =
+		unwrapArchetypeRecord(signed.body) ?? (signed.body as Record<string, unknown> | null);
 
-	if (ctx.db) {
-		await appendAuditEntry(ctx.db, {
-			id: crypto.randomUUID(),
-			occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-			actorEmail: guard.actor.email,
-			actorSub: guard.actor.sub,
-			action: meta.action,
-			method: meta.method,
-			path: meta.path,
-			accountId: ctx.accountId ?? null,
-			pageId: null,
-			requestId: meta.requestId,
-			outcome: 'accepted',
-			detail: { galleryItemId, filename: parsed.data.file.filename }
-		});
-	}
+	await auditOutcome(ctx, meta, guard.actor, {
+		outcome: 'accepted',
+		detail: { galleryItemId, filename: parsed.data.file.filename }
+	});
 
 	return noStoreJson({
 		galleryItemId,
@@ -139,24 +128,12 @@ export async function handleFinalizeMediaUpload(
 		record_type: 'Cms::GalleryItem'
 	});
 	const outcome = medium.ok ? 'accepted' : 'apex_error';
-	const data = unwrapData(medium.body);
+	const data = unwrapArchetypeRecord(medium.body);
 
-	if (ctx.db) {
-		await appendAuditEntry(ctx.db, {
-			id: crypto.randomUUID(),
-			occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-			actorEmail: guard.actor.email,
-			actorSub: guard.actor.sub,
-			action: meta.action,
-			method: meta.method,
-			path: meta.path,
-			accountId: ctx.accountId ?? null,
-			pageId: null,
-			requestId: meta.requestId,
-			outcome,
-			detail: { galleryItemId: parsed.data.galleryItemId, apexStatus: medium.status }
-		});
-	}
+	await auditOutcome(ctx, meta, guard.actor, {
+		outcome,
+		detail: { galleryItemId: parsed.data.galleryItemId, apexStatus: medium.status }
+	});
 
 	if (!medium.ok) return noStoreJson({ error: 'upstream error' }, 502);
 	return noStoreJson({ galleryItemId: parsed.data.galleryItemId, mediumId: data?.id ?? null });

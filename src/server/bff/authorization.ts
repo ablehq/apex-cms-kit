@@ -97,6 +97,12 @@ export function containsNullPrimitive(
  */
 const MAX_STRUCTURAL_DEPTH = 64;
 
+/**
+ * The same body as `archetype-record.ts`'s `isRecord`, deliberately NOT imported.
+ * This module has no imports at all, and that is worth more than three saved lines:
+ * the write invariants here must not be able to change because a record-parsing
+ * module changed.
+ */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -131,13 +137,16 @@ export function containsReviewOnlyField(
 	// TypeScript makes `fields` required, but a JS caller can still omit it. Say what
 	// is wrong rather than dying on `undefined.includes` three frames down.
 	if (!Array.isArray(fields)) {
-		throw new TypeError('containsReviewOnlyField: `fields` is required (BffContext.reviewOnlyFields)');
+		throw new TypeError(
+			'containsReviewOnlyField: `fields` is required (BffContext.reviewOnlyFields)'
+		);
 	}
 	if (value === null || typeof value !== 'object') return false;
 	// Fail CLOSED past the structural cap. The field-value skip below means the only
 	// thing that can grow `depth` is genuine attribute nesting, never rich-text content.
 	if (depth > MAX_STRUCTURAL_DEPTH) return true;
-	if (Array.isArray(value)) return value.some((item) => containsReviewOnlyField(item, fields, depth + 1));
+	if (Array.isArray(value))
+		return value.some((item) => containsReviewOnlyField(item, fields, depth + 1));
 	for (const [key, nested] of Object.entries(value)) {
 		if (fields.includes(key)) return true;
 		// A `fields_data` map: its KEYS are field/attribute names (scan them), but its

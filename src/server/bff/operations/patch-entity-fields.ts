@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { appendAuditEntry } from '../audit';
+import { auditOutcome } from '../audit';
 import { containsReviewOnlyField } from '../authorization';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
@@ -76,27 +76,15 @@ export async function handlePatchEntityFields(
 	);
 	const outcome = apexResponse.ok ? 'accepted' : 'apex_error';
 
-	if (ctx.db) {
-		await appendAuditEntry(ctx.db, {
-			id: crypto.randomUUID(),
-			occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-			actorEmail: guard.actor.email,
-			actorSub: guard.actor.sub,
-			action: 'entities.fields.patch',
-			method: 'PATCH',
-			path: actorMeta.path,
-			accountId: ctx.accountId ?? null,
-			pageId: null,
-			requestId: request.headers.get('cf-ray'),
-			outcome,
-			detail: {
-				entityTypeId: typeId.data,
-				entityId: entityId.data,
-				fields: Object.keys(parsed.data.fields_data),
-				apexStatus: apexResponse.status
-			}
-		});
-	}
+	await auditOutcome(ctx, meta, guard.actor, {
+		outcome,
+		detail: {
+			entityTypeId: typeId.data,
+			entityId: entityId.data,
+			fields: Object.keys(parsed.data.fields_data),
+			apexStatus: apexResponse.status
+		}
+	});
 
 	if (!apexResponse.ok) {
 		// Forward a 4xx (e.g. Apex's 422 validation failure) as-is so `savePage()` can

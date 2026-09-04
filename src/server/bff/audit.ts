@@ -1,4 +1,5 @@
 import type { BffDatabase } from './d1';
+import type { BffContext } from './context';
 
 /**
  * The append-only audit row the BFF writes for every mutation (plan §8, 3a).
@@ -121,4 +122,44 @@ export async function auditRejection(
 export async function readAuditEntry(db: BffDatabase, id: string): Promise<AuditRow | null> {
 	const source = db.withSession ? db.withSession('first-primary') : db;
 	return source.prepare(`SELECT * FROM bff_audit_log WHERE id = ?`).bind(id).first<AuditRow>();
+}
+
+/**
+ * The audit row every ACCEPTED (or upstream-failed) mutation writes, in one place.
+ * Seven operations wrote the same twelve fields by hand; the only things that
+ * actually varied were `outcome`, `detail`, and — for the two page routes — a
+ * `pageId`. `meta` is the operation's own fixed metadata, the same object
+ * `rejectMutation` takes, so a route's accepted and rejected rows cannot disagree
+ * about what action or path they name.
+ *
+ * There is deliberately NO try/catch here. `rejectMutation` swallows because a D1
+ * hiccup must not upgrade a correct 4xx into a 500; on the accepted path the
+ * opposite is true — if the Apex write landed and the audit row did not, the caller
+ * must not be told everything is fine.
+ */
+export async function auditOutcome(
+	ctx: BffContext,
+	meta: { action: string; method: string; path: string; requestId?: string | null },
+	actor: { email: string; sub: string | null },
+	fields: {
+		outcome: AuditEntry['outcome'];
+		detail?: Record<string, unknown>;
+		pageId?: string | null;
+	}
+): Promise<void> {
+	if (!ctx.db) return;
+	await appendAuditEntry(ctx.db, {
+		id: crypto.randomUUID(),
+		occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
+		actorEmail: actor.email,
+		actorSub: actor.sub,
+		action: meta.action,
+		method: meta.method,
+		path: meta.path,
+		accountId: ctx.accountId ?? null,
+		pageId: fields.pageId ?? null,
+		requestId: meta.requestId ?? null,
+		outcome: fields.outcome,
+		...(fields.detail ? { detail: fields.detail } : {})
+	});
 }

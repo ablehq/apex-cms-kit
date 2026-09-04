@@ -1,4 +1,4 @@
-import { appendAuditEntry } from '../audit';
+import { auditOutcome } from '../audit';
 import { containsNullPrimitive } from '../authorization';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
@@ -140,35 +140,23 @@ export async function handleUpdateRecord(
 		references
 	);
 
-	if (ctx.db) {
-		await appendAuditEntry(ctx.db, {
-			id: crypto.randomUUID(),
-			occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-			actorEmail: guard.actor.email,
-			actorSub: guard.actor.sub,
-			action: meta.action,
-			method: meta.method,
-			path: meta.path,
-			accountId: ctx.accountId ?? null,
-			pageId: null,
-			requestId: meta.requestId,
-			outcome: apexResponse.ok ? 'accepted' : 'apex_error',
-			detail: {
-				schema: params.schema,
-				recordId: idResult.data,
-				fields: Object.keys(fields),
-				// The reference diff is the part of this write with the most ways to go
-				// wrong and the fewest traces, so the shape that travelled is recorded.
-				references: Object.fromEntries(
-					Object.entries(references).map(([name, value]) => [
-						name,
-						Array.isArray(value) ? summarizeDiff(value) : value === null ? 'cleared' : 'set'
-					])
-				),
-				apexStatus: apexResponse.status
-			}
-		});
-	}
+	await auditOutcome(ctx, meta, guard.actor, {
+		outcome: apexResponse.ok ? 'accepted' : 'apex_error',
+		detail: {
+			schema: params.schema,
+			recordId: idResult.data,
+			fields: Object.keys(fields),
+			// The reference diff is the part of this write with the most ways to go
+			// wrong and the fewest traces, so the shape that travelled is recorded.
+			references: Object.fromEntries(
+				Object.entries(references).map(([name, value]) => [
+					name,
+					Array.isArray(value) ? summarizeDiff(value) : value === null ? 'cleared' : 'set'
+				])
+			),
+			apexStatus: apexResponse.status
+		}
+	});
 
 	if (!apexResponse.ok) {
 		// Forward a 4xx (Apex's own validation failure) as-is so the editor can be

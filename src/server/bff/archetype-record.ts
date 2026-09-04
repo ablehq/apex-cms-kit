@@ -28,10 +28,15 @@ export const archetypeIdSchema = z
 	.regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu);
 
 /**
- * Unwrap the single record from an Apex response. Apex answers either
- * `{ data: { … } }` or the bare record; anything else is not a record, and saying
- * so is what turns an unexpected upstream shape into a 502 instead of a silent
- * empty result.
+ * Unwrap the single record from an Apex response. Despite the name it serves every
+ * envelope this BFF reads — archetype record, page, gallery item, medium — because
+ * three looser copies were folded into it. The name is kept because both sites
+ * import it. Apex answers either `{ data: { … } }` or the bare record;
+ * anything else is not a record, and saying so is what turns an unexpected upstream
+ * shape into a 502 instead of a silent empty result.
+ *
+ * `data: []` is REJECTED. Three looser copies of this reader used to accept it and
+ * hand back an empty object, which reached callers as a 200 with nothing in it.
  */
 export function unwrapArchetypeRecord(body: unknown): Record<string, unknown> | null {
 	if (!body || typeof body !== 'object') return null;
@@ -56,7 +61,8 @@ export function unwrapArchetypeCollection(body: unknown): Record<string, unknown
 	return [];
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+/** A JSON object, and not an array. Shared with the operations that read Apex JSON. */
+export function isRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 

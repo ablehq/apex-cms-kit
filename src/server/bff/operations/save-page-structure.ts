@@ -1,3 +1,4 @@
+import { unwrapArchetypeRecord } from '../archetype-record';
 import { z } from 'zod';
 import { appendAuditEntry } from '../audit';
 import { containsReviewOnlyField } from '../authorization';
@@ -38,15 +39,6 @@ export const savePageStructureBodySchema = z
 		meta_properties_attributes: z.array(jsonRecord).max(50).optional()
 	})
 	.strict();
-
-function unwrapPage(body: unknown): Record<string, unknown> | null {
-	if (body && typeof body === 'object') {
-		const maybe = body as { data?: unknown };
-		if (maybe.data && typeof maybe.data === 'object') return maybe.data as Record<string, unknown>;
-		if ('id' in (body as object)) return body as Record<string, unknown>;
-	}
-	return null;
-}
 
 export async function handleSavePageStructure(
 	request: Request,
@@ -118,7 +110,7 @@ export async function handleSavePageStructure(
 
 	// Return the fresh page + its new version so `savePage()` re-baselines the stale
 	// guard and reconciles temp-id blocks to their server ids in one round-trip.
-	const page = unwrapPage(apexResponse.body);
+	const page = unwrapArchetypeRecord(apexResponse.body);
 	const version = page ? await computePageVersion(page) : null;
 	return noStoreJson({ ok: true, page, version });
 }
