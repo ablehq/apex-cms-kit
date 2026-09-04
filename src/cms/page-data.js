@@ -267,7 +267,7 @@ export function projectCmsPage(page, options = {}) {
 	return {
 		slug: normalizeSlugPath(record.slug),
 		title: typeof record.title === 'string' ? record.title : '',
-		meta: cmsPageMeta(page),
+		meta: cmsPageMeta(page, options),
 		blocks: projectBlocks(page, options.media)
 	};
 }
