@@ -110,6 +110,14 @@ export async function handleSavePageStructure(
 
 	// Return the fresh page + its new version so `savePage()` re-baselines the stale
 	// guard and reconciles temp-id blocks to their server ids in one round-trip.
+	//
+	// A malformed envelope here answers 200 with `page: null`, NOT 502 — unlike
+	// `get-page` and `preview-page`, which do 502 on the same shape. The difference is
+	// deliberate: by this line the PATCH has already landed upstream, so a 502 would
+	// tell the editor a completed write failed and `savePage()` would retry it. Null
+	// is the honest answer, and `save-page.js` is written for it — it falls back to a
+	// fresh `getPage()` and, if that fails too, returns `{ ok: true, refreshed: false }`
+	// so the UI can prompt a reload. Do not "fix" this into a 502.
 	const page = unwrapArchetypeRecord(apexResponse.body);
 	const version = page ? await computePageVersion(page) : null;
 	return noStoreJson({ ok: true, page, version });
