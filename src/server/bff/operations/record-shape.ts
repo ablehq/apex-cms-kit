@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { ContentContract, Referrers } from '../content-contract';
+import type { ContentContract } from '../content-contract';
 import {
 	cleanString,
 	readPrimitiveValue,
