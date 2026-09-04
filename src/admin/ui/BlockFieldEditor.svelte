@@ -31,6 +31,27 @@
 	 * @type {(id: string) => string | null}
 	 */
 	export let mediaUrl = () => null;
+	// DECLARED BEFORE the prop that defaults to it. A `const` in a Svelte <script> is
+	// in its temporal dead zone until its own line runs, and the default initializer
+	// below runs when a parent OMITS the prop — which GLC does. With the const further
+	// down the file this threw `Cannot access 'DELETE_MARKER' before initialization`
+	// and took out the whole block field editor. Godrej passes `emptyValue` explicitly,
+	// so it never hit it.
+	/**
+	 * Apex's spelling for "clear this field", not ours: `PropertySetFormHelper`
+	 * merges a PATCH's `fields_data` into the stored property set and drops every
+	 * NIL attribute as "not supplied", so `null` is a silent no-op — Apex answers
+	 * 200 and keeps the old row. Only `"__delete__"` removes a row of any kind.
+	 *
+	 * The ports clear media with `''`, which is right for THEIR field: on Apex's
+	 * `media` kind a blank counts as an explicit clear. GLC's one media field is
+	 * `ref/model/Cms::GalleryItem`, a REFERENCE, and there `''` is validated like
+	 * any other id — measured against local Apex on 2026-08-31: `null` → 200 and
+	 * the logo survives, `''` → 422 "Logo does not exist in model
+	 * Cms::GalleryItem", `"__delete__"` → 200 and the key is gone.
+	 */
+	const DELETE_MARKER = '__delete__';
+
 	/**
 	 * What Remove emits on a media field. Apex's delete marker by default — the one
 	 * spelling that clears a value rather than being merged away as "no change". A
@@ -52,21 +73,6 @@
 	// Which plain-text fields are machine-facing, and so set in the mono face. The
 	// prototype's rule, applied by name because that is what the contract gives us.
 	const MACHINE = /(^|_)(anchor_id|href|url|key|slug|id|refs|count)$/u;
-
-	/**
-	 * Apex's spelling for "clear this field", not ours: `PropertySetFormHelper`
-	 * merges a PATCH's `fields_data` into the stored property set and drops every
-	 * NIL attribute as "not supplied", so `null` is a silent no-op — Apex answers
-	 * 200 and keeps the old row. Only `"__delete__"` removes a row of any kind.
-	 *
-	 * The ports clear media with `''`, which is right for THEIR field: on Apex's
-	 * `media` kind a blank counts as an explicit clear. GLC's one media field is
-	 * `ref/model/Cms::GalleryItem`, a REFERENCE, and there `''` is validated like
-	 * any other id — measured against local Apex on 2026-08-31: `null` → 200 and
-	 * the logo survives, `''` → 422 "Logo does not exist in model
-	 * Cms::GalleryItem", `"__delete__"` → 200 and the key is gone.
-	 */
-	const DELETE_MARKER = '__delete__';
 
 	/**
 	 * One field's stored value. `fields_data` is Apex-validated JSON, so what a key

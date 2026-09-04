@@ -128,6 +128,14 @@ export async function loadPagePreview(
 		partitionRenderableBlocks: PartitionRenderableBlocks;
 		/** Derive the request-time data a derived section needs (GLC: the sermon strip). */
 		messages?: (collections: Record<string, unknown[]>, blocks: unknown[]) => unknown;
+		/**
+		 * The `<title>` fallback for a page with no title of its own — and it MUST be
+		 * the same value the site's publish projection uses. The two projections are
+		 * compared byte-for-byte below to decide `identical` vs `differs`, so a site
+		 * that passes `siteTitle` at publish and not here reports every untitled page
+		 * as `differs` forever, no matter how often it republishes.
+		 */
+		siteTitle?: string;
 	}
 ): Promise<PagePreviewResult> {
 	const { partitionRenderableBlocks } = options;
@@ -156,7 +164,7 @@ export async function loadPagePreview(
 	}
 
 	// ── The site's own projection, on live data. No second implementation. ──
-	const projected = projectCmsPage(raw, { media: site.mediaIndex });
+	const projected = projectCmsPage(raw, { media: site.mediaIndex, siteTitle: options.siteTitle });
 	const { renderable, unknownTemplates } = previewBlocks(projected, partitionRenderableBlocks);
 	const messages = options.messages ? options.messages(site.collections, renderable) : [];
 

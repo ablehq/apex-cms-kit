@@ -10,11 +10,7 @@ import {
 	sanitizeHtml,
 	sanitizeRichText
 } from '../src/sanitize/html.js';
-import {
-	EVENT_HANDLER_PATTERN,
-	FORBIDDEN_SUBSTRINGS,
-	XSS_PAYLOADS
-} from './xss-corpus.js';
+import { EVENT_HANDLER_PATTERN, FORBIDDEN_SUBSTRINGS, XSS_PAYLOADS } from './xss-corpus.js';
 
 test('the payload corpus covers every category the plan names', () => {
 	const categories = new Set(XSS_PAYLOADS.map((entry) => entry.category));

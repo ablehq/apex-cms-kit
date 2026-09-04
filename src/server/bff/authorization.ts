@@ -21,20 +21,6 @@
  */
 
 /**
- * The review-only RULE lives here; the review-only FIELD NAMES do not.
- *
- * The invariant is generic: only a dedicated human-review route may set a
- * review-only field, so every other mutation route must refuse a body that even
- * NAMES one. Which fields those are is a property of a site's content model —
- * `transcript_reviewed` is a GLC sermon field, and Godrej has no equivalent — so
- * the list arrives on `BffContext.reviewOnlyFields`, set by the site.
- *
- * `fields` is REQUIRED and has no default, deliberately. A default of `[]` would
- * turn this predicate into one that always returns `false`: a security guard that
- * silently passes. Required means `tsc` fails any caller that forgets it.
- */
-
-/**
  * The second data invariant, added for phase 3d, and the same class of thing as the
  * review-only rule above: a property of the DATA that must hold no matter who is
  * calling.
@@ -108,6 +94,18 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 /**
+ * The review-only RULE lives here; the review-only FIELD NAMES do not.
+ *
+ * The invariant is generic: only a dedicated human-review route may set a
+ * review-only field, so every other mutation route must refuse a body that even
+ * NAMES one. Which fields those are is a property of a site's content model —
+ * `transcript_reviewed` is a GLC sermon field, and Godrej has no equivalent — so
+ * the list arrives on `BffContext.reviewOnlyFields`, set by the site.
+ *
+ * `fields` is REQUIRED and has no default, deliberately. A default of `[]` would
+ * turn this predicate into one that always returns `false`: a security guard that
+ * silently passes. Required means `tsc` fails any caller that forgets it.
+ *
  * The page-structure save carries a nested, recursive `blocks_attributes` tree that
  * can include `entity_attributes.fields_data` for newly added blocks — so a shallow
  * key check is not enough to keep the review-only invariant. This walks the body's

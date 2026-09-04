@@ -125,17 +125,20 @@ export async function readAuditEntry(db: BffDatabase, id: string): Promise<Audit
 }
 
 /**
- * The audit row every ACCEPTED (or upstream-failed) mutation writes, in one place.
+ * The audit row a mutation writes once it has DECIDED — accepted, upstream-failed,
+ * or a refusal it answers itself (`delete-record`'s two 409s).
  * Seven operations wrote the same twelve fields by hand; the only things that
  * actually varied were `outcome`, `detail`, and — for the two page routes — a
  * `pageId`. `meta` is the operation's own fixed metadata, the same object
  * `rejectMutation` takes, so a route's accepted and rejected rows cannot disagree
  * about what action or path they name.
  *
- * There is deliberately NO try/catch here. `rejectMutation` swallows because a D1
- * hiccup must not upgrade a correct 4xx into a 500; on the accepted path the
- * opposite is true — if the Apex write landed and the audit row did not, the caller
- * must not be told everything is fine.
+ * There is deliberately NO try/catch here, and this matches what the ten call sites
+ * did before they were collapsed — none of them caught. The reasoning is the write
+ * path's: if the Apex write landed and the audit row did not, the caller must not be
+ * told everything is fine. Note that two of the ten (`delete-record`'s 409s) are
+ * refusals, where `rejectMutation`'s opposite rule would apply — they are here
+ * because that is where they already were, not because the rule above fits them.
  */
 export async function auditOutcome(
 	ctx: BffContext,
