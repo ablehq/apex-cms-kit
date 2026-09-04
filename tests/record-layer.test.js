@@ -28,7 +28,6 @@ const contract = {
 					items: []
 				}
 			: null,
-	schemas: () => ['focus_area', 'partner', 'story'].map((slug) => contract.schema(slug)),
 	isContentLibrarySlug: (slug) => slug === 'focus_area' || slug === 'partner',
 	primitiveFieldDefs: () => [],
 	referenceItems: (slug) =>

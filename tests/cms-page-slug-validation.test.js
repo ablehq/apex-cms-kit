@@ -5,7 +5,6 @@ import path from 'node:path';
 
 import {
 	getPageSlugValidationError,
-	isPortableRouteSlug,
 	isReservedSlug,
 	normalizeSlugPath,
 	bindReservedRoutes
@@ -54,9 +53,11 @@ test('a prefix does not swallow a slug that merely starts with its letters', () 
 	assert.equal(getPageSlugValidationError('/blogsy'), '');
 });
 
+// A `portable` route has a filesystem route AND is creatable as a CMS page, so the
+// CMS page shadows it. That is the property worth pinning; the `isPortableRouteSlug`
+// predicate that used to be asserted here had no caller in any repo.
 test('the ported static routes are portable, not reserved', () => {
 	for (const slug of ['/who-we-are', '/gospel', '/what-we-believe']) {
-		assert.ok(isPortableRouteSlug(slug), `${slug} should be portable`);
 		assert.equal(isReservedSlug(slug), false);
 		assert.equal(getPageSlugValidationError(slug), '');
 	}

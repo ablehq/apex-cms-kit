@@ -62,35 +62,6 @@ export function routableCmsPages(pages, options = {}) {
 }
 
 /**
- * @param {unknown} pages
- * @param {unknown} rawSlug
- * @param {{ warn?: (message: string) => void }} [options]
- */
-export function cmsPageBySlug(pages, rawSlug, options = {}) {
-	const wanted = normalizeSlugPath(rawSlug);
-	return (
-		routableCmsPages(pages, options).find((page) => normalizeSlugPath(page.slug) === wanted) ?? null
-	);
-}
-
-/**
- * The prerender entry list.
- *
- * `/` is in it: since the home-page port the catch-all owns the home page too,
- * and a rest parameter matching zero segments is how `[...slug]` answers it —
- * hence the empty `slug`. It used to be filtered out, back when
- * `src/routes/+page.svelte` still existed and would have collided with it.
- *
- * @param {unknown} pages
- * @param {{ warn?: (message: string) => void }} [options]
- */
-export function cmsPageEntries(pages, options = {}) {
-	return routableCmsPages(pages, options)
-		.map((page) => normalizeSlugPath(page.slug))
-		.map((slug) => ({ slug: slug.slice(1) }));
-}
-
-/**
  * An `anchor_id` becomes a DOM id, so it is reduced to what is safe to put in
  * one and to link to with `#`. An empty result means no anchor, not a broken
  * one.

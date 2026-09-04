@@ -9,27 +9,10 @@
 // rather than a raw-HTML textarea; a full Quill/tiptap integration is deferred to
 // bring-up (it needs the `quill` dependency + the legacy/runes snippet hybrid the
 // plan flags). For 3a.2 the control is a plain-text field that produces valid
-// paragraph HTML on the way in and shows readable text on the way out — honest,
-// dependency-free, and it never corrupts existing HTML (which it passes through).
+// paragraph HTML on the way in — honest, dependency-free, and it never corrupts
+// existing HTML (which it passes through).
 
 const HTML_TAG = /<\/?[a-z][^>]*>/iu;
-
-/** Extract editable plain text from a stored rich-text value (or a bare string). */
-export function richTextToPlain(value) {
-	const html = value && typeof value === 'object' ? value.html || '' : `${value ?? ''}`;
-	if (!html) return '';
-	if (!HTML_TAG.test(html)) return html;
-	return html
-		.replace(/<\/(?:p|div|li|h[1-6])>/giu, '\n')
-		.replace(/<br\s*\/?>/giu, '\n')
-		.replace(/<[^>]+>/gu, '')
-		.replace(/&nbsp;/giu, ' ')
-		.replace(/&amp;/giu, '&')
-		.replace(/&lt;/giu, '<')
-		.replace(/&gt;/giu, '>')
-		.replace(/\n{3,}/gu, '\n\n')
-		.trim();
-}
 
 /**
  * Wrap edited plain text back into paragraph HTML, preserving pre-existing markup.

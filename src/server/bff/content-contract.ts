@@ -73,8 +73,6 @@ export interface Referrers {
 export interface ContentContract {
 	/** One schema as the admin holds it, or null when the slug is unknown. */
 	schema(slug: string): ArchetypeSchema | null;
-	/** Every schema the admin knows. */
-	schemas(): ArchetypeSchema[];
 	/** Whether this slug may be read and written through the content-library surface. */
 	isContentLibrarySlug(slug: string): boolean;
 	primitiveFieldDefs(slug: string): FieldDef[];

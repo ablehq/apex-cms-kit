@@ -52,11 +52,3 @@ export function buildMediaIndex(collections) {
 	return index;
 }
 
-/**
- * @param {Map<string, { url: string, alt: string, contentType: string }>} index
- * @param {unknown} mediaId
- */
-export function resolveMedia(index, mediaId) {
-	if (typeof mediaId !== 'string' || mediaId === '') return null;
-	return index.get(mediaId) ?? null;
-}

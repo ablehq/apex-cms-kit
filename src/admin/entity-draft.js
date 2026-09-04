@@ -187,13 +187,6 @@ export function setEntityReference(draft, name, value) {
 	return true;
 }
 
-/** Is this reference currently selected? For a `has_many` picker's tick state. */
-export function hasReference(draft, name, targetId) {
-	const held = draft?.references?.[name];
-	if (Array.isArray(held)) return held.includes(targetId);
-	return held === targetId;
-}
-
 export function isEntityDirty(draft) {
 	return Boolean(draft) && (draft.dirtyFields.size > 0 || draft.dirtyReferences.size > 0);
 }

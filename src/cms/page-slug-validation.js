@@ -66,11 +66,6 @@ export function isReservedSlug(rawSlug) {
 	return current().prefixes.some((prefix) => slug === prefix || slug.startsWith(`${prefix}/`));
 }
 
-/** @param {unknown} rawSlug */
-export function isPortableRouteSlug(rawSlug) {
-	return current().portable.includes(normalizeSlugPath(rawSlug));
-}
-
 /**
  * The message an editor — or, until there is one, the authoring script — should
  * be shown. Empty string means the slug is usable.

@@ -14,7 +14,7 @@ import {
 	EVENT_HANDLER_PATTERN,
 	FORBIDDEN_SUBSTRINGS,
 	XSS_PAYLOADS
-} from '../src/sanitize/xss-corpus.js';
+} from './xss-corpus.js';
 
 test('the payload corpus covers every category the plan names', () => {
 	const categories = new Set(XSS_PAYLOADS.map((entry) => entry.category));

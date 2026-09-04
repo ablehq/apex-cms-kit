@@ -33,7 +33,11 @@ function readCsrfToken() {
  * method for method, and its return shapes are those of the BFF operations in
  * `src/lib/server/bff/operations/`.
  *
- * @param {{ fetchImpl?: typeof fetch, csrfToken?: string | (() => string) }} [options]
+ * `extend` is how a site adds its own methods over the SAME transport: it receives
+ * `get` and `mutate` and returns an object merged over the base client. It is not
+ * given the internal `readJson` — neither site ever destructured it.
+ *
+ * @param {{ fetchImpl?: typeof fetch, csrfToken?: string | (() => string), extend?: (transport: { get: Function, mutate: Function }) => object }} [options]
  * @returns {import('./types').BffClient}
  */
 export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
@@ -178,5 +182,5 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 		}
 	};
 	// A site adds its own methods over the same `get`/`mutate`, never a second transport.
-	return extend ? { ...base, ...extend({ get, mutate, readJson }) } : base;
+	return extend ? { ...base, ...extend({ get, mutate }) } : base;
 }
