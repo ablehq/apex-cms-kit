@@ -88,13 +88,28 @@ export interface BffContext {
 	accountId?: string;
 	/** Injectable clock (ms epoch) for deterministic tests. */
 	now?: number;
+	/**
+	 * The field names only a dedicated human-review route may write (§ authorization).
+	 *
+	 * REQUIRED, and deliberately not optional: an unset or defaulted `[]` would make
+	 * `containsReviewOnlyField` always return `false` — a write guard that silently
+	 * passes, including on machine ingest surfaces with no human at the keyboard. A
+	 * site with no such fields states that by passing `[]` explicitly.
+	 */
+	reviewOnlyFields: readonly string[];
 }
 
 /**
  * Build the request context for a real Worker run. The harness does NOT
  * use this — it constructs a `BffContext` directly with injected dependencies.
+ *
+ * `site.reviewOnlyFields` is required rather than defaulted: see `BffContext`. A
+ * site with no review-only fields passes `[]` and says so at its call site.
  */
-export function buildContext(event: { platform?: { env?: BffEnv } }): BffContext {
+export function buildContext(
+	event: { platform?: { env?: BffEnv } },
+	site: { reviewOnlyFields: readonly string[] }
+): BffContext {
 	const env = event.platform?.env;
 	if (!env) throw new Error('platform bindings unavailable');
 
@@ -112,6 +127,7 @@ export function buildContext(event: { platform?: { env?: BffEnv } }): BffContext
 		content: env.CONTENT,
 		assetsPrefix: env.PUBLIC_ASSETS_PREFIX,
 		accountId: env.PRIVATE_APEX_ACCOUNT_ID || env.PRIVATE_APEX_INGEST_ACCOUNT_ID || undefined,
-		db: env.DB
+		db: env.DB,
+		reviewOnlyFields: site.reviewOnlyFields
 	};
 }

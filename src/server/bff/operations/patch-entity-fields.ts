@@ -60,7 +60,7 @@ export async function handlePatchEntityFields(
 		return rejectMutation(ctx, actorMeta, 400, 'invalid json', 'invalid json');
 	}
 
-	if (containsReviewOnlyField(bodyJson)) {
+	if (containsReviewOnlyField(bodyJson, ctx.reviewOnlyFields)) {
 		return rejectMutation(ctx, actorMeta, 400, 'field not allowed', 'review-only field');
 	}
 

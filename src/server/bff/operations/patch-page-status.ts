@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { appendAuditEntry } from '../audit';
-import { REVIEW_ONLY_FIELDS } from '../authorization';
+
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
 import { rejectMutation } from '../reject';
@@ -73,7 +73,7 @@ export async function handlePatchPageStatus(
 	if (
 		typeof bodyJson === 'object' &&
 		bodyJson !== null &&
-		REVIEW_ONLY_FIELDS.some((field) => field in bodyJson)
+		ctx.reviewOnlyFields.some((field) => field in bodyJson)
 	) {
 		return rejectMutation(
 			ctx,
