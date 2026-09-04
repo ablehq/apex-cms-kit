@@ -296,19 +296,11 @@ export interface BffClient {
 
 	// ── Images (3d) ───────────────────────────────────────────────────────────
 	/**
-	 * The whole `images` gallery, plus the bring-up gate. `uploadEnabled` is a SERVER
-	 * fact (§2.7): byte upload cannot complete against an Apex whose signed upload URL
-	 * names a port it does not serve, so the screen disables the control and shows
-	 * `uploadDisabledReason` rather than offering an upload that never finishes.
-	 * There is no `createImage` for the same reason — an image without bytes is a
-	 * caption attached to nothing.
+	 * The whole `images` gallery. There is no `createImage`: an image is created by
+	 * uploading bytes, and an image without bytes is a caption attached to nothing.
+	 * Whether a site offers an upload control is that site's own policy.
 	 */
-	listImages(): Promise<{
-		images: AdminGalleryItem[];
-		galleryId: string;
-		uploadEnabled: boolean;
-		uploadDisabledReason: string;
-	}>;
+	listImages(): Promise<{ images: AdminGalleryItem[]; galleryId: string }>;
 	updateImage(
 		imageId: string,
 		fields: { caption?: string; alt?: string }

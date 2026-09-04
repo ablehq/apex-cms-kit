@@ -36,37 +36,13 @@ import type { BffContext } from '../context';
  *
  * `medium` and `thumbnail` are `has_one … as: :record` and are simply ABSENT until
  * something is attached — they are not null keys, they are missing keys. Nothing
- * here guesses at their shape: no bytes can be uploaded against this Apex (below),
- * so no shape has been observed, and inventing one would be a thumbnail that
- * silently never renders. See `IMAGE_UPLOAD_ENABLED`.
+ * here guesses at their shape: no bytes have been uploaded against this Apex, so no
+ * shape has been observed, and inventing one would be a thumbnail that silently
+ * never renders.
  */
 export const imageIdSchema = z
 	.string()
 	.regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu);
-
-/**
- * ⚠ BRING-UP GATE — byte upload is NOT proven and is therefore OFF (spec §2.7).
- *
- * `POST /api/platform/v1/media/signed_upload_url` answers 200 with
- * `{url, headers, signed_id}` (probes G5/G6) — but the `url` it returns points at
- * `http://localhost:3000` while this Apex serves on `:3001`, and a `PUT` to it hung
- * until it was killed. The finalize leg (`POST /media` with the signed id) has
- * therefore never been executed at all: it is marked NOT PROVEN in the probe ledger.
- *
- * The screen shows the Upload button DISABLED and says why, rather than offering a
- * control that would create an empty gallery item and then fail — an editor would be
- * left with a caption attached to no image and no way to tell that from a slow
- * upload. Everything else on the screen (browse, caption, alt, delete) is proven
- * against real local Apex and works.
- *
- * At bring-up: flip this to `true`, confirm the `medium`/`thumbnail` read shape, and
- * surface a thumbnail URL from it. Nothing else on this screen changes.
- */
-export const IMAGE_UPLOAD_ENABLED = false;
-
-/** The reason the upload control is off, in the words the editor is shown. */
-export const IMAGE_UPLOAD_DISABLED_REASON =
-	'Uploading is not switched on yet. The storage service this CMS uploads to is not reachable from here, so an upload would appear to start and never finish. Captions, alt text and deletion all work.';
 
 /** One row of the Images list. */
 export interface AdminGalleryImageRecord {
@@ -174,12 +150,5 @@ export async function handleListImages(request: Request, ctx: BffContext): Promi
 	const gallery = await loadImagesGallery(guard.apex, ctx.assetsPrefix ?? '');
 	if (!gallery) return bffError(502, 'upstream error');
 
-	// The gate travels WITH the data, so the button's state is a server fact rather
-	// than a guess the browser makes about an environment it cannot see.
-	return noStoreJson({
-		images: gallery.images,
-		galleryId: gallery.galleryId,
-		uploadEnabled: IMAGE_UPLOAD_ENABLED,
-		uploadDisabledReason: IMAGE_UPLOAD_ENABLED ? '' : IMAGE_UPLOAD_DISABLED_REASON
-	});
+	return noStoreJson({ images: gallery.images, galleryId: gallery.galleryId });
 }

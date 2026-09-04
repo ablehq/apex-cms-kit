@@ -152,20 +152,15 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 
 		// ── Images (3d) ──────────────────────────────────────────────────────────
 		//
-		// There is no `createImage`. An image is created by uploading BYTES, and that
-		// leg is bring-up-gated (§2.7): the signed upload URL Apex hands back points at
-		// a port it does not serve. `listImages` reports the gate as `uploadEnabled` so
-		// the screen can disable the control and say why, instead of offering an upload
-		// that would stall forever and leave a captioned item with no picture.
+		// There is no `createImage`. An image is created by uploading BYTES, and no
+		// site has proven that leg against its Apex yet. Whether a given site offers
+		// an upload control is that SITE's policy, decided on its own screen.
 
 		async listImages() {
 			const body = await get('/api/admin/images');
 			return {
 				images: Array.isArray(body?.images) ? body.images : [],
-				galleryId: typeof body?.galleryId === 'string' ? body.galleryId : '',
-				uploadEnabled: body?.uploadEnabled === true,
-				uploadDisabledReason:
-					typeof body?.uploadDisabledReason === 'string' ? body.uploadDisabledReason : ''
+				galleryId: typeof body?.galleryId === 'string' ? body.galleryId : ''
 			};
 		},
 		/** Caption and alt only. Position is not writable — this screen cannot reorder. */
