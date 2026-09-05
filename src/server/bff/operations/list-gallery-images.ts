@@ -63,7 +63,8 @@ export interface AdminGalleryImageRecord {
 /** Normalize one `Cms::GalleryItem`. Rows without an id are dropped, not rendered blank. */
 export function summarizeGalleryImage(
 	row: Record<string, unknown>,
-	assetsPrefix = ''
+	assetsPrefix = '',
+	gallery: string = 'images'
 ): AdminGalleryImageRecord {
 	const medium = isRecord(row.medium) ? row.medium : null;
 	const file = medium && isRecord(medium.file) ? medium.file : null;
@@ -77,25 +78,47 @@ export function summarizeGalleryImage(
 		createdAt: cleanString(row.created_at),
 		// The same transform the public pages use, so the picker shows what the site
 		// will show.
-		url: assetsPrefix && key ? `${assetsPrefix}/cdn-cgi/image/f=auto,w=auto/${key}` : null
+		// A Cloudflare IMAGE transform — meaningless for a PDF or an MP4, so only images
+		// get a thumbnail URL. The other galleries carry the key and no URL.
+		url:
+			assetsPrefix && key && gallery === 'images'
+				? `${assetsPrefix}/cdn-cgi/image/f=auto,w=auto/${key}`
+				: null
 	};
 }
 
 /** The account's `images` gallery id, resolved by name from `cms_config`. */
-export async function readImagesGalleryId(apex: ApexAdminClient): Promise<string | null> {
+/** The galleries `cms_config` names, and the only ones a screen may address. */
+export const GALLERY_NAMES = Object.freeze(['images', 'videos', 'files'] as const);
+
+/**
+ * Resolve ONE gallery's id by NAME from `cms_config`, on every request (the ids are
+ * account-scoped — risk R14). `gallery` defaults to `images` so every shipped caller
+ * is unchanged; an unknown name resolves to null, never to the images gallery.
+ */
+export async function readGalleryId(
+	apex: ApexAdminClient,
+	gallery: string = 'images'
+): Promise<string | null> {
+	if (!(GALLERY_NAMES as readonly string[]).includes(gallery)) return null;
 	const config = await apex.readCmsConfig();
 	if (!config.ok) return null;
 	const body = config.body as { data?: unknown } | null;
 	const data = (body?.data ?? body) as { asset_library?: unknown } | null;
 	const entries = Array.isArray(data?.asset_library) ? data.asset_library : [];
 	for (const entry of entries) {
-		const gallery = (entry as { gallery?: { id?: unknown; name?: unknown } }).gallery;
-		if (cleanString(gallery?.name) === 'images') {
-			const id = cleanString(gallery?.id);
+		const entryGallery = (entry as { gallery?: { id?: unknown; name?: unknown } }).gallery;
+		if (cleanString(entryGallery?.name) === gallery) {
+			const id = cleanString(entryGallery?.id);
 			if (imageIdSchema.safeParse(id).success) return id;
 		}
 	}
 	return null;
+}
+
+/** The images gallery's id — the original name, kept for its positional callers. */
+export function readImagesGalleryId(apex: ApexAdminClient): Promise<string | null> {
+	return readGalleryId(apex, 'images');
 }
 
 /**
@@ -107,16 +130,17 @@ export async function readImagesGalleryId(apex: ApexAdminClient): Promise<string
  */
 export async function loadImagesGallery(
 	apex: ApexAdminClient,
-	assetsPrefix = ''
+	assetsPrefix = '',
+	gallery: string = 'images'
 ): Promise<{ galleryId: string; images: AdminGalleryImageRecord[] } | null> {
-	const galleryId = await readImagesGalleryId(apex);
+	const galleryId = await readGalleryId(apex, gallery);
 	if (!galleryId) return null;
 
 	const listed = await apex.listGalleryItems(galleryId);
 	if (!listed.ok) return null;
 
 	const images = unwrapArchetypeCollection(listed.body)
-		.map((row) => summarizeGalleryImage(row, assetsPrefix))
+		.map((row) => summarizeGalleryImage(row, assetsPrefix, gallery))
 		.filter((image) => image.id.length > 0)
 		// Newest first, like every other collection in this admin. `position` is what
 		// Apex sorts a gallery by for RENDERING; the library screen is a filing
@@ -126,25 +150,43 @@ export async function loadImagesGallery(
 	return { galleryId, images };
 }
 
-/** The item with this id, only if it is in the IMAGES gallery. `null` otherwise. */
+/**
+ * The item with this id, only if it is in the REQUESTED gallery (`images` by default).
+ * Apex addresses items by id alone, so this membership check is the only thing that
+ * stops the files screen editing an image, or vice versa.
+ */
 export async function findImage(
 	apex: ApexAdminClient,
 	imageId: string,
-	assetsPrefix = ''
+	assetsPrefix = '',
+	gallery: string = 'images'
 ): Promise<AdminGalleryImageRecord | null> {
-	const gallery = await loadImagesGallery(apex, assetsPrefix);
-	if (!gallery) return null;
-	return gallery.images.find((image) => image.id === imageId) ?? null;
+	const loaded = await loadImagesGallery(apex, assetsPrefix, gallery);
+	if (!loaded) return null;
+	return loaded.images.find((image) => image.id === imageId) ?? null;
 }
 
-export async function handleListImages(request: Request, ctx: BffContext): Promise<Response> {
+export async function handleListImages(
+	request: Request,
+	ctx: BffContext,
+	options: { gallery?: string } = {}
+): Promise<Response> {
+	const gallery = options.gallery ?? 'images';
 	const guard = await guardRequest(request, ctx, { mutation: false });
 	if (!guard.ok) return guard.response;
+	if (!(GALLERY_NAMES as readonly string[]).includes(gallery))
+		return bffError(404, 'no such gallery');
 
 	// The site's CDN prefix, when it has one: with it the picker browses thumbnails,
 	// without it the ids, which is what it did before any site could resolve a URL.
-	const gallery = await loadImagesGallery(guard.apex, ctx.assetsPrefix ?? '');
-	if (!gallery) return bffError(502, 'upstream error');
-
-	return noStoreJson({ images: gallery.images, galleryId: gallery.galleryId });
+	const loaded = await loadImagesGallery(guard.apex, ctx.assetsPrefix ?? '', gallery);
+	if (!loaded) return bffError(502, 'upstream error');
+	// `images` stays as the key the shipped browser client reads; `items` is the honest
+	// name for a files or videos listing and carries the same rows.
+	return noStoreJson({
+		gallery,
+		galleryId: loaded.galleryId,
+		images: loaded.images,
+		items: loaded.images
+	});
 }

@@ -2,7 +2,7 @@ import { auditOutcome } from '../audit';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
 import { rejectMutation } from '../reject';
-import { findImage, imageIdSchema } from './list-gallery-images';
+import { findImage, imageIdSchema, GALLERY_NAMES } from './list-gallery-images';
 import type { BffContext } from '../context';
 
 /**
@@ -28,12 +28,18 @@ import type { BffContext } from '../context';
 export async function handleDeleteImage(
 	request: Request,
 	ctx: BffContext,
-	params: { imageId: string }
+	params: { imageId: string },
+	options: { gallery?: string } = {}
 ): Promise<Response> {
+	const gallery = options.gallery ?? 'images';
+	// The audit row names the gallery actually addressed — never "images" for a file.
 	const meta = {
-		action: 'images.delete',
+		action: `${gallery}.delete`,
 		method: 'DELETE',
-		path: `/api/admin/images/${params.imageId}`,
+		path:
+			gallery === 'images'
+				? `/api/admin/images/${params.imageId}`
+				: `/api/admin/galleries/${gallery}/${params.imageId}`,
 		requestId: request.headers.get('cf-ray')
 	};
 
@@ -47,7 +53,10 @@ export async function handleDeleteImage(
 		return rejectMutation(ctx, actorMeta, 400, 'invalid id', 'invalid image id');
 	}
 
-	const existing = await findImage(guard.apex, idResult.data);
+	if (!(GALLERY_NAMES as readonly string[]).includes(gallery)) {
+		return rejectMutation(ctx, actorMeta, 404, 'not found', 'no such gallery');
+	}
+	const existing = await findImage(guard.apex, idResult.data, '', gallery);
 	if (!existing) return rejectMutation(ctx, actorMeta, 404, 'not found', 'no such image');
 
 	const apexResponse = await guard.apex.deleteGalleryItem(idResult.data);

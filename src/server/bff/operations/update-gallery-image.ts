@@ -3,7 +3,7 @@ import { auditOutcome } from '../audit';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
 import { rejectMutation } from '../reject';
-import { findImage, imageIdSchema } from './list-gallery-images';
+import { findImage, imageIdSchema, GALLERY_NAMES } from './list-gallery-images';
 import type { BffContext } from '../context';
 
 /**
@@ -42,12 +42,18 @@ export const updateImageBodySchema = z
 export async function handleUpdateImage(
 	request: Request,
 	ctx: BffContext,
-	params: { imageId: string }
+	params: { imageId: string },
+	options: { gallery?: string } = {}
 ): Promise<Response> {
+	const gallery = options.gallery ?? 'images';
+	// The audit row names the gallery actually addressed — never "images" for a file.
 	const meta = {
-		action: 'images.update',
+		action: `${gallery}.update`,
 		method: 'PATCH',
-		path: `/api/admin/images/${params.imageId}`,
+		path:
+			gallery === 'images'
+				? `/api/admin/images/${params.imageId}`
+				: `/api/admin/galleries/${gallery}/${params.imageId}`,
 		requestId: request.headers.get('cf-ray')
 	};
 
@@ -73,7 +79,10 @@ export async function handleUpdateImage(
 		return rejectMutation(ctx, actorMeta, 400, 'invalid body', 'invalid body');
 	}
 
-	const existing = await findImage(guard.apex, idResult.data);
+	if (!(GALLERY_NAMES as readonly string[]).includes(gallery)) {
+		return rejectMutation(ctx, actorMeta, 404, 'not found', 'no such gallery');
+	}
+	const existing = await findImage(guard.apex, idResult.data, '', gallery);
 	if (!existing) return rejectMutation(ctx, actorMeta, 404, 'not found', 'no such image');
 
 	const apexResponse = await guard.apex.updateGalleryItem(idResult.data, parsed.data);
@@ -97,7 +106,9 @@ export async function handleUpdateImage(
 	// Apex answered 200 to and dropped on the floor (phase 3b) and one that 422'd for
 	// months behind a stub, so a status code does not count as evidence anywhere in
 	// this codebase: the value is written when the READ surface shows it.
-	const image = await findImage(guard.apex, idResult.data);
+	// Re-read from the SAME gallery the write was addressed to. Reading images here for
+	// a files item would find nothing and answer 502 after the write had landed.
+	const image = await findImage(guard.apex, idResult.data, ctx.assetsPrefix ?? '', gallery);
 	if (!image) return noStoreJson({ error: 'unexpected upstream shape' }, 502);
 
 	return noStoreJson({ image });

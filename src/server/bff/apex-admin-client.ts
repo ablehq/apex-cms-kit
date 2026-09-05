@@ -223,6 +223,8 @@ export interface ApexAdminClient {
 
 	listTags(query?: Record<string, string | number>): Promise<ApexResponse>;
 	createTag(name: string): Promise<ApexResponse>;
+	/** Rename a tag. `PATCH /tags/:id` permits exactly `name`; uniqueness is per tenant and case-sensitive, so a collision is a 422. */
+	updateTag(tagId: string, name: string): Promise<ApexResponse>;
 	listTaggings(query?: Record<string, string | number>): Promise<ApexResponse>;
 	createTagging(tagId: string, taggableId: string): Promise<ApexResponse>;
 	deleteTagging(taggingId: string): Promise<ApexResponse>;
@@ -575,6 +577,13 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			// list-then-create, adopt on 422 — never as an error to show an editor.
 			return call(TAGS_BASE, { method: 'POST', body: JSON.stringify({ name }) });
 		},
+		async updateTag(tagId, name) {
+			assertUuid(tagId);
+			return call(`${TAGS_BASE}/${encodeURIComponent(tagId)}`, {
+				method: 'PATCH',
+				body: JSON.stringify({ name })
+			});
+		},
 		async listTaggings(query = {}) {
 			return call(`${TAGGINGS_BASE}/search_and_filter?${searchParams(query)}`, { method: 'GET' });
 		},
@@ -607,13 +616,30 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 
 		async listGalleryItems(galleryId) {
 			assertUuid(galleryId);
-			return call(
-				`${GALLERY_BASE}/search_and_filter?${searchParams(
-					{ per_page: 500 },
-					{ 'q[gallery_id_eq]': galleryId }
-				)}`,
-				{ method: 'GET' }
-			);
+			// Every page, not the first 500: the membership check that guards every edit
+			// and delete reads this list, and an item past the cap would be refused as
+			// "not found". Pages are merged into one envelope so callers are unchanged.
+			const page = (n: number) =>
+				call(
+					`${GALLERY_BASE}/search_and_filter?${searchParams(
+						{ per_page: 500, page: n },
+						{ 'q[gallery_id_eq]': galleryId }
+					)}`,
+					{ method: 'GET' }
+				);
+			const first = await page(1);
+			if (!first.ok) return first;
+			const body = first.body as { data?: unknown[]; pagination?: { total_pages?: number } } | null;
+			const totalPages = Number(body?.pagination?.total_pages ?? 1);
+			if (!Array.isArray(body?.data) || !(totalPages > 1)) return first;
+			const rest = [];
+			for (let n = 2; n <= totalPages; n += 1) {
+				const next = await page(n);
+				if (!next.ok) return next;
+				const data = (next.body as { data?: unknown[] } | null)?.data;
+				if (Array.isArray(data)) rest.push(...data);
+			}
+			return { ...first, body: { ...body, data: [...body.data, ...rest] } };
 		},
 		async updateGalleryItem(galleryItemId, fields) {
 			assertUuid(galleryItemId);
