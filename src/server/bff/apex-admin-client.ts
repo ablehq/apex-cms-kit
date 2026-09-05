@@ -191,10 +191,24 @@ export interface PageStructureBody {
 	meta_properties_attributes?: unknown[];
 }
 
+/** What `POST /cms/pages` takes — the three columns the pages controller permits on a create. */
+export interface PageCreateBody {
+	title: string;
+	slug: string;
+	summary?: string;
+}
+
 export interface ApexAdminClient {
 	listPages(query: Record<string, string | number>): Promise<ApexResponse>;
 	listPageBlockTemplates(): Promise<ApexResponse>;
 	getPage(pageId: string): Promise<ApexResponse>;
+	/**
+	 * Mint a page (plan 04, G3). Measured 2026-09-05: one POST creates a `draft`
+	 * page with its `web` SEO triple and no blocks; a duplicate slug is a 422; and
+	 * Apex ACCEPTS a slug the site reserves (`/admin`), so the operation above
+	 * this refuses those itself.
+	 */
+	createPage(body: PageCreateBody): Promise<ApexResponse>;
 	updatePageStructure(pageId: string, body: PageStructureBody): Promise<ApexResponse>;
 	updateEntityFields(
 		entityTypeId: string,
@@ -481,6 +495,19 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 		async getPage(pageId) {
 			assertUuid(pageId);
 			return call(`${PAGES_BASE}/${encodeURIComponent(pageId)}`, { method: 'GET' });
+		},
+		async createPage(body) {
+			// The keys are named ONE BY ONE rather than spread, so an extra key on the
+			// caller's object can never reach Apex — the operation's schema is `.strict()`
+			// on the same three, so the two ends agree by construction.
+			return call(PAGES_BASE, {
+				method: 'POST',
+				body: JSON.stringify({
+					title: body.title,
+					slug: body.slug,
+					...(body.summary === undefined ? {} : { summary: body.summary })
+				})
+			});
 		},
 		async updatePageStructure(pageId, body) {
 			assertUuid(pageId);

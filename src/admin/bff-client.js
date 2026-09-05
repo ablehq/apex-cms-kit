@@ -115,6 +115,10 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 		getPage(pageId) {
 			return get(`/api/admin/pages/${pageId}`);
 		},
+		/** Create-then-reveal: the page exists (as a draft) before the editor opens. */
+		createPage(payload) {
+			return mutate('/api/admin/pages', 'POST', payload);
+		},
 		readVersion(pageId) {
 			return get(`/api/admin/pages/${pageId}/version`);
 		},

@@ -281,6 +281,12 @@ export interface BffClient {
 	}): Promise<AdminPage[]>;
 	listTemplates(): Promise<AdminTemplateSummary[]>;
 	getPage(pageId: string): Promise<AdminPageLoad>;
+	/** `{ ok, page, version }` on 201; `409 slug-taken` and `400 reserved-slug` are the refusals. */
+	createPage(payload: {
+		title: string;
+		slug: string;
+		summary?: string;
+	}): Promise<BffMutationResult>;
 	readVersion(pageId: string): Promise<{ version: string }>;
 	patchEntityFields(
 		entityTypeId: string,
