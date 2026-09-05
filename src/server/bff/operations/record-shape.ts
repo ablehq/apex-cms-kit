@@ -157,7 +157,15 @@ export function hasManyDiff(
  * the delete confirmation has to, and it has to name the types truthfully.
  */
 /**
- * How many content-library records reference this one, fresh.
+ * How many records reference this one, fresh — content-library records AND posts.
+ *
+ * A referrer whose schema is a POST (`target_model: 'Cms::Post'`) is read through
+ * `listPostArchetypes`, the archetypes surface that carries the items; a
+ * content-library referrer through `listContentLibrary`. A site whose contract
+ * names a post referrer as countable but whose client has not enabled that slug
+ * gets a thrown refusal from the client — caught here and reported as
+ * `{ok:false}`, so the delete answers 502 rather than 500 and, above all, never
+ * proceeds on a count it could not take.
  *
  * It fails CLOSED: any leg that will not read returns `{ok:false}` and the caller
  * answers 502 rather than a count that is missing entries — because a missing entry
@@ -172,15 +180,20 @@ export async function countReferencesTo(
 	const { countable } = contract.referrersTo(targetSlug);
 	let count = 0;
 	for (const referrer of countable) {
+		const isPost = contract.schema(referrer.slug)?.target_model === 'Cms::Post';
 		// EVERY page. A referrer on page two counted as zero is the one answer that
 		// must never be a guess: it reads as "nothing uses this" and talks an editor
 		// into a delete that silently strips the reference.
 		let page = 1;
 		for (;;) {
-			const listed = await apex.listContentLibrary(referrer.slug, {
-				per_page: PAGE_SIZE,
-				page
-			});
+			let listed;
+			try {
+				listed = isPost
+					? await apex.listPostArchetypes(referrer.slug, { per_page: PAGE_SIZE, page })
+					: await apex.listContentLibrary(referrer.slug, { per_page: PAGE_SIZE, page });
+			} catch {
+				return { ok: false };
+			}
 			if (!listed.ok) return { ok: false };
 			for (const record of unwrapArchetypeCollection(listed.body)) {
 				const references = readReferences(record, referrer.itemName);

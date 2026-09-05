@@ -61,11 +61,14 @@ export interface Referrers {
 	 */
 	countable: { slug: string; displayName: string; itemName: string }[];
 	/**
-	 * Referring POST schemas (`update`, `story`). Named but NOT counted: a post's
-	 * archetype is not addressable through the content-library client (its fields
-	 * would 422 there — SHARED-FACTS §15), and the post surface is P2. A partial
-	 * count reads as a complete one, which is the exact sentence that talks someone
-	 * into a delete, so it is left uncounted and said so.
+	 * Referring schemas the site cannot count. Named but NOT counted, and the
+	 * delete REFUSES outright while any exist: a partial count reads as a complete
+	 * one, which is the exact sentence that talks someone into a delete.
+	 *
+	 * A POST schema (`update`, `story`) belongs here only while the site's client
+	 * cannot read it. Once the site enables the slug in `allowedPostSlugs`,
+	 * `countReferencesTo` reads post archetypes too, and the site moves the schema
+	 * into `countable` — which is what turns "cannot delete yet" into a real number.
 	 */
 	uncounted: { slug: string; displayName: string; itemName: string }[];
 }

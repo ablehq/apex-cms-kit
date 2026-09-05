@@ -32,7 +32,7 @@ const FILE = 'cccccccc-0000-4000-8000-000000000003';
  * recorded, so a refusal can be proved to have made NO upstream write (the check
  * itself necessarily reads `cms_config` and lists the gallery).
  */
-function apexWith(calls) {
+function apexWith(calls, { ignoreFilter = false } = {}) {
 	const items = [
 		{
 			id: IMG,
@@ -74,10 +74,12 @@ function apexWith(calls) {
 		},
 		async listGalleryItems(galleryId) {
 			calls.push(['listGalleryItems', galleryId]);
+			// `ignoreFilter` models an Apex that does NOT honour `q[gallery_id_eq]` — the
+			// mutation that proved the id-only membership check was not enough.
 			return {
 				ok: true,
 				status: 200,
-				body: { data: items.filter((it) => it.gallery_id === galleryId) }
+				body: { data: ignoreFilter ? items : items.filter((it) => it.gallery_id === galleryId) }
 			};
 		},
 		async updateGalleryItem(id, fields) {
@@ -91,7 +93,7 @@ function apexWith(calls) {
 	};
 }
 
-function ctxWith(calls, audit) {
+function ctxWith(calls, audit, options = {}) {
 	return {
 		allowedOrigins: parseAllowedOrigins(ORIGIN),
 		reviewOnlyFields: [],
@@ -108,7 +110,7 @@ function ctxWith(calls, audit) {
 			},
 			async revoke() {}
 		},
-		createApexClient: () => apexWith(calls),
+		createApexClient: () => apexWith(calls, options),
 		assetsPrefix: 'https://cdn.test',
 		db: audit
 			? {
@@ -248,6 +250,42 @@ describe('cross-gallery membership — the check every edit and delete stands on
 				row.some((v) => typeof v === 'string' && v.startsWith('/api/admin/galleries/files/')),
 				'audit path is the route addressed'
 			);
+		});
+	}
+
+	for (const [op, run] of [
+		['update', (r, ctx, id, g) => handleUpdateImage(r, ctx, { imageId: id }, { gallery: g })],
+		['delete', (r, ctx, id, g) => handleDeleteImage(r, ctx, { imageId: id }, { gallery: g })]
+	]) {
+		it(`${op}: a foreign item is STILL refused when Apex ignores the gallery filter`, async () => {
+			// The second layer. Against an Apex that returns every item regardless of
+			// `q[gallery_id_eq]`, an id-only check found the video under the files route
+			// and wrote upstream (proved by mutation, 2026-09-05). The row's own
+			// `gallery_id` must match the gallery resolved by name.
+			const calls = [];
+			const ctx = ctxWith(calls, undefined, { ignoreFilter: true });
+			const session = await signIn(ctx);
+			const method = op === 'update' ? 'PATCH' : 'DELETE';
+			const body = op === 'update' ? { caption: 'x' } : undefined;
+			const res = await run(
+				req(session, `/api/admin/galleries/files/${VID}`, method, body),
+				ctx,
+				VID,
+				'files'
+			);
+			assert.equal(res.status, 404);
+			const writes = calls.filter(
+				([name]) => name === 'updateGalleryItem' || name === 'deleteGalleryItem'
+			);
+			assert.deepEqual(writes, [], `${op} must not reach Apex for a foreign item`);
+			// And the SAME unfiltered Apex still serves the item that genuinely belongs.
+			const own = await run(
+				req(session, `/api/admin/galleries/files/${FILE}`, method, body),
+				ctx,
+				FILE,
+				'files'
+			);
+			assert.equal(own.status, 200);
 		});
 	}
 

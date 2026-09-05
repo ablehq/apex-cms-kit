@@ -17,6 +17,21 @@ export interface ApexAdminClientOptions {
 	 * content-library methods. Omitted: no narrowing (GLC's behaviour today).
 	 */
 	allowedSchemaSlugs?: readonly string[];
+	/**
+	 * The POST archetype schema slugs this site may address through the post
+	 * methods (`listPosts`, `listPostArchetypes`, `getPostArchetype`, `createPost`,
+	 * `updatePostArchetype`, `deletePost`) and, by extension, `updatePostFields`.
+	 *
+	 * A SEPARATE allowlist from `allowedSchemaSlugs`, deliberately: a post's own
+	 * fields must never be written on the content-library surface (its slug 422s
+	 * there — `Slug has already been taken`), and a content-library record has no
+	 * `Cms::Post` to write. The two sets are disjoint by construction, and a site
+	 * that lists a slug in both has made a mistake this option cannot express.
+	 *
+	 * Omitted or empty: EVERY post method refuses. A site opts in by naming its
+	 * post schemas; GLC, which has its own article methods, names none.
+	 */
+	allowedPostSlugs?: readonly string[];
 }
 
 export interface ApexResponse {
@@ -116,6 +131,24 @@ export interface SignedUploadFile {
 	byte_size: number;
 	content_type: string;
 	checksum: string;
+}
+
+/**
+ * The `Cms::Post` half of a post — the ONLY surface its own fields may be written
+ * on (`PATCH /cms/posts/:id`). Exactly what `posts_controller#permitted_params`
+ * permits, read 2026-09-05: the four columns, the SEO rows and the shared gallery
+ * items (the cover). Both nested lists are `accepts_nested_attributes_for` with
+ * ordinary Rails semantics — an entry WITHOUT an id creates a second row, an entry
+ * with one updates it, `_destroy` removes it — so the operations build them from
+ * ids Apex already gave back, never from the browser.
+ */
+export interface PostFields {
+	title?: string;
+	slug?: string;
+	summary?: string;
+	published_date?: string;
+	meta_properties_attributes?: unknown[];
+	shared_gallery_items_attributes?: unknown[];
 }
 
 /** The `Cms::GalleryItem` fields the images screen may write (probe G3). */
@@ -221,6 +254,53 @@ export interface ApexAdminClient {
 	updateDocumentBlocks(documentId: string, blocks: unknown[]): Promise<ApexResponse>;
 	changePostStatus(postId: string, statusEvent: PostStatusEvent): Promise<ApexResponse>;
 
+	// ── Posts, schema-scoped (plan 04, G1) ────────────────────────────────────
+	//
+	// A post is THREE records addressed in TWO id spaces, and every method below
+	// says which it takes. The `slug` is checked against `allowedPostSlugs` first
+	// and last: a caller cannot widen the catalogue with its own filter, and a
+	// site that has not opted in cannot reach any of them.
+	//
+	//   archetype id  → `getPostArchetype`, `updatePostArchetype`, `deletePost`
+	//                   (kind, author, focus_area, partner; delete cascades)
+	//   post id       → `updatePostFields`, `changePostStatus`
+	//                   (title, slug, summary, published_date, SEO, cover; status)
+	//   document id   → `getDocument`, `updateDocumentBlocks` (the body)
+
+	/** The `post_archetype_views` for one schema: post fields, `archetype_id`, `document.id`, SEO, cover. */
+	listPosts(slug: string, query?: Record<string, string | number>): Promise<ApexResponse>;
+	/**
+	 * The ARCHETYPES for one post schema, with `archetype_items` and `taggings` —
+	 * the half the views do not carry (the view's `archetype` is stripped of its
+	 * items). One call for the whole list, so a list screen is not N+1, and the
+	 * read the reference count uses.
+	 */
+	listPostArchetypes(slug: string, query?: Record<string, string | number>): Promise<ApexResponse>;
+	getPostArchetype(slug: string, archetypeId: string): Promise<ApexResponse>;
+	/**
+	 * ONE call mints the archetype, its `Cms::Post`, an empty `Cms::Document` and
+	 * any primitive or reference sent beside `target_model_attributes` (measured
+	 * 2026-09-05: `kind` and a `focus_area` has_many both land on create). Apex
+	 * answers with the ARCHETYPE; the post id is its `target_model_id`.
+	 */
+	createPost(
+		slug: string,
+		targetModelAttributes: PostFields,
+		fields?: ContentLibraryFields,
+		references?: Record<string, HasManyEntry[] | string | null>
+	): Promise<ApexResponse>;
+	/** The archetype half: primitives (a story's `kind`) and references, FLAT on `archetype_models`. */
+	updatePostArchetype(
+		slug: string,
+		archetypeId: string,
+		fields: ContentLibraryFields,
+		references?: Record<string, HasManyEntry[] | string | null>
+	): Promise<ApexResponse>;
+	/** The ARCHETYPE id: deleting it cascades to the post and its document. */
+	deletePost(slug: string, archetypeId: string): Promise<ApexResponse>;
+	/** The `Cms::Post` half, by POST id. Refuses unless the client has any post slug enabled. */
+	updatePostFields(postId: string, fields: PostFields): Promise<ApexResponse>;
+
 	listTags(query?: Record<string, string | number>): Promise<ApexResponse>;
 	createTag(name: string): Promise<ApexResponse>;
 	/** Rename a tag. `PATCH /tags/:id` permits exactly `name`; uniqueness is per tenant and case-sensitive, so a collision is a 422. */
@@ -298,6 +378,24 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			throw new Error(`not a content-library archetype schema: ${slug}`);
 		}
 		return encodeURIComponent(slug);
+	}
+	/**
+	 * The post-side twin of `contentLibrarySlug`: a slug the site has not named in
+	 * `allowedPostSlugs` is refused, and with no allowlist at all every post method
+	 * is unreachable. A thrown error rather than a 4xx, because reaching here with
+	 * the wrong slug is a programming error in the caller, not a request to answer.
+	 */
+	function postSlug(slug: string): string {
+		const allowed = options.allowedPostSlugs;
+		if (!allowed || !allowed.includes(slug)) {
+			throw new Error(`not an allowed post archetype schema: ${slug}`);
+		}
+		return encodeURIComponent(slug);
+	}
+	function assertPostsEnabled(): void {
+		if (!options.allowedPostSlugs || options.allowedPostSlugs.length === 0) {
+			throw new Error('post methods are not enabled for this client');
+		}
 	}
 	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
 	if (!options.baseUrl) throw new Error('Apex base URL is not configured');
@@ -567,6 +665,73 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			});
 		},
 
+		// ── Posts, schema-scoped ────────────────────────────────────────────────
+
+		async listPosts(slug, query = {}) {
+			// The schema filter is set HERE and last, so a caller cannot widen the
+			// catalogue — and a post of another schema addressed by `q[id_eq]` simply
+			// finds nothing (measured: a story id through the update filter → 0 rows).
+			return call(
+				`${POST_VIEWS_BASE}/search_and_filter?${searchParams(query, {
+					'q[archetype_schema_slug_eq]': postSlug(slug)
+				})}`,
+				{ method: 'GET' }
+			);
+		},
+		async listPostArchetypes(slug, query = {}) {
+			return call(
+				`${ARCHETYPES_BASE}/search_and_filter?${searchParams(query, {
+					'q[archetype_schema_slug_eq]': postSlug(slug)
+				})}`,
+				{ method: 'GET' }
+			);
+		},
+		async getPostArchetype(slug, archetypeId) {
+			assertUuid(archetypeId);
+			return call(
+				`${ARCHETYPE_SCHEMAS_BASE}/${postSlug(slug)}/archetypes/${encodeURIComponent(archetypeId)}`,
+				{ method: 'GET' }
+			);
+		},
+		async createPost(slug, targetModelAttributes, fields = {}, references = {}) {
+			return call(`${ARCHETYPE_SCHEMAS_BASE}/${postSlug(slug)}/archetype_models`, {
+				method: 'POST',
+				body: JSON.stringify({
+					target_model_attributes: targetModelAttributes,
+					...fields,
+					...references
+				})
+			});
+		},
+		async updatePostArchetype(slug, archetypeId, fields, references = {}) {
+			assertUuid(archetypeId);
+			// FLAT keys on `archetype_models` — the one write that persists (the same
+			// pairing `updateContentLibraryRecord` documents). A has_one is a bare id
+			// or `null`; a has_many is the all-hash diff on `HasManyEntry`.
+			return call(
+				`${ARCHETYPE_SCHEMAS_BASE}/${postSlug(slug)}/archetype_models/${encodeURIComponent(archetypeId)}`,
+				{ method: 'PATCH', body: JSON.stringify({ ...fields, ...references }) }
+			);
+		},
+		async deletePost(slug, archetypeId) {
+			assertUuid(archetypeId);
+			return call(
+				`${ARCHETYPE_SCHEMAS_BASE}/${postSlug(slug)}/archetype_models/${encodeURIComponent(archetypeId)}`,
+				{ method: 'DELETE' }
+			);
+		},
+		async updatePostFields(postId, fields) {
+			assertPostsEnabled();
+			assertUuid(postId);
+			// `Cms::Post` DIRECTLY — routing a post's fields through `archetype_models`
+			// 422s with `Slug has already been taken`, because the service validates a
+			// freshly built post whose slug collides with the post's own.
+			return call(`${POSTS_BASE}/${encodeURIComponent(postId)}`, {
+				method: 'PATCH',
+				body: JSON.stringify(fields)
+			});
+		},
+
 		async listTags(query = {}) {
 			return call(`${TAGS_BASE}/search_and_filter?${searchParams(query)}`, { method: 'GET' });
 		},
@@ -632,7 +797,9 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			const body = first.body as { data?: unknown[]; pagination?: { total_pages?: number } } | null;
 			const totalPages = Number(body?.pagination?.total_pages ?? 1);
 			if (!Array.isArray(body?.data) || !(totalPages > 1)) return first;
-			const rest = [];
+			// Typed, not inferred: under a consumer's `noImplicitAny: false` an untyped
+			// `[]` is `never[]`, and the spread below is then a type error in the site.
+			const rest: unknown[] = [];
 			for (let n = 2; n <= totalPages; n += 1) {
 				const next = await page(n);
 				if (!next.ok) return next;

@@ -167,6 +167,12 @@ export interface AdminTemplateSummary {
 /** slug → provisioned template. A slug the account has not provisioned is absent. */
 export type AdminTemplateRegistry = Record<string, AdminTemplateSummary>;
 
+/** One word of the account's tag vocabulary, as `TagPicker.svelte` lists it. */
+export interface AdminTag {
+	id: string;
+	name: string;
+}
+
 /**
  * One item of an asset-library gallery.
  *

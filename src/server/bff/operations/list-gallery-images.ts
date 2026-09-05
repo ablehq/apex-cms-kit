@@ -154,6 +154,14 @@ export async function loadImagesGallery(
  * The item with this id, only if it is in the REQUESTED gallery (`images` by default).
  * Apex addresses items by id alone, so this membership check is the only thing that
  * stops the files screen editing an image, or vice versa.
+ *
+ * TWO checks, not one. The list is read with `q[gallery_id_eq]`, but a filter is
+ * a request, not a proof: a code review proved by mutation (2026-09-05) that
+ * against an Apex which ignored the filter, an item from another gallery came
+ * back in the list, matched by id, and was written upstream through the wrong
+ * route. So the row's OWN `gallery_id` — which `summarizeGalleryImage` already
+ * carries as `galleryId` — must also equal the gallery id resolved by name. A row
+ * Apex returns from the wrong gallery is refused whatever the filter did.
  */
 export async function findImage(
 	apex: ApexAdminClient,
@@ -163,7 +171,10 @@ export async function findImage(
 ): Promise<AdminGalleryImageRecord | null> {
 	const loaded = await loadImagesGallery(apex, assetsPrefix, gallery);
 	if (!loaded) return null;
-	return loaded.images.find((image) => image.id === imageId) ?? null;
+	return (
+		loaded.images.find((image) => image.id === imageId && image.galleryId === loaded.galleryId) ??
+		null
+	);
 }
 
 export async function handleListImages(
