@@ -286,6 +286,18 @@ describe('savePost — the write order, and what never runs after a failure', ()
 		assert.match(result.message, /Nothing after it was saved/u);
 	});
 
+	it('a 422 that names no field says so, in the shared wording', async () => {
+		const client = makeClient({ fail: 'updatePost', status: 422, errors: [] });
+		const draft = createPostDraft('story', post, 'v1', contract);
+		setPostField(draft, 'title', 'Renamed');
+		const result = await savePost(draft, client);
+		assert.equal(result.status, 422);
+		assert.equal(
+			result.message,
+			'A field was rejected, but Apex did not say which. Nothing after it was saved; fix it and Save again.'
+		);
+	});
+
 	it('skips every stage that has nothing to write', async () => {
 		const client = makeClient();
 		const draft = createPostDraft('story', post, 'v1', contract);

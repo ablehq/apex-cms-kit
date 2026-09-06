@@ -21,6 +21,7 @@
 // the only failure here that reaches the public site. Everything else leaves a
 // draft that is merely behind, and the message says which stage it is behind at.
 
+import { rejectedFieldsSentence } from './field-errors.js';
 import {
 	hasPostArchetypeChanges,
 	hasPostFieldChanges,
@@ -31,24 +32,6 @@ import {
 
 export const STALE_MESSAGE =
 	'This was changed somewhere else since you opened it. Reload to get the latest version, then re-apply your changes.';
-
-/**
- * Apex's field errors, as the BFF forwards them on a 422 (`{ errors: [{ attribute,
- * messages }] }`). Apex's messages are FULL sentences already ("Published date is
- * invalid"), so they are shown as they are; the attribute name is the fallback
- * only when an error carries no message at all.
- * @param {any} res
- */
-function fieldErrors(res) {
-	const errors = Array.isArray(res?.errors) ? res.errors : [];
-	return errors
-		.map((/** @type {any} */ e) => {
-			const messages = Array.isArray(e?.messages) ? e.messages.filter(Boolean) : [];
-			return messages.length > 0 ? messages.join(', ') : String(e?.attribute ?? '');
-		})
-		.filter(Boolean)
-		.join('; ');
-}
 
 /**
  * @param {string} stage @param {any} res
@@ -62,8 +45,9 @@ function messageFor(stage, res) {
 			return 'Another post already uses that address. Nothing after it was saved; choose a different one and Save again.';
 		}
 		if (status === 422) {
-			const detail = fieldErrors(res);
-			return `${detail ? `A field was rejected: ${detail}.` : 'A field was rejected.'} Nothing after it was saved; fix it and Save again.`;
+			// The list and the "named nothing" wording are the kit's (field-errors.js);
+			// only the sentence around them — what was and was not saved — is this screen's.
+			return `${rejectedFieldsSentence(res)} Nothing after it was saved; fix it and Save again.`;
 		}
 		return 'Saving failed. Nothing after it was saved — Save again to retry.';
 	}
