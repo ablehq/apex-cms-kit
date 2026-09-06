@@ -111,29 +111,9 @@ export function rejectedWriteResponse(body: unknown): Response {
 	return noStoreJson({ error: 'invalid', code: 'invalid', errors }, 422);
 }
 
-/**
- * Every page of a `search_and_filter` read, or null when a page will not read or
- * the pagination metadata is missing — the same fail-closed rule as
- * `countReferencesTo`. A list that silently stopped at page one would make the
- * tab counts guesses past 100 posts, and desync the two halves of a post when
- * the views and the archetypes paginated differently.
- */
-export async function listAllPages(
-	fetchPage: (page: number) => Promise<{ ok: boolean; body: unknown }>
-): Promise<Record<string, unknown>[] | null> {
-	const rows: Record<string, unknown>[] = [];
-	let page = 1;
-	for (;;) {
-		const response = await fetchPage(page);
-		if (!response.ok) return null;
-		rows.push(...unwrapArchetypeCollection(response.body));
-		const totalPages = (response.body as { pagination?: { total_pages?: unknown } } | null)
-			?.pagination?.total_pages;
-		if (!Number.isInteger(totalPages)) return null;
-		if (page >= Math.max(1, totalPages as number)) return rows;
-		page += 1;
-	}
-}
+// The paginator moved to `../paginate` so the pages list shares it; re-exported
+// here because the post list and its tests import it from this module.
+export { listAllPages } from '../paginate';
 
 /** The schema, only if it is a POST schema — the one kind these operations serve. */
 export function postSchemaOf(contract: ContentContract, slug: string): ArchetypeSchema | null {

@@ -46,10 +46,17 @@ const CSRF = 'csrf-unit';
 
 function stubApexFetch() {
 	return async () =>
-		new Response(JSON.stringify({ data: [{ id: 'page-1', slug: 'gospel' }] }), {
-			status: 200,
-			headers: { 'content-type': 'application/json' }
-		});
+		// Apex's real envelope: rows plus pagination (the list op walks every page).
+		new Response(
+			JSON.stringify({
+				data: [{ id: 'page-1', slug: 'gospel' }],
+				pagination: { current_page: 1, total_pages: 1 }
+			}),
+			{
+				status: 200,
+				headers: { 'content-type': 'application/json' }
+			}
+		);
 }
 
 function buildTestContext(overrides = {}) {
