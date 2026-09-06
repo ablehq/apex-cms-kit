@@ -64,6 +64,35 @@
 
 	$: busy = phase !== 'idle';
 
+	/**
+	 * ── ONE DIALOG SESSION ────────────────────────────────────────────────────
+	 * This component is not remounted between uses: a page form opens it for one
+	 * field, closes it, and opens the same instance again for another. `save()`
+	 * therefore outlives the dialog it was started from, and until this counter
+	 * existed it spoke for whichever dialog happened to be open when it finished.
+	 *
+	 * Probed: start an upload for field A, press Close, open the picker for field
+	 * B, and when A lands it calls the CURRENT `onSelect` — so A's image is filed
+	 * in B's field — then resets the state B is using and closes B's dialog.
+	 *
+	 * The counter advances on every transition of `open`, however it was caused:
+	 * the ✕, a tile, a successful upload, or the parent setting the prop itself.
+	 * An upload captures it at Save and is only allowed to speak if it still
+	 * matches. Closing is deliberately NOT disabled while busy — a 25 MB upload on
+	 * a slow link would trap an editor in a dialog they no longer want — so the
+	 * invalidation, not a disabled button, is what makes this hold.
+	 *
+	 * An invalidated upload is not cancelled and cannot be: the bytes are already
+	 * on their way and the item is created server-side. It simply stops speaking.
+	 * The item is really in the gallery and the caller's next list read shows it.
+	 */
+	let session = 0;
+	let wasOpen = open;
+	$: if (open !== wasOpen) {
+		wasOpen = open;
+		session += 1;
+	}
+
 	function reset() {
 		file = null;
 		title = '';
@@ -88,18 +117,26 @@
 	}
 
 	async function save() {
-		if (!file || !media || !client) return;
+		if (!file || !media || !client || busy) return;
 		error = '';
 		// The destination is captured HERE, so a `gallery` that changes while the
 		// bytes are in flight cannot misfile what is already on its way.
 		const destination = gallery;
+		// And the SESSION is captured here, so an upload that outlives its dialog
+		// cannot select into, reset, or close a later one.
+		const mine = session;
 		const result = await uploadMedia(client, {
 			gallery: destination,
 			file,
 			title,
 			alt: showAlt ? alt : '',
-			onPhase: (next) => (phase = next)
+			// Guarded as well: without this a stale upload's progress would put
+			// "Uploading…" on a dialog it has nothing to do with, and mark it busy.
+			onPhase: (next) => {
+				if (mine === session) phase = next;
+			}
 		});
+		if (mine !== session) return;
 		phase = 'idle';
 		if (!result.ok) {
 			error = result.message;
