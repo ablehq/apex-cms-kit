@@ -57,6 +57,27 @@ import type { BffContext } from '../context';
  * judged, finalize spends that row with a single conditional UPDATE. See that file
  * for why one statement, and not a read followed by a write.
  *
+ * ── THE WINDOW BETWEEN THE ITEM AND ITS BYTES, STATED HONESTLY ────────────────
+ * An earlier comment here said the cleanup delete "cannot race a caller". It can.
+ * The item is created before the file is attached, so for the length of one Apex
+ * round trip it is a real, listable row that another editor could delete — and Rails
+ * permits a `Medium` whose polymorphic record is absent, measured: create an item,
+ * delete it, then attach to its id and Apex answers 200 with a medium pointing at
+ * nothing. So this op can report an accepted upload whose gallery item is gone, and
+ * leave a `Medium` row referencing a deleted record.
+ *
+ * Not repaired, deliberately. Re-reading the item after the attach would narrow the
+ * window and not close it — the delete can land immediately after the re-read — and
+ * a check that looks like a guarantee but is not one is worse than a stated limit.
+ * Closing it needs something upstream this API does not offer: creating the item and
+ * attaching the file in one transaction, or a foreign key that refuses a `Medium`
+ * whose record is absent. Both belong in `ellipsis-backend`, next to the
+ * unattached-blob sweeper below.
+ *
+ * The practical reach is small: the id is seconds old and appears in no list anyone
+ * has read, so deleting it means already holding an id nothing has published yet.
+ * That is why it is documented rather than defended against.
+ *
  * ── WHAT IS STILL NOT REPAIRED ────────────────────────────────────────────────
  * The blob. Signing mints an `ActiveStorage::Blob` immediately, so an abandoned or
  * failed PUT strands bytes that no platform API can reach, and `ellipsis-backend` has
@@ -461,8 +482,9 @@ export async function handleFinalizeMediaUpload(
 	if (!medium.ok) {
 		// The ONE compensation this design still needs, and it is local: the item was
 		// created moments ago, in this request, by this op, so its id is known and the
-		// delete cannot race a caller. An item with no medium is the "caption attached
-		// to no picture" the whole ordering exists to prevent.
+		// delete needs no search. An item with no medium is the "caption attached to no
+		// picture" the whole ordering exists to prevent. `deleteQuietly` reports rather
+		// than assumes, because the item may already be gone (see the header).
 		const swept = await deleteQuietly(guard.apex, galleryItemId);
 		await auditOutcome(ctx, meta, guard.actor, {
 			outcome: 'apex_error',
