@@ -3,6 +3,12 @@ import { unwrapArchetypeRecord } from '../archetype-record';
 import { auditOutcome } from '../audit';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
+import {
+	purgeExpiredUploadClaims,
+	recordUploadClaim,
+	redeemUploadClaim,
+	uploadClaimMessage
+} from '../media-claim';
 import { rejectMutation } from '../reject';
 import { readGalleryId } from './list-gallery-images';
 import { galleryMedia, refuseUpload } from '../../../admin/media-types.js';
@@ -16,10 +22,11 @@ import type { BffContext } from '../context';
  * the ActiveStorage SIGNED URL, which is storage, not Apex, and carries no Apex
  * credential.
  *
- *   POST /api/admin/media/uploads  → check the type and size, mint a signed URL.
- *                                    Creates NOTHING upstream.
+ *   POST /api/admin/media/uploads  → check the type and size, mint a signed URL,
+ *                                    write the CLAIM. Creates NOTHING upstream.
  *   (the browser PUTs the file to that URL)
- *   POST /api/admin/media          → create the gallery item AND attach the medium.
+ *   POST /api/admin/media          → spend the claim, then create the gallery item
+ *                                    AND attach the medium.
  *
  * ── WHY THE ITEM IS CREATED HERE AND NOT AT SIGN ──────────────────────────────
  * It used to be created at sign, before the bytes existed. Every failure after that
@@ -29,11 +36,25 @@ import type { BffContext } from '../context';
  * browser was tried and does not work.
  *
  * Creating the item at FINALIZE removes the failure mode rather than handling it:
- * nothing exists until the bytes are stored, so there is no rollback to perform, no
- * orphaned item to sweep, and no browser-supplied `galleryItemId` to distrust (which
- * in turn removes the target guard the previous design needed). The one compensation
- * left is local and server-side: if creating the MEDIUM fails after the item was
- * created, this op deletes the item it just made, in the same request.
+ * nothing exists until the bytes are stored, so there is no rollback to perform and
+ * no orphaned item to sweep. The one compensation left is local and server-side: if
+ * creating the MEDIUM fails after the item was created, this op deletes the item it
+ * just made, in the same request.
+ *
+ * ── WHAT MOVING THE CREATE DID *NOT* REMOVE ───────────────────────────────────
+ * This file used to argue that finalize no longer had to guard its target because
+ * there was no browser-supplied `galleryItemId` left to distrust. That was wrong,
+ * and measurably so. The SIGNED ID is still a caller-supplied token, and it is the
+ * only thing tying the finalize request to the type and size check the sign leg ran.
+ * With nothing checking it: a PNG signed for `images` finalized into `videos` (200);
+ * a PDF signed for `files` finalized into `images` (200); one signed id finalized
+ * twice, and twice concurrently, each time leaving two gallery items whose media
+ * shared a single blob — which `dependent: :purge_later` turns into "deleting one
+ * item destroys the other's bytes".
+ *
+ * `media-claim.ts` closes both holes with one row: sign writes down the gallery it
+ * judged, finalize spends that row with a single conditional UPDATE. See that file
+ * for why one statement, and not a read followed by a write.
  *
  * ── WHAT IS STILL NOT REPAIRED ────────────────────────────────────────────────
  * The blob. Signing mints an `ActiveStorage::Blob` immediately, so an abandoned or
@@ -162,6 +183,13 @@ export async function handleSignMediaUpload(request: Request, ctx: BffContext): 
 	);
 	if (refusal) return rejectMutation(ctx, actorMeta, 400, refusal, refusal);
 
+	// Fail CLOSED before asking Apex for anything: a signed id whose claim cannot be
+	// written is a token finalize could not check, so minting one would hand the
+	// browser exactly the unbound capability the claim exists to prevent.
+	if (!ctx.db) {
+		return noStoreJson({ error: 'Uploads are not available on this deployment.' }, 500);
+	}
+
 	const signed = await guard.apex.createSignedUploadUrl(parsed.data.file);
 	if (!signed.ok) {
 		await auditOutcome(ctx, meta, guard.actor, {
@@ -172,6 +200,33 @@ export async function handleSignMediaUpload(request: Request, ctx: BffContext): 
 	}
 	const signedData =
 		unwrapArchetypeRecord(signed.body) ?? (signed.body as Record<string, unknown> | null);
+	const uploadUrl = typeof signedData?.url === 'string' ? signedData.url : '';
+	const signedId = typeof signedData?.signed_id === 'string' ? signedData.signed_id : '';
+	if (!uploadUrl || !signedId) {
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: { gallery: parsed.data.gallery, filename: parsed.data.file.filename }
+		});
+		return noStoreJson({ error: 'unexpected upstream shape' }, 502);
+	}
+
+	const now = ctx.now ?? Date.now();
+	// The sweep is best-effort housekeeping and must never cost an editor an upload;
+	// the claim write is the opposite, and a failure there fails the whole sign.
+	try {
+		await purgeExpiredUploadClaims(ctx.db, now);
+	} catch {
+		// swallow — an unswept expired claim is refused anyway, by its `expires_at`.
+	}
+	try {
+		await recordUploadClaim(ctx.db, signedId, parsed.data.gallery, now);
+	} catch {
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: { gallery: parsed.data.gallery, claimStored: false }
+		});
+		return noStoreJson({ error: 'The upload could not be started.' }, 500);
+	}
 
 	await auditOutcome(ctx, meta, guard.actor, {
 		outcome: 'accepted',
@@ -180,9 +235,9 @@ export async function handleSignMediaUpload(request: Request, ctx: BffContext): 
 
 	// No `galleryItemId`: nothing has been created. That absence is the design.
 	return noStoreJson({
-		uploadUrl: signedData?.url ?? null,
+		uploadUrl,
 		uploadHeaders: signedData?.headers ?? {},
-		signedId: signedData?.signed_id ?? null
+		signedId
 	});
 }
 
@@ -213,6 +268,24 @@ export async function handleFinalizeMediaUpload(
 	// An unknown name is the CALLER's fault and is refused before any upstream call.
 	if (!galleryMedia(gallery))
 		return rejectMutation(ctx, actorMeta, 400, 'no-such-gallery', 'no-such-gallery');
+
+	// Fail CLOSED: without the claim store there is nothing to check the signed id
+	// against, and an unchecked signed id is the whole defect this guard closes.
+	if (!ctx.db) {
+		return noStoreJson({ error: 'Uploads are not available on this deployment.' }, 500);
+	}
+
+	// SPEND THE SIGNED ID, and do it FIRST — before the Apex reads, so a token that
+	// was never minted here, was minted for another library, or has already been
+	// spent costs no upstream call at all. Winning this is what authorizes everything
+	// below it. A claim spent by a request that then fails upstream is NOT put back:
+	// releasing it would reopen the window it exists to close, and the cost of not
+	// releasing is that the editor chooses the file again — which is what the browser
+	// asks them to do on any finalize failure anyway.
+	const refusal = await redeemUploadClaim(ctx.db, signedId, gallery, ctx.now ?? Date.now());
+	if (refusal) {
+		return rejectMutation(ctx, actorMeta, 400, uploadClaimMessage(refusal), refusal);
+	}
 
 	// A name this kit serves that `cms_config` cannot resolve is an UPSTREAM fault —
 	// a failed read, or an account without that gallery — so it is a 502, not a 400.

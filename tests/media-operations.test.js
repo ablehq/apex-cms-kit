@@ -6,9 +6,10 @@ import {
 	handleSignMediaUpload,
 	handleFinalizeMediaUpload
 } from '../src/server/bff/operations/media.ts';
-import { UPLOAD_LIMIT_BYTES } from '../src/admin/media-types.js';
+import { galleryMedia, UPLOAD_LIMIT_BYTES } from '../src/admin/media-types.js';
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
+import { barrierOn, createMigratedDatabase } from './harness/d1.ts';
 import { createMemorySessionStore } from './harness/session-store.ts';
 
 const ORIGIN = 'https://site.test';
@@ -73,9 +74,10 @@ function apexWith(calls, fail = {}) {
 	};
 }
 
-function ctxWith(calls, fail) {
+function ctxWith(calls, fail, db) {
 	return {
 		allowedOrigins: parseAllowedOrigins(ORIGIN),
+		...(db ? { db } : {}),
 		reviewOnlyFields: [],
 		sessions: createMemorySessionStore(),
 		auth: {
@@ -134,18 +136,46 @@ const goodFile = {
 	checksum: 'Q2hlY2tzdW0='
 };
 
-async function sign(body, { calls = [], fail } = {}) {
-	const ctx = ctxWith(calls, fail);
-	const session = await signIn(ctx);
-	const response = await handleSignMediaUpload(req(session, '/api/admin/media/uploads', body), ctx);
-	return { response, body: await response.json().catch(() => null), calls };
+/** A file each gallery actually accepts, so a claim can be minted for any of them. */
+const FILE_FOR = {
+	images: goodFile,
+	files: { ...goodFile, content_type: 'application/pdf', filename: 'notes.pdf' },
+	videos: { ...goodFile, content_type: 'video/mp4', filename: 'clip.mp4' }
+};
+
+/**
+ * `db` is `undefined` for "give me a fresh migrated one" and `null` for "run without
+ * a claim store at all", which is a case with its own required behaviour (refuse).
+ */
+async function databaseFor(db) {
+	return db === undefined ? await createMigratedDatabase() : db;
 }
 
-async function finalize(body, { calls = [], fail } = {}) {
-	const ctx = ctxWith(calls, fail);
+async function sign(body, { calls = [], fail, db } = {}) {
+	const database = await databaseFor(db);
+	const ctx = ctxWith(calls, fail, database);
+	const session = await signIn(ctx);
+	const response = await handleSignMediaUpload(req(session, '/api/admin/media/uploads', body), ctx);
+	return { response, body: await response.json().catch(() => null), calls, db: database };
+}
+
+/**
+ * Finalize a signed id that has been through the REAL sign leg first — because that
+ * is where its claim comes from, and a finalize whose signed id was never signed for
+ * anything is now a different test rather than the default one. `mintClaim: false`
+ * asks for exactly that case.
+ */
+async function finalize(body, { calls = [], fail, db, mintClaim = true } = {}) {
+	const database = await databaseFor(db);
+	if (mintClaim && database && galleryMedia(body.gallery)) {
+		// A clean context for the sign leg: this suite's `fail` switches describe what
+		// the FINALIZE is up against, and the mint is only setting the scene.
+		await sign({ gallery: body.gallery, file: FILE_FOR[body.gallery] }, { db: database });
+	}
+	const ctx = ctxWith(calls, fail, database);
 	const session = await signIn(ctx);
 	const response = await handleFinalizeMediaUpload(req(session, '/api/admin/media', body), ctx);
-	return { response, body: await response.json().catch(() => null), calls };
+	return { response, body: await response.json().catch(() => null), calls, db: database };
 }
 
 describe('sign — it creates nothing, and that is the guarantee', () => {
@@ -404,5 +434,157 @@ describe('finalize — it creates the item, and cleans up only what it made', ()
 		assert.equal(response.status, 502);
 		assert.ok(!calls.some((c) => c[0] === 'createMedium'));
 		assert.ok(!calls.some((c) => c[0] === 'deleteGalleryItem'), 'nothing was created to delete');
+	});
+});
+
+describe('the signed id is bound to one gallery and one redemption', () => {
+	/** Which claims the store holds, and which of them are spent. */
+	function claims(db) {
+		return db.sqlite
+			.prepare(`SELECT gallery, redeemed_at FROM bff_media_upload_claim`)
+			.all()
+			.map((row) => ({ ...row }));
+	}
+
+	it('refuses a signed id finalized into a gallery it was NOT signed for', async () => {
+		// Measured against local Apex before this guard existed: a PNG signed for
+		// `images` finalized into `videos` with a 200, because the only thing linking
+		// the two legs was a token that records neither.
+		const db = await createMigratedDatabase();
+		await sign({ gallery: 'images', file: goodFile }, { db });
+
+		const calls = [];
+		const { response, body } = await finalize(
+			{ gallery: 'videos', signedId: 'signed-abc' },
+			{ db, calls, mintClaim: false }
+		);
+		assert.equal(response.status, 400);
+		assert.match(body.error, /prepared for a different library/u);
+		assert.deepEqual(calls, [], 'a refused signed id costs no upstream call');
+		// And the claim is still spendable — by the library it was actually signed for.
+		assert.deepEqual(claims(db), [{ gallery: 'images', redeemed_at: null }]);
+	});
+
+	it('refuses the SECOND redemption of one signed id', async () => {
+		const db = await createMigratedDatabase();
+		await sign({ gallery: 'images', file: goodFile }, { db });
+
+		const first = await finalize(
+			{ gallery: 'images', signedId: 'signed-abc', title: 'Once' },
+			{ db, mintClaim: false }
+		);
+		assert.equal(first.response.status, 200);
+
+		const calls = [];
+		const second = await finalize(
+			{ gallery: 'images', signedId: 'signed-abc', title: 'Twice' },
+			{ db, calls, mintClaim: false }
+		);
+		// Two items sharing one blob is the live hazard: `Medium` is
+		// `has_one_attached :file, dependent: :purge_later`, so deleting either one
+		// purges the bytes the other still points at.
+		assert.equal(second.response.status, 400);
+		assert.match(second.body.error, /already been saved/u);
+		assert.deepEqual(calls, [], 'the second redemption reaches Apex not at all');
+	});
+
+	it('lets exactly ONE of two concurrent finalizes through', async () => {
+		// The property under test belongs to the STATEMENT, not to the handler: a
+		// SELECT followed by an UPDATE would let both of these past, because the
+		// window between the two halves spans an await.
+		//
+		// The barrier is what makes that testable. Left to the scheduler these two
+		// requests do not interleave at all — the first gets through both halves
+		// before the second reaches either, and a deliberately racy implementation
+		// passed this test three runs out of three. `barrierOn` holds BOTH requests at
+		// their first claim statement and releases them together, which is the only
+		// arrangement in which "read, then write" can be caught.
+		const db = await createMigratedDatabase();
+		await sign({ gallery: 'files', file: FILE_FOR.files }, { db });
+
+		const calls = [];
+		const ctx = ctxWith(calls, undefined, db);
+		const session = await signIn(ctx);
+		barrierOn(db, 'bff_media_upload_claim');
+		const race = () =>
+			handleFinalizeMediaUpload(
+				req(session, '/api/admin/media', { gallery: 'files', signedId: 'signed-abc' }),
+				ctx
+			);
+		const [a, b] = await Promise.all([race(), race()]);
+
+		const statuses = [a.status, b.status].sort();
+		assert.deepEqual(statuses, [200, 400]);
+		assert.equal(
+			calls.filter((c) => c[0] === 'createGalleryItem').length,
+			1,
+			'exactly one gallery item may be created for one set of bytes'
+		);
+		assert.equal(calls.filter((c) => c[0] === 'createMedium').length, 1);
+		assert.equal(claims(db).length, 1);
+	});
+
+	it('refuses a signed id this deployment never minted', async () => {
+		const calls = [];
+		const { response, body } = await finalize(
+			{ gallery: 'images', signedId: 'not-a-real-signed-id' },
+			{ calls, mintClaim: false }
+		);
+		assert.equal(response.status, 400);
+		assert.match(body.error, /could not be matched/u);
+		assert.deepEqual(calls, []);
+	});
+
+	it('refuses a claim that has expired, and sweeps it on the next sign', async () => {
+		const db = await createMigratedDatabase();
+		await sign({ gallery: 'images', file: goodFile }, { db });
+		db.sqlite.exec(`UPDATE bff_media_upload_claim SET expires_at = 1`);
+
+		const { response, body } = await finalize(
+			{ gallery: 'images', signedId: 'signed-abc' },
+			{ db, mintClaim: false }
+		);
+		assert.equal(response.status, 400);
+		assert.match(body.error, /prepared too long ago/u);
+
+		// The sweep runs on the sign path, so the next upload clears it out.
+		await sign({ gallery: 'images', file: goodFile }, { db });
+		assert.deepEqual(claims(db), [{ gallery: 'images', redeemed_at: null }]);
+	});
+
+	it('stores NO claim when the sign leg itself fails', async () => {
+		const db = await createMigratedDatabase();
+		const { response } = await sign(
+			{ gallery: 'images', file: goodFile },
+			{ db, fail: { sign: { ok: false, status: 422, body: { message: 'nope' } } } }
+		);
+		assert.equal(response.status, 422);
+		assert.deepEqual(claims(db), []);
+	});
+
+	it('fails CLOSED on both legs when there is no claim store', async () => {
+		// A deployment with no D1 binding cannot check a signed id, so it must not
+		// mint one either: an unbound capability is exactly what the claim prevents.
+		const signed = await sign({ gallery: 'images', file: goodFile }, { db: null });
+		assert.equal(signed.response.status, 500);
+		assert.deepEqual(signed.calls, [], 'nothing is signed that could not be claimed');
+
+		const finalized = await finalize(
+			{ gallery: 'images', signedId: 'signed-abc' },
+			{ db: null, mintClaim: false }
+		);
+		assert.equal(finalized.response.status, 500);
+		assert.deepEqual(finalized.calls, []);
+	});
+
+	it('answers 502 rather than a claimless 200 when Apex returns no signed id', async () => {
+		const db = await createMigratedDatabase();
+		const { response, body } = await sign(
+			{ gallery: 'images', file: goodFile },
+			{ db, fail: { sign: { ok: true, status: 200, body: { data: { url: null } } } } }
+		);
+		assert.equal(response.status, 502);
+		assert.equal(body.error, 'unexpected upstream shape');
+		assert.deepEqual(claims(db), []);
 	});
 });
