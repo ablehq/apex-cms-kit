@@ -7,6 +7,7 @@ import {
 	purgeExpiredUploadClaims,
 	recordUploadClaim,
 	redeemUploadClaim,
+	uploadClaimId,
 	uploadClaimMessage
 } from '../media-claim';
 import { rejectMutation } from '../reject';
@@ -261,19 +262,24 @@ export async function handleSignMediaUpload(request: Request, ctx: BffContext): 
 	} catch {
 		// swallow — an unswept expired claim is refused anyway, by its `expires_at`.
 	}
+	// The claim's key doubles as the ATTEMPT id in the audit log: it is what ties
+	// this row to the finalize row that spends it, and what makes a sign row with no
+	// finalize beside it recognisable as an abandonment. It is a one-way hash — the
+	// signed id is a capability to attach a blob and never reaches the log.
+	const attempt = await uploadClaimId(signedId);
 	try {
-		await recordUploadClaim(ctx.db, signedId, parsed.data.gallery, now);
+		await recordUploadClaim(ctx.db, attempt, parsed.data.gallery, now);
 	} catch {
 		await auditOutcome(ctx, meta, guard.actor, {
 			outcome: 'apex_error',
-			detail: { gallery: parsed.data.gallery, claimStored: false }
+			detail: { gallery: parsed.data.gallery, attempt, claimStored: false }
 		});
 		return noStoreJson({ error: 'The upload could not be started.' }, 500);
 	}
 
 	await auditOutcome(ctx, meta, guard.actor, {
 		outcome: 'accepted',
-		detail: { gallery: parsed.data.gallery, filename: parsed.data.file.filename }
+		detail: { gallery: parsed.data.gallery, attempt, filename: parsed.data.file.filename }
 	});
 
 	// No `galleryItemId`: nothing has been created. That absence is the design.
@@ -328,9 +334,24 @@ export async function handleFinalizeMediaUpload(
 	// releasing it would reopen the window it exists to close, and the cost of not
 	// releasing is that the editor chooses the file again — which is what the browser
 	// asks them to do on any finalize failure anyway.
-	const refusal = await redeemUploadClaim(ctx.db, signedId, gallery, ctx.now ?? Date.now());
+	// The same attempt id the sign leg recorded, so every row this request writes —
+	// including a refusal — can be read next to the sign row it belongs to.
+	const attempt = await uploadClaimId(signedId);
+	// The caption and the alt an editor typed. Not secrets, capped, and the only
+	// human-readable handle the log has on which upload a row is about.
+	const captionDetail = {
+		caption: (parsed.data.title ?? '').slice(0, 80),
+		alt: (parsed.data.alt ?? '').slice(0, 80)
+	};
+	const refusal = await redeemUploadClaim(ctx.db, attempt, gallery, ctx.now ?? Date.now());
 	if (refusal) {
-		return rejectMutation(ctx, actorMeta, 400, uploadClaimMessage(refusal), refusal);
+		return rejectMutation(
+			ctx,
+			{ ...actorMeta, detail: { gallery, attempt } },
+			400,
+			uploadClaimMessage(refusal),
+			refusal
+		);
 	}
 
 	// A name this kit serves that `cms_config` cannot resolve is an UPSTREAM fault —
@@ -338,7 +359,10 @@ export async function handleFinalizeMediaUpload(
 	// The two cases answer differently because they are different mistakes.
 	const galleryId = await readGalleryId(guard.apex, gallery).catch(() => null);
 	if (!galleryId) {
-		await auditOutcome(ctx, meta, guard.actor, { outcome: 'apex_error', detail: { gallery } });
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: { gallery, attempt, ...captionDetail }
+		});
 		return noStoreJson({ error: 'upstream error' }, 502);
 	}
 
@@ -357,18 +381,14 @@ export async function handleFinalizeMediaUpload(
 		// audit row to point at.
 		await auditOutcome(ctx, meta, guard.actor, {
 			outcome: 'apex_error',
-			detail: {
-				gallery,
-				itemCreated: 'unknown',
-				caption: (parsed.data.title ?? '').slice(0, 80)
-			}
+			detail: { gallery, attempt, itemCreated: 'unknown', ...captionDetail }
 		});
 		return noStoreJson({ error: 'The upload could not be saved. Choose the file again.' }, 502);
 	}
 	if (!created.ok) {
 		await auditOutcome(ctx, meta, guard.actor, {
 			outcome: 'apex_error',
-			detail: { gallery, apexStatus: created.status }
+			detail: { gallery, attempt, apexStatus: created.status, ...captionDetail }
 		});
 		return upstreamFailure(created);
 	}
@@ -391,10 +411,11 @@ export async function handleFinalizeMediaUpload(
 			outcome: 'apex_error',
 			detail: {
 				gallery,
+				attempt,
 				apexStatus: created.status,
 				unnamedItem: true,
 				itemDeleted: swept,
-				caption: (parsed.data.title ?? '').slice(0, 80)
+				...captionDetail
 			}
 		});
 		return noStoreJson({ error: 'unexpected upstream shape' }, 502);
@@ -428,10 +449,11 @@ export async function handleFinalizeMediaUpload(
 			outcome: 'apex_error',
 			detail: {
 				gallery,
+				attempt,
 				galleryItemId,
 				attachOutcome: 'unknown',
 				itemDeleted: swept,
-				caption: (parsed.data.title ?? '').slice(0, 80)
+				...captionDetail
 			}
 		});
 		return noStoreJson({ error: 'The upload could not be saved. Choose the file again.' }, 502);
@@ -444,7 +466,14 @@ export async function handleFinalizeMediaUpload(
 		const swept = await deleteQuietly(guard.apex, galleryItemId);
 		await auditOutcome(ctx, meta, guard.actor, {
 			outcome: 'apex_error',
-			detail: { gallery, galleryItemId, apexStatus: medium.status, itemDeleted: swept }
+			detail: {
+				gallery,
+				attempt,
+				galleryItemId,
+				apexStatus: medium.status,
+				itemDeleted: swept,
+				...captionDetail
+			}
 		});
 		return upstreamFailure(medium);
 	}
@@ -452,7 +481,7 @@ export async function handleFinalizeMediaUpload(
 	const data = unwrapArchetypeRecord(medium.body);
 	await auditOutcome(ctx, meta, guard.actor, {
 		outcome: 'accepted',
-		detail: { gallery, galleryItemId, apexStatus: medium.status }
+		detail: { gallery, attempt, galleryItemId, apexStatus: medium.status, ...captionDetail }
 	});
 	return noStoreJson({ galleryItemId, mediumId: data?.id ?? null });
 }

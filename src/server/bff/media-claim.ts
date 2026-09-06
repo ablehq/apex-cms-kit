@@ -16,8 +16,8 @@ import type { BffDatabase } from './d1';
  *
  * So the sign leg writes down what it decided, and finalize spends that row:
  *
- *   sign      → `recordUploadClaim(db, signedId, 'files', now)`
- *   finalize  → `redeemUploadClaim(db, signedId, 'files', now)` → null, or a refusal
+ *   sign      → `recordUploadClaim(db, uploadClaimId(signedId), 'files', now)`
+ *   finalize  → `redeemUploadClaim(db, uploadClaimId(signedId), 'files', now)`
  *
  * ── WHY THE REDEMPTION IS ONE STATEMENT ───────────────────────────────────────
  * `UPDATE … WHERE redeemed_at IS NULL` and its row-change count, not a SELECT
@@ -51,7 +51,19 @@ export type UploadClaimRefusal =
 	| 'upload-expired'
 	| 'upload-claim-unavailable';
 
-/** The claim's primary key: the SHA-256 of the signed id, never the signed id. */
+/**
+ * The claim's primary key: the SHA-256 of the signed id, never the signed id.
+ *
+ * It doubles as the UPLOAD ATTEMPT ID in the audit log, which is what lets a sign
+ * row and a finalize row be recognised as two halves of one upload — and a sign row
+ * with no finalize beside it be recognised as an abandonment. Safe to log precisely
+ * because it is a one-way hash: holding it does not let anyone finalize, since the
+ * op hashes whatever signed id it is handed and compares. The signed id itself is a
+ * capability to attach a blob and must never reach the log.
+ *
+ * Both `recordUploadClaim` and `redeemUploadClaim` take this id rather than the
+ * signed id, so the credential structurally cannot travel past the handler.
+ */
 export async function uploadClaimId(signedId: string): Promise<string> {
 	const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(signedId));
 	return Array.from(new Uint8Array(digest))
@@ -67,7 +79,7 @@ export async function uploadClaimId(signedId: string): Promise<string> {
  */
 export async function recordUploadClaim(
 	db: BffDatabase,
-	signedId: string,
+	claimId: string,
 	gallery: string,
 	now: number
 ): Promise<void> {
@@ -76,7 +88,7 @@ export async function recordUploadClaim(
 			`INSERT INTO bff_media_upload_claim (id, gallery, created_at, expires_at, redeemed_at)
 			 VALUES (?, ?, ?, ?, NULL)`
 		)
-		.bind(await uploadClaimId(signedId), gallery, now, now + UPLOAD_CLAIM_TTL_MS)
+		.bind(claimId, gallery, now, now + UPLOAD_CLAIM_TTL_MS)
 		.run();
 }
 
@@ -91,11 +103,11 @@ export async function recordUploadClaim(
  */
 export async function redeemUploadClaim(
 	db: BffDatabase,
-	signedId: string,
+	claimId: string,
 	gallery: string,
 	now: number
 ): Promise<UploadClaimRefusal | null> {
-	const id = await uploadClaimId(signedId);
+	const id = claimId;
 	const claimed = await db
 		.prepare(
 			`UPDATE bff_media_upload_claim

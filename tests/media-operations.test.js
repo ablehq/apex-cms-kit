@@ -805,3 +805,81 @@ describe('a THROWN upstream call is swept and audited like a returned failure', 
 		);
 	});
 });
+
+describe('the two legs of one upload can be read as one attempt', () => {
+	function rows(db) {
+		return db.sqlite
+			.prepare(`SELECT action, outcome, detail FROM bff_audit_log ORDER BY occurred_at, rowid`)
+			.all()
+			.map((row) => ({
+				action: row.action,
+				outcome: row.outcome,
+				detail: JSON.parse(row.detail ?? 'null')
+			}));
+	}
+
+	it('ties the sign row and the finalize row together, and never logs the credential', async () => {
+		// Before this there was no shared id and the two `cf-ray` values belong to
+		// different requests, so two uploads by one editor left four rows nothing could
+		// pair up — and an abandoned signing was indistinguishable from a finished one.
+		const db = await createMigratedDatabase();
+		await sign({ gallery: 'images', file: goodFile }, { db });
+		await finalize(
+			{ gallery: 'images', signedId: 'signed-abc', title: 'A hero', alt: 'A hero image' },
+			{ db, mintClaim: false }
+		);
+
+		const [signRow, finalizeRow] = rows(db);
+		assert.equal(signRow.action, 'media.upload.sign');
+		assert.equal(finalizeRow.action, 'media.upload.finalize');
+		assert.equal(signRow.outcome, 'accepted');
+		assert.equal(finalizeRow.outcome, 'accepted');
+		assert.ok(signRow.detail.attempt, 'the sign row names the attempt');
+		assert.equal(finalizeRow.detail.attempt, signRow.detail.attempt, 'and so does its finalize');
+		// The attempt id is the claim's key: a one-way hash, so it can be logged. The
+		// signed id is a capability to attach a blob and must appear nowhere.
+		assert.match(signRow.detail.attempt, /^[0-9a-f]{64}$/u);
+		assert.equal(
+			db.sqlite.prepare(`SELECT id FROM bff_media_upload_claim`).get().id,
+			signRow.detail.attempt
+		);
+		for (const row of rows(db)) {
+			assert.ok(
+				!JSON.stringify(row.detail).includes('signed-abc'),
+				'the signed id itself is never written to the log'
+			);
+		}
+		// And what the editor actually typed, which is the only human handle on a row.
+		assert.equal(finalizeRow.detail.caption, 'A hero');
+		assert.equal(finalizeRow.detail.alt, 'A hero image');
+	});
+
+	it('shows an abandoned signing as a sign row with no finalize beside it', async () => {
+		const db = await createMigratedDatabase();
+		await sign({ gallery: 'images', file: goodFile }, { db });
+		await sign({ gallery: 'files', file: FILE_FOR.files }, { db });
+
+		const attempts = rows(db)
+			.filter((r) => r.action === 'media.upload.sign')
+			.map((r) => r.detail.attempt);
+		assert.equal(attempts.length, 2);
+		// The fake mints one signed id, so the two attempts share a hash — which is
+		// itself the honest answer: the same blob was signed for twice.
+		assert.equal(rows(db).filter((r) => r.action === 'media.upload.finalize').length, 0);
+	});
+
+	it('names the attempt even on a refused finalize, so the refusal pairs with its sign', async () => {
+		const db = await createMigratedDatabase();
+		await sign({ gallery: 'images', file: goodFile }, { db });
+		const { response } = await finalize(
+			{ gallery: 'videos', signedId: 'signed-abc' },
+			{ db, mintClaim: false }
+		);
+		assert.equal(response.status, 400);
+
+		const [signRow, refusal] = rows(db);
+		assert.equal(refusal.outcome, 'rejected');
+		assert.equal(refusal.detail.reason, 'upload-wrong-gallery');
+		assert.equal(refusal.detail.attempt, signRow.detail.attempt);
+	});
+});
