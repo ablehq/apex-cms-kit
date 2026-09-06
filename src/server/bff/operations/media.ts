@@ -345,8 +345,32 @@ export async function handleFinalizeMediaUpload(
 		return upstreamFailure(created);
 	}
 	const item = unwrapArchetypeRecord(created.body);
-	const galleryItemId = typeof item?.id === 'string' ? item.id : null;
-	if (!galleryItemId) return noStoreJson({ error: 'unexpected upstream shape' }, 502);
+	const galleryItemId = typeof item?.id === 'string' && item.id ? item.id : null;
+	if (!galleryItemId) {
+		// Apex answered 2xx, so an item almost certainly EXISTS — this op simply cannot
+		// name it. That made this the one post-create failure that swept nothing and
+		// audited nothing, while its two neighbours do both: an orphan was left with a
+		// caption and no picture, and no record that it had happened.
+		//
+		// Sweep with whatever came back (an id of the wrong TYPE is still an id; the
+		// client's own uuid check refuses a nonsense one and `deleteQuietly` reports
+		// that as `false`), and audit either way. The caption goes in the detail — not
+		// a secret, and the only handle a person has on an item nothing can name.
+		const unusable = item?.id;
+		const rawId = unusable === undefined || unusable === null ? '' : String(unusable);
+		const swept = rawId ? await deleteQuietly(guard.apex, rawId) : false;
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: {
+				gallery,
+				apexStatus: created.status,
+				unnamedItem: true,
+				itemDeleted: swept,
+				caption: (parsed.data.title ?? '').slice(0, 80)
+			}
+		});
+		return noStoreJson({ error: 'unexpected upstream shape' }, 502);
+	}
 
 	const medium = await guard.apex.createMedium({
 		kind: 'primary',

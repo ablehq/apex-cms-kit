@@ -635,3 +635,67 @@ describe('a refused body is a sentence, not a machine code', () => {
 		assert.equal(body.error, 'That upload could not be saved as sent.');
 	});
 });
+
+describe('an item created but not NAMED is still swept, and still audited', () => {
+	/** The finalize rows this op wrote, newest last. */
+	function finalizeAudit(db) {
+		return db.sqlite
+			.prepare(
+				`SELECT outcome, detail FROM bff_audit_log
+				  WHERE action = 'media.upload.finalize' ORDER BY occurred_at, rowid`
+			)
+			.all()
+			.map((row) => ({ outcome: row.outcome, detail: JSON.parse(row.detail ?? 'null') }));
+	}
+
+	it('deletes the item and writes the audit row when the id is the wrong type', async () => {
+		// Apex says 2xx, so an item exists; the envelope just does not name it in a way
+		// this op can use. Both neighbours of this branch sweep and audit; it did
+		// neither, which left an orphan nothing recorded.
+		const { response, body, calls, db } = await finalize(
+			{ gallery: 'images', signedId: 'signed-abc', title: 'Unnamed' },
+			{ fail: { createItem: { ok: true, status: 200, body: { data: { id: 42 } } } } }
+		);
+		assert.equal(response.status, 502);
+		assert.equal(body.error, 'unexpected upstream shape');
+		assert.deepEqual(
+			calls.map((c) => c[0]),
+			['readCmsConfig', 'createGalleryItem', 'deleteGalleryItem']
+		);
+		assert.equal(calls[2][1], '42', 'an id of the wrong type is still an id to delete by');
+		assert.ok(
+			!calls.some((c) => c[0] === 'createMedium'),
+			'nothing is attached to an item this op cannot name'
+		);
+
+		const rows = finalizeAudit(db);
+		assert.equal(rows.length, 1);
+		assert.equal(rows[0].outcome, 'apex_error');
+		assert.equal(rows[0].detail.unnamedItem, true);
+		assert.equal(rows[0].detail.itemDeleted, true);
+		// The caption is the only handle a person has on an item nothing can name.
+		assert.equal(rows[0].detail.caption, 'Unnamed');
+	});
+
+	it('audits it even when there is no id to sweep by at all', async () => {
+		const { response, calls, db } = await finalize(
+			{ gallery: 'images', signedId: 'signed-abc', title: 'Nameless' },
+			{ fail: { createItem: { ok: true, status: 200, body: { data: { caption: 'Nameless' } } } } }
+		);
+		assert.equal(response.status, 502);
+		assert.ok(!calls.some((c) => c[0] === 'deleteGalleryItem'), 'there is nothing to delete by');
+		const rows = finalizeAudit(db);
+		assert.equal(rows.length, 1);
+		assert.equal(rows[0].detail.unnamedItem, true);
+		assert.equal(rows[0].detail.itemDeleted, false);
+	});
+
+	it('treats an empty-string id as no id, rather than deleting by ""', async () => {
+		const { response, calls } = await finalize(
+			{ gallery: 'images', signedId: 'signed-abc' },
+			{ fail: { createItem: { ok: true, status: 200, body: { data: { id: '' } } } } }
+		);
+		assert.equal(response.status, 502);
+		assert.ok(!calls.some((c) => c[0] === 'deleteGalleryItem'));
+	});
+});
