@@ -109,7 +109,10 @@ function makeClient(overrides = {}) {
 		},
 		async getPage() {
 			calls.push(['getPage']);
-			return { page: samplePage(), version: 'v-refreshed' };
+			// After a structure save the server HOLDS the minted block, so a re-read
+			// answers the realized page, the way Apex would.
+			const page = overrides.structurePage ? overrides.structurePage() : samplePage();
+			return { page, version: 'v-refreshed' };
 		}
 	};
 	if (serverVersion === undefined) serverVersion = 'baseline-v';
@@ -205,6 +208,93 @@ describe('savePage (M1 explicit save)', () => {
 		assert.ok(client.calls.some((c) => c[0] === 'getPage'));
 		assert.equal(isDirty(draft), false);
 		assert.equal(draft.baselineVersion, 'v-refreshed');
+	});
+});
+
+describe('a duplicated section — the fields the editor seeded on a temp entity', () => {
+	/** The server page after the structure save: the new block minted at position 2. */
+	function mintedPage() {
+		const page = samplePage();
+		page.blocks.push({
+			id: 'block-new',
+			label: 'Copy of heading',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::TemplateInstance',
+			blockable: {
+				id: 'inst-new',
+				page_block_template_id: 'tpl-heading',
+				page_block_template: { id: 'tpl-heading', slug: 'glc-page-heading' },
+				// Rails permits no `fields_data` under `entity_attributes`: minted EMPTY.
+				entity: { id: 'entity-new', entity_type_id: ET_HEADING, fields_data: {} },
+				child_template_instances: []
+			}
+		});
+		return page;
+	}
+	const copied = { title: 'The Gospel', breadcrumb_label: 'Home' };
+
+	it('saves the structure, then PATCHes the copied fields ONCE against the minted entity id', async () => {
+		const client = makeClient({ structurePage: mintedPage });
+		const draft = createDraft(samplePage(), 'baseline-v');
+		addTemplateBlock(draft, {
+			templateId: 'tpl-heading',
+			templateSlug: 'glc-page-heading',
+			label: 'Copy of heading',
+			entityTypeId: ET_HEADING,
+			fieldsData: { ...copied }
+		});
+		const result = await savePage(draft, client);
+		assert.equal(result.ok, true, JSON.stringify(result));
+		assert.deepEqual(
+			client.calls.map((c) => c[0]),
+			['readVersion', 'savePageStructure', 'patchEntityFields', 'getPage'],
+			'structure first, then the seeded fields, then a re-read for an honest baseline'
+		);
+		const patches = client.calls.filter((c) => c[0] === 'patchEntityFields');
+		assert.equal(patches.length, 1);
+		assert.equal(patches[0][1], 'entity-new', 'the id Apex minted, never the temp id');
+		assert.deepEqual(patches[0][2], copied);
+		assert.equal(draft.baselineVersion, 'v-refreshed');
+		assert.equal(isDirty(draft), false);
+	});
+
+	it('a new block with no fields makes no extra PATCH', async () => {
+		const client = makeClient({ structurePage: mintedPage });
+		const draft = createDraft(samplePage(), 'baseline-v');
+		addTemplateBlock(draft, {
+			templateId: 'tpl-heading',
+			templateSlug: 'glc-page-heading',
+			label: 'Blank',
+			entityTypeId: ET_HEADING,
+			fieldsData: {}
+		});
+		assert.equal((await savePage(draft, client)).ok, true);
+		assert.deepEqual(
+			client.calls.map((c) => c[0]),
+			['readVersion', 'savePageStructure'],
+			"nothing to copy: no PATCH, and the structure save's page is baseline enough"
+		);
+	});
+
+	it('a refused copy stops there — the section exists, its fields do not, and no publish goes out', async () => {
+		const client = makeClient({
+			structurePage: mintedPage,
+			results: { fields: () => ({ ok: false, status: 422 }) }
+		});
+		const draft = createDraft(samplePage(), 'baseline-v');
+		addTemplateBlock(draft, {
+			templateId: 'tpl-heading',
+			templateSlug: 'glc-page-heading',
+			label: 'Copy',
+			entityTypeId: ET_HEADING,
+			fieldsData: { ...copied }
+		});
+		const result = await savePage(draft, client, { statusEvent: 'publish' });
+		assert.equal(result.ok, false);
+		assert.equal(result.stage, 'new-block-fields');
+		assert.equal(result.status, 422);
+		assert.match(result.message, /The new section was added, but its fields could not be saved/u);
+		assert.ok(!client.calls.some((c) => c[0] === 'changePageStatus'), 'no publish after a failure');
 	});
 });
 
