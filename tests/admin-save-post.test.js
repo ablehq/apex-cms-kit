@@ -266,13 +266,22 @@ describe('savePost — the write order, and what never runs after a failure', ()
 		const client = makeClient({
 			fail: 'updatePost',
 			status: 422,
-			errors: [{ attribute: 'published_date', messages: ['is invalid'] }]
+			// Apex's real shape: the messages are full sentences.
+			errors: [
+				{ attribute: 'published_date', messages: ['Published date is invalid'] },
+				{ attribute: 'summary', messages: [] }
+			]
 		});
 		const draft = createPostDraft('story', post, 'v1', contract);
 		setPostField(draft, 'publishedDate', 'not-a-date');
 		const result = await savePost(draft, client);
 		assert.equal(result.status, 422);
-		assert.match(result.message, /A field was rejected: published_date is invalid\./u);
+		assert.match(
+			result.message,
+			/A field was rejected: Published date is invalid; summary\./u,
+			'the sentence as Apex wrote it, never "published_date Published date …"; the bare attribute only when there is no message'
+		);
+		assert.doesNotMatch(result.message, /published_date/u);
 		assert.doesNotMatch(result.message, /address/u);
 		assert.match(result.message, /Nothing after it was saved/u);
 	});

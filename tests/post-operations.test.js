@@ -27,7 +27,7 @@ import { handleCreatePost } from '../src/server/bff/operations/create-post.ts';
 import { handleDeletePost } from '../src/server/bff/operations/delete-post.ts';
 import { postStatusBodySchema } from '../src/server/bff/operations/patch-post-status.ts';
 import { countReferencesTo } from '../src/server/bff/operations/record-shape.ts';
-import { loadPostCatalogue } from '../src/server/bff/operations/post-list.ts';
+import { handleListPosts, loadPostCatalogue } from '../src/server/bff/operations/post-list.ts';
 import { createApexAdminClient } from '../src/server/bff/apex-admin-client.ts';
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
@@ -871,8 +871,40 @@ describe('the post list reads EVERY page of both surfaces', () => {
 		);
 	});
 
+	it('page 2 failing after page 1 succeeded is no catalogue at all — 502, not half a list', async () => {
+		const apex = paginating(250, 100);
+		const archetypes = apex.listPostArchetypes;
+		apex.listPostArchetypes = async (slug, query) =>
+			query.page === 2 ? { ok: false, status: 500, body: null } : archetypes(slug, query);
+		assert.equal(await loadPostCatalogue(contract, apex, 'story'), null);
+
+		const ctx = { ...ctxWith([]), createApexClient: () => apex };
+		const session = await signIn(ctx);
+		const res = await handleListPosts(
+			request('/api/admin/posts/story', 'GET', undefined, session),
+			ctx,
+			{ schema: 'story' }
+		);
+		assert.equal(res.status, 502);
+		assert.deepEqual(await res.json(), { error: 'upstream error' });
+		assert.equal(res.headers.get('cache-control'), 'no-store');
+	});
+
 	it('fails CLOSED when a page will not read or the pagination is missing', async () => {
 		assert.equal(await listAllPages(async () => ({ ok: false, body: null })), null);
+		// Page 2 fails AFTER page 1 succeeded: the rows already read are not a
+		// partial answer, they are no answer.
+		const asked = [];
+		assert.equal(
+			await listAllPages(async (n) => {
+				asked.push(n);
+				return n === 1
+					? { ok: true, body: { data: [{ id: 'p1' }], pagination: { total_pages: 3 } } }
+					: { ok: false, body: null };
+			}),
+			null
+		);
+		assert.deepEqual(asked, [1, 2], 'page 1 was read, page 2 failed, page 3 never asked for');
 		assert.equal(
 			await listAllPages(async () => ({ ok: true, body: { data: [{ id: 'x' }] } })),
 			null

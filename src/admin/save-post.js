@@ -34,15 +34,18 @@ export const STALE_MESSAGE =
 
 /**
  * Apex's field errors, as the BFF forwards them on a 422 (`{ errors: [{ attribute,
- * messages }] }`), in a sentence: "published_date is invalid".
+ * messages }] }`). Apex's messages are FULL sentences already ("Published date is
+ * invalid"), so they are shown as they are; the attribute name is the fallback
+ * only when an error carries no message at all.
  * @param {any} res
  */
 function fieldErrors(res) {
 	const errors = Array.isArray(res?.errors) ? res.errors : [];
 	return errors
-		.map((/** @type {any} */ e) =>
-			`${e.attribute} ${Array.isArray(e.messages) ? e.messages.join(', ') : ''}`.trim()
-		)
+		.map((/** @type {any} */ e) => {
+			const messages = Array.isArray(e?.messages) ? e.messages.filter(Boolean) : [];
+			return messages.length > 0 ? messages.join(', ') : String(e?.attribute ?? '');
+		})
 		.filter(Boolean)
 		.join('; ');
 }

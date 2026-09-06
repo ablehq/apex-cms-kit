@@ -285,6 +285,12 @@ export function metaAttributes(
 			// A SECOND row of the same name is what a no-id write left behind; `readMeta`
 			// shows the first, so the extra is invisible until it is not. Healed here,
 			// the way `coverAttributes` heals a duplicate cover row.
+			//
+			// NOTE: the culling applies to EVERY name in group `web`, not only the three
+			// in META_NAMES. That is safe today because Apex mints exactly title,
+			// description and keywords in group `web` and nothing else writes there;
+			// should another `web` meta ever appear, its duplicates would be culled by
+			// the same rule — deliberate, since a duplicate is wrong whatever its name.
 			attributes.push({ id, _destroy: true });
 			continue;
 		}
