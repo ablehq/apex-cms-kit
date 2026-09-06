@@ -58,6 +58,19 @@ export interface AdminGalleryImageRecord {
 	 * which is what it did before any site could resolve a URL.
 	 */
 	url: string | null;
+	/**
+	 * The stored file's type and size, or `''`/`0` when nothing is attached.
+	 *
+	 * A thumbnail is composed for IMAGES only — a Cloudflare image transform is
+	 * meaningless for a PDF or an MP4 — so without these two a Files or Videos row
+	 * could show no evidence whatsoever that an upload had landed, which is exactly
+	 * how a screen ends up printing "No file attached" under a file that is attached.
+	 * They are what Apex actually returns: `medium.file` carries `key`,
+	 * `content_type` and `byte_size` and NO filename, so the screen names the type
+	 * and the size, and does not invent a name it was never given.
+	 */
+	contentType: string;
+	byteSize: number;
 }
 
 /** Normalize one `Cms::GalleryItem`. Rows without an id are dropped, not rendered blank. */
@@ -69,6 +82,7 @@ export function summarizeGalleryImage(
 	const medium = isRecord(row.medium) ? row.medium : null;
 	const file = medium && isRecord(medium.file) ? medium.file : null;
 	const key = file ? cleanString(file.key) : '';
+	const byteSize = file && typeof file.byte_size === 'number' ? file.byte_size : 0;
 	return {
 		id: cleanString(row.id),
 		galleryId: cleanString(row.gallery_id),
@@ -83,7 +97,11 @@ export function summarizeGalleryImage(
 		url:
 			assetsPrefix && key && gallery === 'images'
 				? `${assetsPrefix}/cdn-cgi/image/f=auto,w=auto/${key}`
-				: null
+				: null,
+		// Carried for EVERY gallery, unlike `url`: this is the only evidence a Files or
+		// Videos row has that the bytes are really there.
+		contentType: file ? cleanString(file.content_type) : '',
+		byteSize
 	};
 }
 

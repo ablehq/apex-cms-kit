@@ -199,6 +199,13 @@ export interface AdminGalleryItem {
 	createdAt: string;
 	/** A thumbnail to draw, when one can be composed. See above for the three nulls. */
 	url: string | null;
+	/**
+	 * The stored file's type and size — `''` and `0` when nothing is attached. A
+	 * thumbnail exists for images alone, so for a file or a video these two are the
+	 * only evidence a row can show that the bytes landed. Apex returns no filename.
+	 */
+	contentType: string;
+	byteSize: number;
 }
 
 /**
