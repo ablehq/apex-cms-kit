@@ -133,9 +133,13 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 		changePageStatus(pageId, statusEvent) {
 			return mutate(`/api/admin/pages/${pageId}/status`, 'PATCH', { status_event: statusEvent });
 		},
-		// Media upload path (MediaPickerModal). `sign` creates the gallery item + a
-		// signed storage URL; the browser PUTs the file to that URL directly (it is a
-		// storage URL, not Apex); `finalize` records the medium. All same-origin.
+		// Media upload path (`upload-media.js`, which is what the picker and both
+		// library screens call). `sign` checks the type and size and mints a signed
+		// storage URL and creates NOTHING; the browser PUTs the file to that URL
+		// directly (storage, not Apex, no credential); `finalize` creates the gallery
+		// item and attaches the medium in one server-side op. Creating the item last
+		// is why no failure on this path can leave a caption with no picture. Both
+		// legs are same-origin.
 		signMediaUpload(payload) {
 			return mutate('/api/admin/media/uploads', 'POST', payload);
 		},
@@ -156,9 +160,10 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 
 		// ── Images (3d) ──────────────────────────────────────────────────────────
 		//
-		// There is no `createImage`. An image is created by uploading BYTES, and no
-		// site has proven that leg against its Apex yet. Whether a given site offers
-		// an upload control is that SITE's policy, decided on its own screen.
+		// There is still no `createImage`, and there never will be: an image is
+		// created by uploading BYTES, which is `signMediaUpload` + `finalizeMediaUpload`
+		// above. That path is now proved end to end against real Apex for all three
+		// galleries; the methods here read and edit what it produced.
 
 		async listImages() {
 			const body = await get('/api/admin/images');

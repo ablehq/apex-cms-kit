@@ -176,13 +176,18 @@ export interface AdminTag {
 /**
  * One item of an asset-library gallery.
  *
- * There is no thumbnail field, and its absence is the honest answer rather than an
- * omission: `medium` and `thumbnail` are `has_one … as: :record` associations that
- * are simply MISSING from the read until bytes are attached, and no bytes can be
- * attached against local Apex (§2.7 — the signed upload URL points at a port it does
- * not serve). Their shape has therefore never been observed. Declaring a
- * `thumbnailUrl` on a guess would be a field that silently stays empty forever.
- * It arrives with upload bring-up, together with the shape that proves it.
+ * `url` was withheld while no bytes could be attached: `medium` and `thumbnail` are
+ * `has_one … as: :record` associations that are simply MISSING from the read until
+ * something is attached, so their shape had never been observed and declaring a field
+ * on a guess would have been one that silently stayed empty forever. Uploads are now
+ * proved end to end against real Apex for all three galleries, and
+ * `summarizeGalleryImage` has been composing this URL from `medium.file.key` all
+ * along — so the type now declares what the rows have been carrying. Without it,
+ * `npm run check` refuses a screen that reads it.
+ *
+ * `null` is a real answer, not an error, in three cases: the item has no bytes yet,
+ * the deployment has no assets prefix, or the gallery is `files`/`videos`, where a
+ * Cloudflare IMAGE transform is meaningless.
  */
 export interface AdminGalleryItem {
 	id: string;
@@ -192,6 +197,8 @@ export interface AdminGalleryItem {
 	position: number;
 	/** ISO 8601, from Apex. The Images list sorts newest-first on it. */
 	createdAt: string;
+	/** A thumbnail to draw, when one can be composed. See above for the three nulls. */
+	url: string | null;
 }
 
 /**
@@ -253,18 +260,55 @@ export interface BffRequestError extends Error {
 	status?: number;
 }
 
+/** The four scalars the signed-upload leg takes, at the TOP level of the body. */
+export interface MediaUploadFile {
+	byte_size: number;
+	content_type: string;
+	filename: string;
+	checksum: string;
+}
+
+/**
+ * The body of `POST /api/admin/media/uploads`. The gallery is a NAME — the ids are
+ * account-scoped, so the server resolves them from `cms_config` per request and no
+ * browser is ever trusted with one.
+ */
+export interface MediaUploadRequest {
+	gallery: string;
+	file: MediaUploadFile;
+}
+
 /**
  * The 2xx body of `POST /api/admin/media/uploads` (`operations/media.ts`): the
- * gallery item the BFF created, plus the ActiveStorage direct-upload signature the
- * browser PUTs the bytes to. A failure comes back as `{ ok: false, status, error }`
- * instead, which is why the caller checks `ok` before it reads any of this.
+ * ActiveStorage direct-upload signature the browser PUTs the bytes to. A failure comes
+ * back as `{ ok: false, status, error }` instead, which is why the caller checks `ok`
+ * before it reads any of this.
+ *
+ * There is deliberately NO `galleryItemId` here: signing creates nothing upstream. The
+ * gallery item is created at finalize, after the bytes exist, so no failure on this
+ * path can leave an item behind.
  */
 export interface MediaUploadSignature extends BffMutationResult {
-	/** The operation answers 502 rather than return without one. */
-	galleryItemId: string;
 	uploadUrl: string | null;
 	uploadHeaders: Record<string, string>;
 	signedId: string | null;
+}
+
+/**
+ * The body of `POST /api/admin/media`. The caption and alt travel HERE rather than
+ * with the signature, because this is the leg that creates the item.
+ */
+export interface MediaFinalizeRequest {
+	gallery: string;
+	signedId: string;
+	title?: string;
+	alt?: string;
+}
+
+/** The 2xx body of `POST /api/admin/media`: the item this leg created, and its medium. */
+export interface MediaFinalizeResult extends BffMutationResult {
+	galleryItemId: string | null;
+	mediumId: string | null;
 }
 
 /**
@@ -295,8 +339,13 @@ export interface BffClient {
 	): Promise<BffMutationResult>;
 	savePageStructure(pageId: string, payload: unknown): Promise<BffMutationResult>;
 	changePageStatus(pageId: string, statusEvent: AdminStatusEvent): Promise<BffMutationResult>;
-	signMediaUpload(payload: unknown): Promise<MediaUploadSignature>;
-	finalizeMediaUpload(payload: unknown): Promise<BffMutationResult>;
+	/**
+	 * Named payloads, not `unknown`: the bodies changed shape when the item moved to
+	 * the finalize leg, and a caller still sending `{ galleryId, title, alt, file }`
+	 * should be a compile error rather than a 400 discovered at runtime.
+	 */
+	signMediaUpload(payload: MediaUploadRequest): Promise<MediaUploadSignature>;
+	finalizeMediaUpload(payload: MediaFinalizeRequest): Promise<MediaFinalizeResult>;
 	/**
 	 * Fetch every collection from Apex as this editor and publish the snapshot. NOT an Apex
 	 * call. Resolves — never throws — so a deployment that cannot publish comes back
