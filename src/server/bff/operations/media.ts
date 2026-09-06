@@ -11,7 +11,7 @@ import {
 } from '../media-claim';
 import { rejectMutation } from '../reject';
 import { readGalleryId } from './list-gallery-images';
-import { galleryMedia, refuseUpload } from '../../../admin/media-types.js';
+import { CAPTION_MAX_LENGTH, galleryMedia, refuseUpload } from '../../../admin/media-types.js';
 import type { ApexAdminClient, ApexResponse } from '../apex-admin-client';
 import type { BffContext } from '../context';
 
@@ -91,10 +91,37 @@ const finalizeBodySchema = z
 	.object({
 		gallery: z.string().max(40),
 		signedId: z.string().min(1).max(4096),
-		title: z.string().max(300).optional(),
-		alt: z.string().max(300).optional()
+		title: z.string().max(CAPTION_MAX_LENGTH).optional(),
+		alt: z.string().max(CAPTION_MAX_LENGTH).optional()
 	})
 	.strict();
+
+/**
+ * A rejected body, as a sentence.
+ *
+ * Everywhere else in this BFF a schema failure answers the code `invalid body`, and
+ * that is right: those codes are read by screens that already know what they sent
+ * and choose their own words. This path is the exception, and it is the only one —
+ * the media screens print the server's string VERBATIM, and they print it after the
+ * editor's bytes have already been uploaded. A caption pasted past the cap therefore
+ * showed a person the words "invalid body" as the explanation for losing a 20 MB
+ * upload. The `maxlength` attributes make that unreachable through the UI; this
+ * makes it survivable when it is reached anyway.
+ *
+ * The audit row still records `invalid body`, so nothing that greps the log changes.
+ */
+function invalidBodyMessage(issues: { path: PropertyKey[]; code: string }[], fallback: string) {
+	for (const issue of issues) {
+		if (issue.code !== 'too_big') continue;
+		const field = issue.path[issue.path.length - 1];
+		if (field === 'title')
+			return `That caption is too long. Keep it to ${CAPTION_MAX_LENGTH} characters or fewer.`;
+		if (field === 'alt')
+			return `That alt text is too long. Keep it to ${CAPTION_MAX_LENGTH} characters or fewer.`;
+		if (field === 'filename') return 'That file name is too long. Rename the file and try again.';
+	}
+	return fallback;
+}
 
 /**
  * What Apex actually said, dug out of the two failure shapes its controllers use:
@@ -171,7 +198,13 @@ export async function handleSignMediaUpload(request: Request, ctx: BffContext): 
 		return rejectMutation(ctx, actorMeta, 400, 'invalid json', 'invalid json');
 	}
 	const parsed = signBodySchema.safeParse(bodyJson);
-	if (!parsed.success) return rejectMutation(ctx, actorMeta, 400, 'invalid body', 'invalid body');
+	if (!parsed.success) {
+		const said = invalidBodyMessage(
+			parsed.error.issues,
+			'That file could not be prepared for upload.'
+		);
+		return rejectMutation(ctx, actorMeta, 400, said, 'invalid body');
+	}
 
 	// The SAME check the browser ran, run again where it actually holds. A browser
 	// check constrains a well-behaved browser; this one constrains everyone. Note it
@@ -262,7 +295,10 @@ export async function handleFinalizeMediaUpload(
 		return rejectMutation(ctx, actorMeta, 400, 'invalid json', 'invalid json');
 	}
 	const parsed = finalizeBodySchema.safeParse(bodyJson);
-	if (!parsed.success) return rejectMutation(ctx, actorMeta, 400, 'invalid body', 'invalid body');
+	if (!parsed.success) {
+		const said = invalidBodyMessage(parsed.error.issues, 'That upload could not be saved as sent.');
+		return rejectMutation(ctx, actorMeta, 400, said, 'invalid body');
+	}
 
 	const { gallery, signedId } = parsed.data;
 	// An unknown name is the CALLER's fault and is refused before any upstream call.

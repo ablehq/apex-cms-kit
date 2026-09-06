@@ -23,7 +23,7 @@
 	Legacy Svelte mode.
 -->
 <script>
-	import { galleryMedia, MAX_UPLOAD_LABEL } from '../media-types.js';
+	import { CAPTION_MAX_LENGTH, galleryMedia, MAX_UPLOAD_LABEL } from '../media-types.js';
 	import { uploadMedia } from '../upload-media.js';
 
 	export let open = false;
@@ -188,12 +188,28 @@
 						{/if}
 						<div class="f">
 							<label class="label" for="media-title">Title</label>
-							<input id="media-title" class="inp" type="text" bind:value={title} disabled={busy} />
+							<!-- The server caps both of these at CAPTION_MAX_LENGTH. Without the attribute the
+							     cap was reachable by paste, and the refusal arrived AFTER the upload. -->
+							<input
+								id="media-title"
+								class="inp"
+								type="text"
+								maxlength={CAPTION_MAX_LENGTH}
+								bind:value={title}
+								disabled={busy}
+							/>
 						</div>
 						{#if showAlt}
 							<div class="f">
 								<label class="label" for="media-alt">Alt text</label>
-								<input id="media-alt" class="inp" type="text" bind:value={alt} disabled={busy} />
+								<input
+									id="media-alt"
+									class="inp"
+									type="text"
+									maxlength={CAPTION_MAX_LENGTH}
+									bind:value={alt}
+									disabled={busy}
+								/>
 							</div>
 						{/if}
 					</div>

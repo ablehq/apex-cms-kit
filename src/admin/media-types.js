@@ -57,6 +57,17 @@ export const UPLOAD_LIMIT_BYTES = 25 * 1024 * 1024;
 export const MAX_UPLOAD_LABEL = '25 MB';
 
 /**
+ * How long a caption or an alt text may be.
+ *
+ * Defined here for the same reason the type lists are: the finalize schema, the
+ * refusal sentence and every `maxlength` attribute on every caption box in both
+ * sites have to agree, and they only agree if there is one number. Without the
+ * attribute the cap was reachable by PASTE, and what an editor got for it was the
+ * literal words "invalid body" — after their bytes were already uploaded.
+ */
+export const CAPTION_MAX_LENGTH = 300;
+
+/**
  * @typedef {object} GalleryMedia
  * @property {readonly string[]} types The content types this gallery accepts.
  * @property {string} accept The file input's `accept` attribute.

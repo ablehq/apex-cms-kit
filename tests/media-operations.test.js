@@ -6,7 +6,7 @@ import {
 	handleSignMediaUpload,
 	handleFinalizeMediaUpload
 } from '../src/server/bff/operations/media.ts';
-import { galleryMedia, UPLOAD_LIMIT_BYTES } from '../src/admin/media-types.js';
+import { CAPTION_MAX_LENGTH, galleryMedia, UPLOAD_LIMIT_BYTES } from '../src/admin/media-types.js';
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
 import { barrierOn, createMigratedDatabase } from './harness/d1.ts';
@@ -586,5 +586,52 @@ describe('the signed id is bound to one gallery and one redemption', () => {
 		assert.equal(response.status, 502);
 		assert.equal(body.error, 'unexpected upstream shape');
 		assert.deepEqual(claims(db), []);
+	});
+});
+
+describe('a refused body is a sentence, not a machine code', () => {
+	it('names the caption, and says how long is too long', async () => {
+		// Reachable by PASTE from every caption box in both sites, and reached only
+		// AFTER the bytes are uploaded — so what this string says is the entire
+		// explanation an editor gets for losing an upload. It used to say
+		// "invalid body".
+		const { response, body, calls } = await finalize({
+			gallery: 'images',
+			signedId: 'signed-abc',
+			title: 'x'.repeat(CAPTION_MAX_LENGTH + 1)
+		});
+		assert.equal(response.status, 400);
+		assert.equal(body.error, 'That caption is too long. Keep it to 300 characters or fewer.');
+		assert.deepEqual(calls, []);
+	});
+
+	it('names the alt text when that is the field that is too long', async () => {
+		const { body } = await finalize({
+			gallery: 'images',
+			signedId: 'signed-abc',
+			alt: 'x'.repeat(CAPTION_MAX_LENGTH + 1)
+		});
+		assert.equal(body.error, 'That alt text is too long. Keep it to 300 characters or fewer.');
+	});
+
+	it('names the file name on the sign leg, where the cap is also reachable', async () => {
+		const { response, body } = await sign({
+			gallery: 'images',
+			file: { ...goodFile, filename: `${'x'.repeat(400)}.png` }
+		});
+		assert.equal(response.status, 400);
+		assert.equal(body.error, 'That file name is too long. Rename the file and try again.');
+	});
+
+	it('still answers a sentence for a shape it has no specific words for', async () => {
+		// A stale caller sending the old design's key. There is nothing useful to say
+		// about it to an EDITOR, but "invalid body" is not a thing to say to a person.
+		const { response, body } = await finalize({
+			gallery: 'images',
+			signedId: 'signed-abc',
+			galleryItemId: NEW_ITEM
+		});
+		assert.equal(response.status, 400);
+		assert.equal(body.error, 'That upload could not be saved as sent.');
 	});
 });
