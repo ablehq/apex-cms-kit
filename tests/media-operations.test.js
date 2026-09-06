@@ -699,3 +699,109 @@ describe('an item created but not NAMED is still swept, and still audited', () =
 		assert.ok(!calls.some((c) => c[0] === 'deleteGalleryItem'));
 	});
 });
+
+describe('a THROWN upstream call is swept and audited like a returned failure', () => {
+	/** The rows one action wrote, newest last. */
+	function auditFor(db, action) {
+		return db.sqlite
+			.prepare(
+				`SELECT outcome, detail FROM bff_audit_log
+				  WHERE action = ? ORDER BY occurred_at, rowid`
+			)
+			.all(action)
+			.map((row) => ({ outcome: row.outcome, detail: JSON.parse(row.detail ?? 'null') }));
+	}
+
+	/** A client whose named method REJECTS, the way the admin transport rethrows. */
+	function throwingApex(calls, method) {
+		const apex = apexWith(calls);
+		const inner = apex[method].bind(apex);
+		apex[method] = async (...args) => {
+			await inner(...args);
+			throw new TypeError('fetch failed');
+		};
+		return apex;
+	}
+
+	async function finalizeThrowing(method, body = { gallery: 'images', signedId: 'signed-abc' }) {
+		const db = await createMigratedDatabase();
+		const calls = [];
+		await sign({ gallery: body.gallery, file: FILE_FOR[body.gallery] }, { db });
+		const ctx = ctxWith(calls, undefined, db);
+		ctx.createApexClient = () => throwingApex(calls, method);
+		const session = await signIn(ctx);
+		const response = await handleFinalizeMediaUpload(req(session, '/api/admin/media', body), ctx);
+		return { response, body: await response.json().catch(() => null), calls, db };
+	}
+
+	it('sweeps the item and audits when the ATTACH throws', async () => {
+		// The admin transport rethrows network faults — only the ingest path turns them
+		// into typed failures — so a connection reset here used to escape as a framework
+		// 500 with the item intact and no finalize audit row at all.
+		const { response, body, calls, db } = await finalizeThrowing('createMedium', {
+			gallery: 'images',
+			signedId: 'signed-abc',
+			title: 'Lost attach'
+		});
+		assert.equal(response.status, 502);
+		assert.match(body.error, /Choose the file again/u);
+		assert.deepEqual(
+			calls.map((c) => c[0]),
+			['readCmsConfig', 'createGalleryItem', 'createMedium', 'deleteGalleryItem']
+		);
+		assert.equal(calls[3][1], NEW_ITEM, 'the item this op made is deleted by id');
+
+		const rows = auditFor(db, 'media.upload.finalize');
+		assert.equal(rows.length, 1);
+		assert.equal(rows[0].outcome, 'apex_error');
+		// Named as UNKNOWN, not as a failure: a lost response leaves the attach
+		// genuinely ambiguous, and the row must not claim to know which way it went.
+		assert.equal(rows[0].detail.attachOutcome, 'unknown');
+		assert.equal(rows[0].detail.itemDeleted, true);
+		assert.equal(rows[0].detail.caption, 'Lost attach');
+	});
+
+	it('audits when the item CREATE throws, with nothing to sweep by', async () => {
+		const { response, calls, db } = await finalizeThrowing('createGalleryItem', {
+			gallery: 'files',
+			signedId: 'signed-abc',
+			title: 'Lost create'
+		});
+		assert.equal(response.status, 502);
+		assert.ok(!calls.some((c) => c[0] === 'deleteGalleryItem'), 'no id came back to delete by');
+		assert.ok(!calls.some((c) => c[0] === 'createMedium'));
+		const rows = auditFor(db, 'media.upload.finalize');
+		assert.equal(rows.length, 1);
+		assert.equal(rows[0].detail.itemCreated, 'unknown');
+		assert.equal(rows[0].detail.caption, 'Lost create');
+	});
+
+	it('answers 502 rather than a framework 500 when cms_config throws', async () => {
+		const { response, body, calls } = await finalizeThrowing('readCmsConfig');
+		assert.equal(response.status, 502);
+		assert.equal(body.error, 'upstream error');
+		assert.ok(!calls.some((c) => c[0] === 'createGalleryItem'), 'nothing was created');
+	});
+
+	it('audits a thrown SIGN leg, which creates nothing but must still be accounted for', async () => {
+		const db = await createMigratedDatabase();
+		const calls = [];
+		const ctx = ctxWith(calls, undefined, db);
+		ctx.createApexClient = () => throwingApex(calls, 'createSignedUploadUrl');
+		const session = await signIn(ctx);
+		const response = await handleSignMediaUpload(
+			req(session, '/api/admin/media/uploads', { gallery: 'images', file: goodFile }),
+			ctx
+		);
+		assert.equal(response.status, 502);
+		const rows = auditFor(db, 'media.upload.sign');
+		assert.equal(rows.length, 1);
+		assert.equal(rows[0].outcome, 'apex_error');
+		// And no claim was written for a signed id that never came back.
+		assert.deepEqual(
+			db.sqlite.prepare(`SELECT id FROM bff_media_upload_claim`).all(),
+			[],
+			'a sign that threw mints no claim'
+		);
+	});
+});

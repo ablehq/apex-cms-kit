@@ -223,7 +223,17 @@ export async function handleSignMediaUpload(request: Request, ctx: BffContext): 
 		return noStoreJson({ error: 'Uploads are not available on this deployment.' }, 500);
 	}
 
-	const signed = await guard.apex.createSignedUploadUrl(parsed.data.file);
+	const signed = await guard.apex.createSignedUploadUrl(parsed.data.file).catch(() => null);
+	if (signed === null) {
+		// A rethrown transport fault. Nothing upstream was created that could need
+		// sweeping — but an unaudited exception is still a request nobody can account
+		// for afterwards, which is the whole point of the log.
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: { gallery: parsed.data.gallery, filename: parsed.data.file.filename }
+		});
+		return noStoreJson({ error: 'The upload could not be started. Try again.' }, 502);
+	}
 	if (!signed.ok) {
 		await auditOutcome(ctx, meta, guard.actor, {
 			outcome: 'apex_error',
@@ -326,17 +336,35 @@ export async function handleFinalizeMediaUpload(
 	// A name this kit serves that `cms_config` cannot resolve is an UPSTREAM fault —
 	// a failed read, or an account without that gallery — so it is a 502, not a 400.
 	// The two cases answer differently because they are different mistakes.
-	const galleryId = await readGalleryId(guard.apex, gallery);
+	const galleryId = await readGalleryId(guard.apex, gallery).catch(() => null);
 	if (!galleryId) {
 		await auditOutcome(ctx, meta, guard.actor, { outcome: 'apex_error', detail: { gallery } });
 		return noStoreJson({ error: 'upstream error' }, 502);
 	}
 
-	const created = await guard.apex.createGalleryItem(
-		galleryId,
-		parsed.data.title ?? '',
-		parsed.data.alt ?? ''
-	);
+	// `.catch(() => null)` on every upstream call from here down, because the ADMIN
+	// transport RETHROWS network faults (`apex-admin-client.ts`: only the
+	// signal-carrying ingest path turns them into typed failures). An escaping
+	// exception is a framework 500 with no audit row and no cleanup — which is the
+	// hole that was closed for the malformed-shape branch and left open on this one.
+	const created = await guard.apex
+		.createGalleryItem(galleryId, parsed.data.title ?? '', parsed.data.alt ?? '')
+		.catch(() => null);
+	if (created === null) {
+		// The create THREW: the request may or may not have reached Apex, and there is
+		// no id either way, so there is nothing to sweep by. Record it — an item that
+		// exists under a caption nobody can name is exactly what an operator needs the
+		// audit row to point at.
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: {
+				gallery,
+				itemCreated: 'unknown',
+				caption: (parsed.data.title ?? '').slice(0, 80)
+			}
+		});
+		return noStoreJson({ error: 'The upload could not be saved. Choose the file again.' }, 502);
+	}
 	if (!created.ok) {
 		await auditOutcome(ctx, meta, guard.actor, {
 			outcome: 'apex_error',
@@ -372,12 +400,42 @@ export async function handleFinalizeMediaUpload(
 		return noStoreJson({ error: 'unexpected upstream shape' }, 502);
 	}
 
-	const medium = await guard.apex.createMedium({
-		kind: 'primary',
-		file: signedId,
-		record_id: galleryItemId,
-		record_type: 'Cms::GalleryItem'
-	});
+	const medium = await guard.apex
+		.createMedium({
+			kind: 'primary',
+			file: signedId,
+			record_id: galleryItemId,
+			record_type: 'Cms::GalleryItem'
+		})
+		.catch(() => null);
+	if (medium === null) {
+		// ── THE ATTACH THREW, AND THAT IS THE AMBIGUOUS CASE ──────────────────────
+		// A rethrown transport fault means the request may have been LOST on the way
+		// out or on the way back: the `Medium` may exist, or may not, and this op
+		// cannot tell. Both readings are handled by the same action — sweep the item —
+		// because deleting the item destroys any medium hanging off it and purges the
+		// blob (`dependent: :purge_later`), so the outcome converges on "nothing
+		// exists" whichever way the coin actually landed. Leaving it alone does not
+		// converge: it is either a caption with no picture, or a finished upload the
+		// editor was told had failed, and the retry then makes a duplicate.
+		//
+		// The retry is safe to invite BECAUSE of the claim: this signed id is already
+		// spent, so "choose the file again" means a new sign and a new PUT, and the
+		// same bytes cannot be attached twice. What it costs is one stranded blob,
+		// which is the upstream debt this design already names.
+		const swept = await deleteQuietly(guard.apex, galleryItemId);
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: {
+				gallery,
+				galleryItemId,
+				attachOutcome: 'unknown',
+				itemDeleted: swept,
+				caption: (parsed.data.title ?? '').slice(0, 80)
+			}
+		});
+		return noStoreJson({ error: 'The upload could not be saved. Choose the file again.' }, 502);
+	}
 	if (!medium.ok) {
 		// The ONE compensation this design still needs, and it is local: the item was
 		// created moments ago, in this request, by this op, so its id is known and the
