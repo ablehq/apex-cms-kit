@@ -28,7 +28,23 @@
  *     the object is stored `Content-Disposition: inline` and the media host serves
  *     an uploaded SVG as a DOCUMENT — script and all — on an origin shared by every
  *     Apex tenant, whose headers and CSP we do not control. Neither site needs
- *     editor-uploaded SVG. The exclusion is enforced in the sign op, not only here.
+ *     editor-uploaded SVG.
+ *
+ * ── WHAT THESE LISTS DO AND DO NOT CONTROL ────────────────────────────────────
+ * This file used to say the SVG exclusion "is enforced in the sign op, not only
+ * here", which read as a guarantee about BYTES and is not one. Every check on this
+ * path judges the DECLARED string and nothing looks at the file: declare `text/csv`,
+ * PUT SVG bytes, and the object stores and Apex records it as `image/svg+xml` —
+ * measured against local Apex. So the lists are a real control over the ordinary
+ * path (a chooser, a browser's guess from an extension, the wrong file picked) and
+ * NOT a control over a caller choosing what to declare. That caller is a signed-in
+ * editor holding the account's own staff token, so this path opens nothing they
+ * could not already do through Apex directly.
+ *
+ * Do NOT answer this with byte sniffing: the first 4 KB is exactly what Marcel
+ * reads, a polyglot beats both, and the control that would hold — a
+ * `Content-Disposition` that is not `inline`, or a media host not shared across
+ * tenants — lives upstream.
  *
  * ── THE SIZE LIMIT IS THIS KIT'S POLICY, NOT APEX'S CAP ───────────────────────
  * The two backends disagree with each other, on the number AND on where it is

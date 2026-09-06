@@ -1,6 +1,3 @@
-// @ts-nocheck — legacy-mode admin browser module, like `bff-client.js` beside it.
-// Its behaviour is the contract and is covered by tests/upload-media.test.js.
-
 import { md5Base64 } from './md5.js';
 import { declaredContentType, refusalMessage, refuseUpload } from './media-types.js';
 
@@ -32,6 +29,7 @@ import { declaredContentType, refusalMessage, refuseUpload } from './media-types
  *
  * @typedef {'no-such-gallery' | 'type-not-allowed' | 'empty-file' | 'too-large'
  *           | 'sign-failed' | 'store-failed' | 'finalize-failed'} UploadFailure
+ * @typedef {'preparing' | 'uploading' | 'saving'} UploadPhase
  *
  * @param {import('./types').BffClient} client
  * @param {{
@@ -39,7 +37,7 @@ import { declaredContentType, refusalMessage, refuseUpload } from './media-types
  *   file: File,
  *   title?: string,
  *   alt?: string,
- *   onPhase?: (phase: 'preparing' | 'uploading' | 'saving') => void
+ *   onPhase?: (phase: UploadPhase) => void
  * }} options
  * @returns {Promise<{ ok: true, galleryItemId: string }
  *                 | { ok: false, reason: UploadFailure, message: string }>}
@@ -112,6 +110,10 @@ export async function uploadMedia(client, { gallery, file, title = '', alt = '',
 	return { ok: true, galleryItemId: finalized.galleryItemId };
 }
 
+/**
+ * @param {((phase: UploadPhase) => void) | undefined} onPhase
+ * @param {UploadPhase} phase
+ */
 function report(onPhase, phase) {
 	if (typeof onPhase === 'function') onPhase(phase);
 }
@@ -121,8 +123,20 @@ function report(onPhase, phase) {
  * message through (`operations/media.ts`), so "Content type image/avif is not a valid
  * kind" reaches the editor instead of a generic apology — which is the whole point of
  * surfacing it. `fallback` covers a thrown fetch, which has no server message at all.
+ *
+ * `source` is `unknown` because it really is: this is handed either a BFF response
+ * or a caught exception, and the only thing it asks of either is whether it happens
+ * to carry a string `error`. Narrowing here rather than at the four call sites.
+ *
+ * @param {UploadFailure} reason
+ * @param {unknown} source
+ * @param {string} fallback
+ * @returns {{ ok: false, reason: UploadFailure, message: string }}
  */
 function failure(reason, source, fallback) {
-	const said = typeof source?.error === 'string' ? source.error.trim() : '';
+	const said =
+		source && typeof source === 'object' && 'error' in source && typeof source.error === 'string'
+			? source.error.trim()
+			: '';
 	return { ok: false, reason, message: said || fallback };
 }
