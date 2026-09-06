@@ -26,7 +26,7 @@ export async function handleDeletePost(
 ): Promise<Response> {
 	const contract = contractOf(ctx);
 	if (!contract) return noContractResponse();
-	const meta = postRouteMeta(request, 'posts.delete', 'DELETE', params.schema, params.postId);
+	const meta = postRouteMeta(request, 'posts.delete', 'DELETE', true);
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
 	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);

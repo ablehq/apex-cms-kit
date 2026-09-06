@@ -1,12 +1,12 @@
 import { z } from 'zod';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { cleanString, unwrapArchetypeCollection } from '../archetype-record';
+import { cleanString } from '../archetype-record';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import { loadReferenceTargets } from './list-records';
 import { PAGE_SIZE } from './record-shape';
 import type { AdminRecord } from './record-shape';
-import { postSchemaOf, summarizePost } from './post-shape';
+import { listAllPages, postSchemaOf, summarizePost } from './post-shape';
 import type { AdminPost } from './post-shape';
 import type { ApexAdminClient } from '../apex-admin-client';
 import type { ContentContract } from '../content-contract';
@@ -26,10 +26,10 @@ import type { BffContext } from '../context';
  * name ending in `ts`, `js`, `css` or `svelte`. Any future module in this
  * package inherits the rule.
  *
- * TWO reads, not N+1. `post_archetype_views` carries the post fields and the
- * `archetype_id`; `specification/archetypes` for the same schema carries the
- * items and the taggings (measured 2026-09-05). Joined by archetype id here, so
- * the list costs two calls however long it is — plus one per reference target
+ * TWO reads, not N+1 — each read to its last page. `post_archetype_views`
+ * carries the post fields and the `archetype_id`; `specification/archetypes` for
+ * the same schema carries the items and the taggings (measured 2026-09-05).
+ * Joined by archetype id here, so the list costs two reads however long it is — plus one per reference target
  * collection, exactly as the record list pays. Bodies are NOT read for the list.
  *
  * THE STATUS FILTER IS APPLIED HERE, NOT UPSTREAM. The screen's tab counts must
@@ -46,19 +46,24 @@ export async function loadPostCatalogue(
 	apex: ApexAdminClient,
 	slug: string
 ): Promise<{ posts: AdminPost[]; referenceTargets: Record<string, AdminRecord[]> } | null> {
+	// EVERY page of both, or nothing: a list that stopped at page one would make
+	// the tab counts guesses past 100 posts, and the two halves of a post would
+	// desync the moment the views and the archetypes paginated differently.
 	const [views, archetypes] = await Promise.all([
-		apex.listPosts(slug, { per_page: PAGE_SIZE, page: 1, 'q[sorts][]': 'created_at desc' }),
-		apex.listPostArchetypes(slug, { per_page: PAGE_SIZE, page: 1 })
+		listAllPages((page) =>
+			apex.listPosts(slug, { per_page: PAGE_SIZE, page, 'q[sorts][]': 'created_at desc' })
+		),
+		listAllPages((page) => apex.listPostArchetypes(slug, { per_page: PAGE_SIZE, page }))
 	]);
-	if (!views.ok || !archetypes.ok) return null;
+	if (!views || !archetypes) return null;
 
 	const byArchetypeId = new Map<string, Record<string, unknown>>();
-	for (const record of unwrapArchetypeCollection(archetypes.body)) {
+	for (const record of archetypes) {
 		const id = cleanString(record.id);
 		if (id) byArchetypeId.set(id, record);
 	}
 
-	const posts = unwrapArchetypeCollection(views.body)
+	const posts = views
 		.map((view) =>
 			summarizePost(
 				contract,

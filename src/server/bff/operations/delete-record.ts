@@ -29,23 +29,20 @@ import type { BffContext } from '../context';
  * and the confirmation somebody else may have added a reference — a confirmation
  * for "2 partners" must not silently strip 3.
  *
- * ── WHAT THE COUNT DOES AND DOES NOT COVER, AND WHY IT SAYS SO ─────────────────
- * It covers the content-library relations, which are readable through the generic
- * list. It does NOT cover `update` and `story`, which also reference authors, focus
- * areas and partners: a post archetype is not addressable on this surface (its
- * fields would 422 there) and the post screen is P2.
+ * ── WHAT THE COUNT COVERS, AND WHAT HAPPENS WHEN IT CANNOT ───────────────────
+ * It covers every referrer the site's contract names as `countable`: content-
+ * library schemas through the generic list, and post schemas (`update`, `story`)
+ * through `listPostArchetypes` once the site has enabled them on its client
+ * (`allowedPostSlugs`). Godrej counts all of them since plan 04 G1, so the
+ * in-use dialog says a real number.
  *
- * That gap is REPORTED rather than papered over. A partial count reads as a
- * complete one, and "0 records use this" is precisely the sentence that talks an
- * editor into a delete. So the response carries `uncountedReferrers`, the screen
- * names them, and the confirm button says what it does not know.
- *
- * AND, SINCE IT CANNOT COUNT THEM, IT REFUSES. Naming the gap is not enough: a
- * confirmed delete of a focus area would have Apex strip it from every Update and
- * Story that referenced it, silently, and P1 cannot see — let alone report — what
- * it just emptied. So a non-empty `uncountedReferrers` is a 409 in its own right,
- * with no `?confirm=1` that gets past it. That refusal lifts when the post screens
- * land (P2) and those referrers move into the countable set.
+ * A referrer the contract still marks `uncounted` is REPORTED rather than papered
+ * over — a partial count reads as a complete one, and "0 records use this" is
+ * precisely the sentence that talks an editor into a delete — AND REFUSED: a
+ * confirmed delete would have Apex strip the record from every referrer,
+ * silently, and this operation could not see what it just emptied. So a non-empty
+ * `uncountedReferrers` is a 409 in its own right, with no `?confirm=1` that gets
+ * past it, until the site makes that referrer countable.
  */
 export async function handleDeleteRecord(
 	request: Request,

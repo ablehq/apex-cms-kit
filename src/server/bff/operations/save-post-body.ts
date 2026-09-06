@@ -37,14 +37,7 @@ export async function handleSavePostBody(
 ): Promise<Response> {
 	const contract = contractOf(ctx);
 	if (!contract) return noContractResponse();
-	const meta = postRouteMeta(
-		request,
-		'posts.save_body',
-		'PUT',
-		params.schema,
-		params.postId,
-		'/body'
-	);
+	const meta = postRouteMeta(request, 'posts.save_body', 'PUT', true, '/body');
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
 	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);

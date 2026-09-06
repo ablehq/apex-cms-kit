@@ -7,7 +7,13 @@ import { rejectMutation } from '../reject';
 import { cleanString, unwrapArchetypeRecord } from '../archetype-record';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import { toApexFields } from './update-record';
-import { buildPostLoad, postIdSchema, postRouteMeta, postSchemaOf } from './post-shape';
+import {
+	buildPostLoad,
+	postIdSchema,
+	postRouteMeta,
+	postSchemaOf,
+	rejectedWriteResponse
+} from './post-shape';
 import type { ContentContract } from '../content-contract';
 import type { BffContext } from '../context';
 
@@ -28,7 +34,9 @@ import type { BffContext } from '../context';
  * The slug is the post's public address, so the schema pins it to a URL-safe
  * charset. `Cms::Post` slugs are unique PER ACCOUNT ACROSS SCHEMAS (measured
  * 2026-09-05: an update may not take a story's slug), and Apex says so with a
- * 422 that comes back here as `409 slug-taken` — something an editor can act on.
+ * 422 that comes back here as `409 slug-taken` when the slug is what it refused —
+ * something an editor can act on — and as `422 invalid` with Apex's own field
+ * errors otherwise.
  */
 export function createPostBodySchema(contract: ContentContract, slug: string) {
 	const fieldsShape: Record<string, z.ZodTypeAny> = {};
@@ -60,7 +68,7 @@ export async function handleCreatePost(
 ): Promise<Response> {
 	const contract = contractOf(ctx);
 	if (!contract) return noContractResponse();
-	const meta = postRouteMeta(request, 'posts.create', 'POST', params.schema);
+	const meta = postRouteMeta(request, 'posts.create', 'POST');
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
 	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
@@ -106,7 +114,9 @@ export async function handleCreatePost(
 		}
 	});
 
-	if (apexResponse.status === 422) return bffError(409, 'slug-taken');
+	// A 422 is Apex's own validation: `409 slug-taken` only when the slug is what
+	// it refused, otherwise `422 invalid` with the field errors.
+	if (apexResponse.status === 422) return rejectedWriteResponse(apexResponse.body);
 	if (!apexResponse.ok) return bffError(502, 'upstream error');
 
 	// Apex answers with the ARCHETYPE; the admin addresses a post by its POST id,

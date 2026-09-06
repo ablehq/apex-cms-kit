@@ -6,6 +6,7 @@ import { rejectMutation } from '../reject';
 import { unwrapArchetypeRecord } from '../archetype-record';
 import { computePageVersion } from '../page-version';
 import { getPageSlugValidationError } from '../../../cms/page-slug-validation.js';
+import { rejectedWriteResponse } from './post-shape';
 import type { BffContext } from '../context';
 
 /**
@@ -80,7 +81,9 @@ export async function handleCreatePage(request: Request, ctx: BffContext): Promi
 		detail: { slug: parsed.data.slug, apexStatus: apexResponse.status }
 	});
 
-	if (apexResponse.status === 422) return bffError(409, 'slug-taken');
+	// Apex's own validation: `409 slug-taken` when the slug is what it refused,
+	// `422 invalid` with the field errors otherwise — the same rule as the posts.
+	if (apexResponse.status === 422) return rejectedWriteResponse(apexResponse.body);
 	if (!apexResponse.ok) return bffError(502, 'upstream error');
 
 	const page = unwrapArchetypeRecord(apexResponse.body);

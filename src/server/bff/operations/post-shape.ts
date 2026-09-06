@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { bffError, noStoreJson } from '../boundary';
 import { canonicalize } from '../../../cms/canonical-json.js';
 import { sanitizeHtml } from '../../../sanitize/html.js';
 import {
@@ -72,6 +73,67 @@ export const BLOCK_TYPE_QUOTE = 'Cms::DocumentBlock::Quote';
 
 /** The `shared_gallery_items.kind` the public loaders read the cover from. */
 const COVER_KIND = 'cover';
+
+/**
+ * Apex's own 422 body, read: `{ data: [{ attribute_name, messages: [] }] }`. What the
+ * browser is handed on a rejected write, so the editor is told which field and
+ * why — a rejected cover or a bad `published_date` is not a slug problem, and was
+ * being reported as one.
+ */
+export interface ApexValidationError {
+	attribute: string;
+	messages: string[];
+}
+
+export function apexValidationErrors(body: unknown): ApexValidationError[] {
+	const data = (body as { data?: unknown } | null)?.data;
+	if (!Array.isArray(data)) return [];
+	const errors: ApexValidationError[] = [];
+	for (const row of data) {
+		if (!isRecord(row)) continue;
+		const attribute = cleanString(row.attribute_name);
+		const messages = Array.isArray(row.messages)
+			? row.messages.filter((m): m is string => typeof m === 'string')
+			: [];
+		if (attribute) errors.push({ attribute, messages });
+	}
+	return errors;
+}
+
+/**
+ * The response for an Apex 422: `409 slug-taken` ONLY when the errors name the
+ * slug — the one case an editor fixes by changing the address — and otherwise
+ * `422 invalid` carrying Apex's errors so the screen can say which field.
+ */
+export function rejectedWriteResponse(body: unknown): Response {
+	const errors = apexValidationErrors(body);
+	if (errors.some((error) => error.attribute === 'slug')) return bffError(409, 'slug-taken');
+	return noStoreJson({ error: 'invalid', code: 'invalid', errors }, 422);
+}
+
+/**
+ * Every page of a `search_and_filter` read, or null when a page will not read or
+ * the pagination metadata is missing — the same fail-closed rule as
+ * `countReferencesTo`. A list that silently stopped at page one would make the
+ * tab counts guesses past 100 posts, and desync the two halves of a post when
+ * the views and the archetypes paginated differently.
+ */
+export async function listAllPages(
+	fetchPage: (page: number) => Promise<{ ok: boolean; body: unknown }>
+): Promise<Record<string, unknown>[] | null> {
+	const rows: Record<string, unknown>[] = [];
+	let page = 1;
+	for (;;) {
+		const response = await fetchPage(page);
+		if (!response.ok) return null;
+		rows.push(...unwrapArchetypeCollection(response.body));
+		const totalPages = (response.body as { pagination?: { total_pages?: unknown } } | null)
+			?.pagination?.total_pages;
+		if (!Number.isInteger(totalPages)) return null;
+		if (page >= Math.max(1, totalPages as number)) return rows;
+		page += 1;
+	}
+}
 
 /** The schema, only if it is a POST schema — the one kind these operations serve. */
 export function postSchemaOf(contract: ContentContract, slug: string): ArchetypeSchema | null {
@@ -218,10 +280,17 @@ export function metaAttributes(
 		if (cleanString(row.group) !== 'web') continue;
 		const name = cleanString(row.name);
 		const id = cleanString(row.id);
-		if (!id || seen.has(name)) continue;
+		if (!id) continue;
+		if (seen.has(name)) {
+			// A SECOND row of the same name is what a no-id write left behind; `readMeta`
+			// shows the first, so the extra is invisible until it is not. Healed here,
+			// the way `coverAttributes` heals a duplicate cover row.
+			attributes.push({ id, _destroy: true });
+			continue;
+		}
+		seen.add(name);
 		const next = changes[name as (typeof META_NAMES)[number]];
 		if (next === undefined) continue;
-		seen.add(name);
 		attributes.push({ id, name, group: 'web', value_type: 'string', value: next });
 	}
 	return attributes;
@@ -378,34 +447,57 @@ export function buildBlocksAttributes(
 	current: ApexBlockRow[],
 	desired: DesiredBlock[]
 ): Record<string, unknown>[] {
-	const editable = current.filter(
-		(row) => row.blockableType === BLOCK_TYPE_RICH_TEXT || row.blockableType === BLOCK_TYPE_QUOTE
-	);
+	const isEditable = (row: ApexBlockRow) =>
+		row.blockableType === BLOCK_TYPE_RICH_TEXT || row.blockableType === BLOCK_TYPE_QUOTE;
+	const ordered = [...current].sort((a, b) => a.position - b.position);
+	const editable = ordered.filter(isEditable);
 	const byId = new Map(editable.map((row) => [row.id, row]));
 	const kept = new Set<string>();
-	const attributes: Record<string, unknown>[] = [];
 
-	desired.forEach((block, index) => {
+	// POSITIONS ARE ASSIGNED ACROSS EVERY BLOCK, IN DOCUMENT ORDER. A block the
+	// editor is not shown (a story's gallery image) keeps its SLOT — the index it
+	// held among all blocks — and the editor's blocks fill the remaining slots in
+	// the order the editor sent. Numbering only the editable blocks from 0 would
+	// leave the gallery block on its old number, so a reorder around it could land
+	// two blocks on one position and Apex would order them arbitrarily.
+	const slots = new Array<Record<string, unknown> | null>(ordered.length + desired.length).fill(
+		null
+	);
+	ordered.forEach((row, index) => {
+		if (!isEditable(row)) slots[index] = { id: row.id, position: index };
+	});
+	const queue = desired.map((block) => {
 		const existing = block.id ? byId.get(block.id) : undefined;
 		// An id whose KIND changed is not an update: `blockable_type` is a different
 		// table. It becomes a create here and a destroy below.
 		if (existing && existing.blockableType === typeOf(block.kind)) {
 			kept.add(existing.id);
-			attributes.push({
+			return {
 				id: existing.id,
-				position: index,
 				blockable_type: existing.blockableType,
 				blockable_attributes: { id: existing.blockableId, ...payloadOf(block) }
-			});
-			return;
+			};
 		}
-		attributes.push({
-			blockable_type: typeOf(block.kind),
-			position: index,
-			blockable_attributes: payloadOf(block)
-		});
+		return { blockable_type: typeOf(block.kind), blockable_attributes: payloadOf(block) };
 	});
+	let slot = 0;
+	for (const entry of queue) {
+		while (slots[slot]) slot += 1;
+		slots[slot] = { ...entry, position: slot };
+		slot += 1;
+	}
 
+	// Kept and created blocks in position order, then the untouched blocks' own
+	// position rows (so a gallery block's number is stated, never assumed), then
+	// the destroys.
+	const attributes: Record<string, unknown>[] = [];
+	const passthrough: Record<string, unknown>[] = [];
+	for (const entry of slots) {
+		if (!entry) continue;
+		if ('blockable_type' in entry) attributes.push(entry);
+		else passthrough.push(entry);
+	}
+	attributes.push(...passthrough);
 	for (const row of editable) {
 		if (!kept.has(row.id)) attributes.push({ id: row.id, _destroy: true });
 	}
@@ -541,20 +633,26 @@ export async function buildPostLoad(
 	};
 }
 
-/** The fixed audit metadata for one post route. Route PARAMETERS go in `detail`, never here. */
+/**
+ * The fixed audit metadata for one post route: the route's TEMPLATE, with the
+ * placeholders left in. A route parameter never belongs in `path` (`reject.ts`):
+ * it is attacker-controlled until validated, and an audited rejection has to be
+ * attributable to a route even when the id in it was junk. The validated schema
+ * and post id go in the row's `detail`, where every accepting operation already
+ * puts them.
+ */
 export function postRouteMeta(
 	request: Request,
 	action: string,
 	method: string,
-	schema: string,
-	postId?: string,
+	withPostId = false,
 	suffix = ''
 ): { action: string; method: string; path: string; requestId: string | null } {
-	const base = `/api/admin/posts/${schema}`;
+	const base = '/api/admin/posts/[schema]';
 	return {
 		action,
 		method,
-		path: postId ? `${base}/${postId}${suffix}` : base,
+		path: withPostId ? `${base}/[postId]${suffix}` : base,
 		requestId: request.headers.get('cf-ray')
 	};
 }

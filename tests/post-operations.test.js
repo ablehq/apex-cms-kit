@@ -4,9 +4,11 @@ import { describe, it } from 'node:test';
 
 import {
 	apexBlockRows,
+	apexValidationErrors,
 	buildBlocksAttributes,
 	computePostVersion,
 	coverAttributes,
+	listAllPages,
 	metaAttributes,
 	normalizeBlocks,
 	postSchemaOf,
@@ -25,6 +27,7 @@ import { handleCreatePost } from '../src/server/bff/operations/create-post.ts';
 import { handleDeletePost } from '../src/server/bff/operations/delete-post.ts';
 import { postStatusBodySchema } from '../src/server/bff/operations/patch-post-status.ts';
 import { countReferencesTo } from '../src/server/bff/operations/record-shape.ts';
+import { loadPostCatalogue } from '../src/server/bff/operations/post-list.ts';
 import { createApexAdminClient } from '../src/server/bff/apex-admin-client.ts';
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
@@ -200,8 +203,17 @@ describe('post body — the reconciliation, and what it never destroys', () => {
 			{ id: ID_A, kind: 'rich_text', html: '<p>One.</p>' },
 			{ id: ID_B, kind: 'quote', quote: 'Q.', quotedBy: 'W' }
 		]);
-		assert.equal(attributes.length, 2);
+		// Two editable rows by id, plus the gallery block's position-only row.
+		assert.equal(attributes.length, 3);
 		assert.ok(attributes.every((row) => row.id && !row._destroy));
+		assert.deepEqual(
+			attributes.map((row) => [row.id, row.position]),
+			[
+				[ID_A, 0],
+				[ID_B, 1],
+				[ID_C, 2]
+			]
+		);
 	});
 
 	it('NEVER destroys a GalleryItem block — a story body the editor was not shown', () => {
@@ -209,8 +221,59 @@ describe('post body — the reconciliation, and what it never destroys', () => {
 		// block is not in that list, and a save that did not mention it must not
 		// delete it. This is the block Godrej's story bodies carry.
 		const attributes = buildBlocksAttributes(apexBlockRows(apexBlocks()), []);
-		assert.deepEqual(attributes.map((row) => row.id).sort(), [ID_A, ID_B].sort());
-		assert.ok(!attributes.some((row) => row.id === ID_C));
+		assert.deepEqual(
+			attributes
+				.filter((row) => row._destroy)
+				.map((row) => row.id)
+				.sort(),
+			[ID_A, ID_B].sort()
+		);
+		const gallery = attributes.find((row) => row.id === ID_C);
+		assert.ok(gallery && !gallery._destroy, 'the gallery block survives');
+		assert.deepEqual(gallery, { id: ID_C, position: 2 }, 'and only its position is restated');
+	});
+
+	it('numbers positions across ALL blocks in document order — a gallery block keeps its slot', () => {
+		// Gallery block in the MIDDLE: [rich A @0, gallery C @1, quote B @2]. The editor
+		// swaps its two blocks. Numbering only the editable blocks from 0 would put B
+		// on 0 and A on 1 while the gallery stayed on 1 — a collision Apex resolves
+		// arbitrarily. Every block gets a distinct slot instead.
+		const current = apexBlockRows([
+			{
+				id: ID_A,
+				position: 0,
+				blockable_type: RICH,
+				blockable: { id: uuid(5), content_html: '<p>A</p>' }
+			},
+			{ id: ID_C, position: 1, blockable_type: GALLERY, blockable: { id: uuid(7) } },
+			{
+				id: ID_B,
+				position: 2,
+				blockable_type: QUOTE,
+				blockable: { id: uuid(6), quote: 'Q', quoted_by: 'W' }
+			}
+		]);
+		const attributes = buildBlocksAttributes(current, [
+			{ id: ID_B, kind: 'quote', quote: 'Q', quotedBy: 'W' },
+			{ id: ID_A, kind: 'rich_text', html: '<p>A</p>' },
+			{ id: null, kind: 'rich_text', html: '<p>new</p>' }
+		]);
+		const positions = attributes
+			.filter((row) => !row._destroy)
+			.map((row) => [row.id ?? 'new', row.position])
+			.sort((a, b) => a[1] - b[1]);
+		assert.deepEqual(positions, [
+			[ID_B, 0],
+			[ID_C, 1],
+			[ID_A, 2],
+			['new', 3]
+		]);
+		assert.equal(
+			new Set(positions.map(([, p]) => p)).size,
+			positions.length,
+			'no two blocks share a position'
+		);
+		assert.ok(!attributes.some((row) => row._destroy), 'nothing destroyed');
 	});
 
 	it('normalizes the two editable kinds and drops the gallery block from the editor', () => {
@@ -259,6 +322,23 @@ describe('SEO and the cover — written by id, never appended', () => {
 		]);
 		assert.deepEqual(metaAttributes({ meta_properties: [] }, { title: 'x' }), []);
 		assert.deepEqual(readMeta(view()), { title: 'M', description: 'D', keywords: 'K' });
+	});
+
+	it('heals a DUPLICATE SEO row a no-id write left behind — the extra is destroyed, the first kept', () => {
+		const v = view({
+			meta_properties: [
+				{ id: uuid(1), name: 'title', group: 'web', value: 'M' },
+				{ id: uuid(2), name: 'description', group: 'web', value: 'D' },
+				{ id: uuid(3), name: 'keywords', group: 'web', value: 'K' },
+				{ id: uuid(4), name: 'title', group: 'web', value: 'a duplicate' }
+			]
+		});
+		assert.deepEqual(metaAttributes(v, { description: 'D2' }), [
+			{ id: uuid(2), name: 'description', group: 'web', value_type: 'string', value: 'D2' },
+			{ id: uuid(4), _destroy: true }
+		]);
+		// The FIRST row is the one `readMeta` shows, so it is the one that survives.
+		assert.equal(readMeta(v).title, 'M');
 	});
 
 	it('creates the cover row only when none exists', () => {
@@ -453,7 +533,15 @@ function apexStub(calls, options = {}) {
 		async createPost(slug, target, fields) {
 			calls.push(['createPost', slug, target, fields]);
 			if (options.createStatus === 422) {
-				return { ok: false, status: 422, body: { data: [{ attribute_name: 'slug' }] } };
+				return {
+					ok: false,
+					status: 422,
+					body: {
+						data: options.createErrors ?? [
+							{ attribute_name: 'slug', messages: ['has already been taken'] }
+						]
+					}
+				};
 			}
 			return { ok: true, status: 200, body: { data: { id: ARCH, target_model_id: POST } } };
 		},
@@ -614,6 +702,43 @@ describe('create and update — what reaches Apex', () => {
 		);
 	});
 
+	it('reads Apex’s 422 body into field errors', () => {
+		assert.deepEqual(
+			apexValidationErrors({
+				data: [
+					{ attribute_name: 'published_date', messages: ['is invalid'] },
+					{ attribute_name: 'slug', messages: ['has already been taken'] },
+					'junk'
+				]
+			}),
+			[
+				{ attribute: 'published_date', messages: ['is invalid'] },
+				{ attribute: 'slug', messages: ['has already been taken'] }
+			]
+		);
+		assert.deepEqual(apexValidationErrors(null), []);
+	});
+
+	it('a 422 that is NOT about the slug is surfaced as 422 invalid with the field errors', async () => {
+		const calls = [];
+		const ctx = ctxWith(calls, {
+			createStatus: 422,
+			createErrors: [{ attribute_name: 'published_date', messages: ['is invalid'] }]
+		});
+		const session = await signIn(ctx);
+		const res = await handleCreatePost(
+			request('/api/admin/posts/story', 'POST', { title: 'T', slug: 'fine' }, session),
+			ctx,
+			{ schema: 'story' }
+		);
+		assert.equal(res.status, 422);
+		assert.deepEqual(await res.json(), {
+			error: 'invalid',
+			code: 'invalid',
+			errors: [{ attribute: 'published_date', messages: ['is invalid'] }]
+		});
+	});
+
 	it('a slug collision is a 409 the editor can act on', async () => {
 		const calls = [];
 		const ctx = ctxWith(calls, { createStatus: 422 });
@@ -671,6 +796,94 @@ describe('create and update — what reaches Apex', () => {
 			{ schema: 'story', postId: POST }
 		);
 		assert.equal(cleared.status, 200);
+	});
+});
+
+describe('the post list reads EVERY page of both surfaces', () => {
+	/** A paginating Apex: `count` rows per surface, `perPage` per page, joined by archetype id. */
+	function paginating(count, perPage) {
+		const views = Array.from({ length: count }, (_, i) => ({
+			...view({
+				id: `${String(i).padStart(8, '0')}-1111-2222-3333-444444444444`,
+				archetype_id: `${String(i).padStart(8, 'a')}-1111-2222-3333-444444444444`.replace(
+					/^a+/,
+					(m) => m.replace(/a/g, 'a')
+				),
+				title: `Post ${i}`
+			})
+		}));
+		// Archetype ids must be valid strings; use the view's archetype_id.
+		const archetypes = views.map((v, i) =>
+			archetype({
+				id: v.archetype_id,
+				primitives: { kind: i % 2 ? 'video' : 'article' },
+				archetype_items: []
+			})
+		);
+		const calls = [];
+		const page = (rows, n) => ({
+			ok: true,
+			status: 200,
+			body: {
+				data: rows.slice((n - 1) * perPage, n * perPage),
+				pagination: {
+					total_count: rows.length,
+					current_page: n,
+					total_pages: Math.max(1, Math.ceil(rows.length / perPage))
+				}
+			}
+		});
+		return {
+			calls,
+			async listPosts(slug, query) {
+				calls.push(['listPosts', query.page]);
+				return page(views, query.page);
+			},
+			async listPostArchetypes(slug, query) {
+				calls.push(['listPostArchetypes', query.page]);
+				return page(archetypes, query.page);
+			},
+			async listContentLibrary() {
+				return {
+					ok: true,
+					status: 200,
+					body: { data: [], pagination: { total_count: 0, current_page: 1, total_pages: 1 } }
+				};
+			}
+		};
+	}
+
+	it('joins every post to its archetype across three pages', async () => {
+		const apex = paginating(250, 100);
+		const catalogue = await loadPostCatalogue(contract, apex, 'story');
+		assert.equal(catalogue.posts.length, 250);
+		assert.ok(
+			catalogue.posts.every((post) => post.fields.kind !== ''),
+			'every post found its archetype half'
+		);
+		assert.deepEqual(
+			apex.calls.filter(([name]) => name === 'listPosts').map(([, p]) => p),
+			[1, 2, 3]
+		);
+		assert.deepEqual(
+			apex.calls.filter(([name]) => name === 'listPostArchetypes').map(([, p]) => p),
+			[1, 2, 3]
+		);
+	});
+
+	it('fails CLOSED when a page will not read or the pagination is missing', async () => {
+		assert.equal(await listAllPages(async () => ({ ok: false, body: null })), null);
+		assert.equal(
+			await listAllPages(async () => ({ ok: true, body: { data: [{ id: 'x' }] } })),
+			null
+		);
+		assert.deepEqual(
+			await listAllPages(async (n) => ({
+				ok: true,
+				body: { data: [{ id: `p${n}` }], pagination: { total_pages: 2 } }
+			})),
+			[{ id: 'p1' }, { id: 'p2' }]
+		);
 	});
 });
 

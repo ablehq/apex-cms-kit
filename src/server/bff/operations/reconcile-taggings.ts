@@ -200,14 +200,7 @@ export async function handleSetPostTags(
 ): Promise<Response> {
 	const contract = contractOf(ctx);
 	if (!contract) return noContractResponse();
-	const meta = postRouteMeta(
-		request,
-		'posts.tags.put',
-		'PUT',
-		params.schema,
-		params.postId,
-		'/tags'
-	);
+	const meta = postRouteMeta(request, 'posts.tags.put', 'PUT', true, '/tags');
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
 	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);

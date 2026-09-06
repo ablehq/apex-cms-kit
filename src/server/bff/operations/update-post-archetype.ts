@@ -48,14 +48,7 @@ export async function handleUpdatePostArchetype(
 ): Promise<Response> {
 	const contract = contractOf(ctx);
 	if (!contract) return noContractResponse();
-	const meta = postRouteMeta(
-		request,
-		'posts.update_archetype',
-		'PUT',
-		params.schema,
-		params.postId,
-		'/archetype'
-	);
+	const meta = postRouteMeta(request, 'posts.update_archetype', 'PUT', true, '/archetype');
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
 	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);

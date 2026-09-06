@@ -59,13 +59,13 @@ const post = {
 };
 
 /** A recording BFF double. `fail` forces one method to answer not-ok. */
-function makeClient({ fail = null, status = 500, version = 'v1' } = {}) {
+function makeClient({ fail = null, status = 500, version = 'v1', errors = undefined } = {}) {
 	const calls = [];
 	const ok =
 		(name) =>
 		async (...args) => {
 			calls.push({ name, args });
-			if (fail === name) return { ok: false, status };
+			if (fail === name) return errors ? { ok: false, status, errors } : { ok: false, status };
 			return { ok: true, status: 200 };
 		};
 	return {
@@ -260,6 +260,21 @@ describe('savePost — the write order, and what never runs after a failure', ()
 		const result = await savePost(draft, client);
 		assert.equal(result.status, 409);
 		assert.match(result.message, /already uses that address/u);
+	});
+
+	it('a 422 on the fields stage names the rejected field, and does NOT blame the address', async () => {
+		const client = makeClient({
+			fail: 'updatePost',
+			status: 422,
+			errors: [{ attribute: 'published_date', messages: ['is invalid'] }]
+		});
+		const draft = createPostDraft('story', post, 'v1', contract);
+		setPostField(draft, 'publishedDate', 'not-a-date');
+		const result = await savePost(draft, client);
+		assert.equal(result.status, 422);
+		assert.match(result.message, /A field was rejected: published_date is invalid\./u);
+		assert.doesNotMatch(result.message, /address/u);
+		assert.match(result.message, /Nothing after it was saved/u);
 	});
 
 	it('skips every stage that has nothing to write', async () => {

@@ -13,7 +13,8 @@ import {
 	postIdSchema,
 	postRouteMeta,
 	postSchemaOf,
-	readPostIds
+	readPostIds,
+	rejectedWriteResponse
 } from './post-shape';
 import type { PostFields } from '../apex-admin-client';
 import type { BffContext } from '../context';
@@ -69,7 +70,7 @@ export async function handleUpdatePost(
 ): Promise<Response> {
 	const contract = contractOf(ctx);
 	if (!contract) return noContractResponse();
-	const meta = postRouteMeta(request, 'posts.update', 'PATCH', params.schema, params.postId);
+	const meta = postRouteMeta(request, 'posts.update', 'PATCH', true);
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
 	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
@@ -134,7 +135,9 @@ export async function handleUpdatePost(
 		}
 	});
 
-	if (apexResponse.status === 422) return bffError(409, 'slug-taken');
+	// `409 slug-taken` only when the slug is what Apex refused; a rejected cover or
+	// a bad `published_date` is `422 invalid`, carrying Apex's field errors.
+	if (apexResponse.status === 422) return rejectedWriteResponse(apexResponse.body);
 	if (!apexResponse.ok) return bffError(502, 'upstream error');
 
 	// Re-read rather than echo: the write surface answers 200 for shapes it drops.

@@ -51,3 +51,11 @@ Cookies are `apex_admin_session` and `apex_bff_csrf` on every site.
     npm install
     npm test        # node --test over tests/
     npm run check   # tsc
+
+## Naming modules
+
+No module under `src/` may have a basename ending in `ts` or `js` (before its
+extension) — `list-posts.ts`, `objs.js`. Vite 6.2's package `exports` matcher treats a
+bare import of such a subpath as a hit for this package's `./*.ts` / `./*.js` patterns
+and looks for a file that does not exist, so the consumer's build fails while Node
+resolves it fine (measured 2026-09-05). `tests/module-names.test.js` enforces the rule.

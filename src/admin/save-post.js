@@ -33,15 +33,36 @@ export const STALE_MESSAGE =
 	'This was changed somewhere else since you opened it. Reload to get the latest version, then re-apply your changes.';
 
 /**
- * @param {string} stage @param {number} [status]
+ * Apex's field errors, as the BFF forwards them on a 422 (`{ errors: [{ attribute,
+ * messages }] }`), in a sentence: "published_date is invalid".
+ * @param {any} res
  */
-function messageFor(stage, status) {
+function fieldErrors(res) {
+	const errors = Array.isArray(res?.errors) ? res.errors : [];
+	return errors
+		.map((/** @type {any} */ e) =>
+			`${e.attribute} ${Array.isArray(e.messages) ? e.messages.join(', ') : ''}`.trim()
+		)
+		.filter(Boolean)
+		.join('; ');
+}
+
+/**
+ * @param {string} stage @param {any} res
+ */
+function messageFor(stage, res) {
+	const status = res?.status;
 	if (stage === 'fields') {
-		return status === 409
-			? 'Another post already uses that address. Nothing after it was saved; choose a different one and Save again.'
-			: status === 422
-				? 'A field was rejected. Nothing after it was saved; fix it and Save again.'
-				: 'Saving failed. Nothing after it was saved — Save again to retry.';
+		if (status === 409) {
+			// The ONLY case the address is the problem: the BFF answers 409 solely when
+			// Apex's errors name the slug.
+			return 'Another post already uses that address. Nothing after it was saved; choose a different one and Save again.';
+		}
+		if (status === 422) {
+			const detail = fieldErrors(res);
+			return `${detail ? `A field was rejected: ${detail}.` : 'A field was rejected.'} Nothing after it was saved; fix it and Save again.`;
+		}
+		return 'Saving failed. Nothing after it was saved — Save again to retry.';
 	}
 	if (stage === 'body') {
 		return 'The body could not be saved. Your field edits were saved; Save again to retry.';
@@ -102,7 +123,7 @@ export async function savePost(draft, client, options = {}) {
 				ok: false,
 				stage: 'fields',
 				status: res.status,
-				message: messageFor('fields', res.status)
+				message: messageFor('fields', res)
 			};
 		}
 	}
@@ -115,7 +136,7 @@ export async function savePost(draft, client, options = {}) {
 				ok: false,
 				stage: 'body',
 				status: res.status,
-				message: messageFor('body', res.status)
+				message: messageFor('body', res)
 			};
 		}
 	}
@@ -128,7 +149,7 @@ export async function savePost(draft, client, options = {}) {
 				ok: false,
 				stage: 'archetype',
 				status: res.status,
-				message: messageFor('archetype', res.status)
+				message: messageFor('archetype', res)
 			};
 		}
 	}
@@ -142,7 +163,7 @@ export async function savePost(draft, client, options = {}) {
 				ok: false,
 				stage: 'tags',
 				status: res.status,
-				message: messageFor('tags', res.status)
+				message: messageFor('tags', res)
 			};
 		}
 	}
@@ -155,7 +176,7 @@ export async function savePost(draft, client, options = {}) {
 				ok: false,
 				stage: 'status',
 				status: res.status,
-				message: messageFor('status', res.status)
+				message: messageFor('status', res)
 			};
 		}
 	}

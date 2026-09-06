@@ -29,14 +29,7 @@ export async function handlePatchPostStatus(
 ): Promise<Response> {
 	const contract = contractOf(ctx);
 	if (!contract) return noContractResponse();
-	const meta = postRouteMeta(
-		request,
-		'posts.status_event',
-		'POST',
-		params.schema,
-		params.postId,
-		'/status'
-	);
+	const meta = postRouteMeta(request, 'posts.status_event', 'POST', true, '/status');
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
 	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
