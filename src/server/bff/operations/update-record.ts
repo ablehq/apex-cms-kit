@@ -24,6 +24,11 @@ import type { BffContext } from '../context';
  * every key is optional and why an empty patch is a 400 rather than a no-op — a
  * save that sends nothing is a bug in the caller, not a request.
  *
+ * `position` — the archetype's own ordering column — travels at the ROOT of the
+ * body, not inside `fields`, because that is where Apex permits it and because it
+ * is not a declared field: it has no `field_def`, no validator kind, and no entry
+ * in the contract. It is the one key here where `null` is legitimate.
+ *
  * Three things make the destructive `null` unspellable on a primitive rather than
  * merely discouraged, and all three are deliberate belt-and-braces:
  *
@@ -86,7 +91,14 @@ export async function handleUpdateRecord(
 
 	const fields = toApexFields(parsed.data.fields ?? {});
 	const wantedReferences = parsed.data.references ?? {};
-	if (Object.keys(fields).length === 0 && Object.keys(wantedReferences).length === 0) {
+	// `position` counts as a change. Left out of this test it would be sent, and
+	// persisted, while a patch carrying ONLY a reorder answered 400 "empty patch".
+	const position = parsed.data.position;
+	if (
+		Object.keys(fields).length === 0 &&
+		Object.keys(wantedReferences).length === 0 &&
+		position === undefined
+	) {
 		return rejectMutation(ctx, actorMeta, 400, 'empty patch', 'empty patch');
 	}
 
@@ -137,7 +149,8 @@ export async function handleUpdateRecord(
 		params.schema,
 		idResult.data,
 		fields,
-		references
+		references,
+		position
 	);
 
 	await auditOutcome(ctx, meta, guard.actor, {
@@ -146,6 +159,9 @@ export async function handleUpdateRecord(
 			schema: params.schema,
 			recordId: idResult.data,
 			fields: Object.keys(fields),
+			// A reorder changes what a visitor sees and touches no field, so without
+			// this an audit row for one would be indistinguishable from a no-op.
+			...(position === undefined ? {} : { position }),
 			// The reference diff is the part of this write with the most ways to go
 			// wrong and the fewest traces, so the shape that travelled is recorded.
 			references: Object.fromEntries(

@@ -28,6 +28,20 @@ export interface AdminRecord {
 	id: string;
 	updatedAt: string;
 	/**
+	 * The archetype's own ordering COLUMN — not a declared field, which is why it
+	 * sits beside `fields` rather than in it.
+	 *
+	 * `null` when the record carries none, which is a legal upstream state and is
+	 * what a record created without one holds. It is NOT the destructive `null` the
+	 * primitive rule is about: `position` is a column on the archetype, not an
+	 * `archetype_item`, so clearing it strands nothing.
+	 *
+	 * The kit dropped it until P3. A site that sorts its public lists by `position`
+	 * — Poovayya does, in five places — had no way to read or write the ordering the
+	 * page is drawn in, and ordering is not a schema primitive it could add.
+	 */
+	position: number | null;
+	/**
 	 * The primitive field values, by field name, UNNARROWED.
 	 *
 	 * Not `Record<string, string>`, and that is the §4.4 finding made structural:
@@ -60,7 +74,25 @@ export function summarizeRecord(
 	for (const item of contract.referenceItems(slug)) {
 		references[item.name] = readReferences(record, item.name);
 	}
-	return { id: cleanString(record.id), updatedAt: readUpdatedAt(record), fields, references };
+	return {
+		id: cleanString(record.id),
+		updatedAt: readUpdatedAt(record),
+		position: readPosition(record),
+		fields,
+		references
+	};
+}
+
+/**
+ * The archetype's `position` column, or null.
+ *
+ * Anything that is not a finite number reads as "unset" rather than as `0`.
+ * Coercing here would be worse than dropping it: `0` is a real ordering value and a
+ * record that never had one would jump to the front of every list.
+ */
+export function readPosition(record: Record<string, unknown>): number | null {
+	const value = record.position;
+	return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
 /**
@@ -98,7 +130,18 @@ export function recordBodySchema(contract: ContentContract, slug: string) {
 	return z
 		.object({
 			fields: z.object(fieldsShape).strict().optional(),
-			references: z.object(referencesShape).strict().optional()
+			references: z.object(referencesShape).strict().optional(),
+			/**
+			 * The archetype's ordering column, at the ROOT of the payload — which is
+			 * where Apex permits it (`archetype_models_controller.rb:181`, `:position`
+			 * alongside the field names) and why it is not inside `fields`, whose names
+			 * are checked against the contract.
+			 *
+			 * `null` is ALLOWED here and only here. On a primitive it destroys the
+			 * `archetype_item` row and strands the old value where the public site
+			 * reads it; on this column it just clears the ordering.
+			 */
+			position: z.number().int().nullable().optional()
 		})
 		.strict();
 }

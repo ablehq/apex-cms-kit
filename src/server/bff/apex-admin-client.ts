@@ -257,11 +257,19 @@ export interface ApexAdminClient {
 		fields: ContentLibraryFields,
 		references?: Record<string, HasManyEntry[] | string | null>
 	): Promise<ApexResponse>;
+	/**
+	 * `position` is the archetype's own ordering COLUMN and travels at the root of
+	 * the body beside the field names, which is where Apex permits it. It is a
+	 * separate parameter rather than a key in `fields` because `ContentLibraryFields`
+	 * forbids `null` — correctly, for primitives — and `null` on this column is the
+	 * legitimate "unset". `undefined` means "not part of this write".
+	 */
 	updateContentLibraryRecord(
 		slug: string,
 		id: string,
 		fields: ContentLibraryFields,
-		references?: Record<string, HasManyEntry[] | string | null>
+		references?: Record<string, HasManyEntry[] | string | null>,
+		position?: number | null
 	): Promise<ApexResponse>;
 	deleteContentLibraryRecord(slug: string, id: string): Promise<ApexResponse>;
 	getDocument(documentId: string): Promise<ApexResponse>;
@@ -622,7 +630,7 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 				body: JSON.stringify({ ...fields, ...references })
 			});
 		},
-		async updateContentLibraryRecord(slug, id, fields, references = {}) {
+		async updateContentLibraryRecord(slug, id, fields, references = {}, position) {
 			assertUuid(id);
 			// FLAT keys on `archetype_models` — the one write of the five that persists
 			// (probes W1–W5). The other four are documented on `updateSermonTranscript`
@@ -631,8 +639,17 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 				`${ARCHETYPE_SCHEMAS_BASE}/${contentLibrarySlug(slug)}/archetype_models/${encodeURIComponent(id)}`,
 				// Reference values ride in the same body under their item name: a `has_one`
 				// is a bare id (or `null` to clear), a `has_many` the all-hash diff array
-				// documented on `HasManyEntry`.
-				{ method: 'PATCH', body: JSON.stringify({ ...fields, ...references }) }
+				// documented on `HasManyEntry`. `position` is the archetype's own column
+				// and rides at the root too — omitted entirely when the caller passed
+				// `undefined`, because sending `null` would CLEAR it.
+				{
+					method: 'PATCH',
+					body: JSON.stringify({
+						...fields,
+						...references,
+						...(position === undefined ? {} : { position })
+					})
+				}
 			);
 		},
 		async deleteContentLibraryRecord(slug, id) {

@@ -72,6 +72,14 @@ export async function handleCreateRecord(
 	if (parsed.data.references && Object.keys(parsed.data.references).length > 0) {
 		return rejectMutation(ctx, actorMeta, 400, 'references on create', 'references on create');
 	}
+	// NOR IS `position` WRITABLE ON CREATE, and it is refused rather than dropped.
+	// `recordBodySchema` accepts the key for the UPDATE path, so without this line a
+	// create carrying one would parse, be ignored, and answer 201 — a create that
+	// silently did not do what it was asked. Ordering is set on the screen that
+	// opens a moment later, through the update path that actually sends it.
+	if (parsed.data.position !== undefined) {
+		return rejectMutation(ctx, actorMeta, 400, 'position on create', 'position on create');
+	}
 
 	const fields = toApexFields(parsed.data.fields ?? {});
 	const apexResponse = await guard.apex.createContentLibraryRecord(params.schema, fields);

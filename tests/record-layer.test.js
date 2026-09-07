@@ -2,9 +2,14 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { hasManyDiff, countReferencesTo } from '../src/server/bff/operations/record-shape.ts';
+import {
+	hasManyDiff,
+	countReferencesTo,
+	summarizeRecord
+} from '../src/server/bff/operations/record-shape.ts';
 import { handleDeleteRecord } from '../src/server/bff/operations/delete-record.ts';
 import { handleCreateRecord } from '../src/server/bff/operations/create-record.ts';
+import { handleUpdateRecord } from '../src/server/bff/operations/update-record.ts';
 import { createApexAdminClient } from '../src/server/bff/apex-admin-client.ts';
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
@@ -12,6 +17,8 @@ import { createMemorySessionStore } from './harness/session-store.ts';
 
 const ORIGIN = 'https://site.test';
 const CSRF = 'csrf-record';
+/** A uuid, because every record operation validates the id shape before using it. */
+const RECORD_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 
 /**
  * A two-schema content model: `story` (a post, uncountable) and `partner` both point
@@ -453,5 +460,186 @@ describe('the write path refuses what must never reach Apex', () => {
 		});
 		assert.equal(response.status, 500);
 		assert.equal(response.headers.get('content-type'), 'application/json');
+	});
+
+	it('refuses `position` on CREATE rather than dropping it', async () => {
+		// `recordBodySchema` accepts the key for the update path, so without an
+		// explicit refusal a create carrying one would parse, be ignored, and answer
+		// 201 — a create that silently did not do what it was asked.
+		const apex = apexRecording();
+		const ctx = ctxWith(apex);
+		const response = await handleCreateRecord(
+			post(await signIn(ctx), { fields: { title: 'x' }, position: 3 }),
+			ctx,
+			{ schema: 'focus_area' }
+		);
+		assert.equal(response.status, 400);
+		assert.equal(apex.writes.length, 0, 'nothing was written');
+	});
+
+	/**
+	 * RECORD `position` — the archetype's own ordering column (plan §2.1.2).
+	 *
+	 * The kit's record response omitted it and its write schema was `.strict()` over
+	 * `fields` and `references` only, so a site that sorts its public lists by
+	 * `position` — Poovayya does, in five places — could neither read nor write the
+	 * order its pages are drawn in. Ordering is not a schema primitive, so it could
+	 * not be added as a field.
+	 *
+	 * Proved LIVE against local Apex on 2026-09-07 as well as here: a `team_member`
+	 * read back `position: 12`, a PATCH of `{position: 77}` answered 200, and an
+	 * independent re-read returned 77.
+	 */
+	describe('record position', () => {
+		function apexWithPosition(record) {
+			const writes = [];
+			return {
+				writes,
+				async getContentLibraryRecord() {
+					return { status: 200, ok: true, body: { data: record } };
+				},
+				async updateContentLibraryRecord(slug, id, fields, references, position) {
+					writes.push({ slug, id, fields, references, position });
+					return { status: 200, ok: true, body: { data: record } };
+				}
+			};
+		}
+		function patch(session, body) {
+			return new Request(`${ORIGIN}/api/admin/records/focus_area/${RECORD_ID}`, {
+				method: 'PATCH',
+				headers: {
+					origin: ORIGIN,
+					'sec-fetch-site': 'same-origin',
+					'x-csrf-token': CSRF,
+					'content-type': 'application/json',
+					cookie: `apex_admin_session=${session}; apex_bff_csrf=${CSRF}`
+				},
+				body: JSON.stringify(body)
+			});
+		}
+
+		it('is read onto the record, and an absent one is null rather than 0', () => {
+			assert.equal(
+				summarizeRecord(fieldContract, 'focus_area', { id: 'a', position: 4 }).position,
+				4
+			);
+			assert.equal(summarizeRecord(fieldContract, 'focus_area', { id: 'a' }).position, null);
+			// `0` is a real ordering value; coercing an absent one to it would jump a
+			// record that never had a position to the front of every list.
+			assert.equal(
+				summarizeRecord(fieldContract, 'focus_area', { id: 'a', position: 0 }).position,
+				0
+			);
+			assert.equal(
+				summarizeRecord(fieldContract, 'focus_area', { id: 'a', position: '3' }).position,
+				null
+			);
+		});
+
+		it('travels at the ROOT of the write, not inside fields', async () => {
+			const apex = apexWithPosition({ id: RECORD_ID, position: 9, updated_at: 'then' });
+			const ctx = ctxWith(apex);
+			const response = await handleUpdateRecord(patch(await signIn(ctx), { position: 9 }), ctx, {
+				schema: 'focus_area',
+				recordId: RECORD_ID
+			});
+			assert.equal(response.status, 200, await response.clone().text());
+			assert.equal(apex.writes.length, 1);
+			assert.equal(apex.writes[0].position, 9);
+			assert.deepEqual(apex.writes[0].fields, {}, 'position is not a field');
+			assert.equal((await response.json()).record.position, 9);
+		});
+
+		it('a reorder-only patch is a real change, not an "empty patch"', async () => {
+			// The empty-patch check counts `position`. Left out of it, a patch carrying
+			// only a reorder would be refused 400 while the reorder is exactly the change
+			// an editor made.
+			const apex = apexWithPosition({ id: RECORD_ID, position: 2, updated_at: 'then' });
+			const ctx = ctxWith(apex);
+			const response = await handleUpdateRecord(patch(await signIn(ctx), { position: 2 }), ctx, {
+				schema: 'focus_area',
+				recordId: RECORD_ID
+			});
+			assert.equal(response.status, 200);
+		});
+
+		it('`null` clears it, and `undefined` is not sent at all', async () => {
+			const apex = apexWithPosition({ id: RECORD_ID, updated_at: 'then' });
+			const ctx = ctxWith(apex);
+			assert.equal(
+				(
+					await handleUpdateRecord(patch(await signIn(ctx), { position: null }), ctx, {
+						schema: 'focus_area',
+						recordId: RECORD_ID
+					})
+				).status,
+				200
+			);
+			assert.equal(apex.writes[0].position, null, 'null clears the column');
+
+			const other = apexWithPosition({ id: RECORD_ID, updated_at: 'then' });
+			const ctx2 = ctxWith(other);
+			await handleUpdateRecord(patch(await signIn(ctx2), { fields: { title: 'x' } }), ctx2, {
+				schema: 'focus_area',
+				recordId: RECORD_ID
+			});
+			assert.equal(other.writes[0].position, undefined, 'an untouched position is not written');
+		});
+
+		it('the client omits the key entirely for `undefined` and sends it for `null`', async () => {
+			// A `position: null` in the JSON body CLEARS the column upstream, so
+			// "unchanged" has to be an absent key rather than a null one. This is the
+			// only place that distinction is visible on the wire.
+			const bodies = [];
+			const client = createApexAdminClient({
+				baseUrl: 'https://apex.test',
+				token: 't',
+				fetchImpl: async (_url, init) => {
+					bodies.push(JSON.parse(init.body));
+					return new Response('{}', {
+						status: 200,
+						headers: { 'content-type': 'application/json' }
+					});
+				}
+			});
+			await client.updateContentLibraryRecord('focus_area', RECORD_ID, { title: 'a' });
+			await client.updateContentLibraryRecord('focus_area', RECORD_ID, {}, {}, null);
+			await client.updateContentLibraryRecord('focus_area', RECORD_ID, {}, {}, 5);
+			// A schema MAY carry a primitive field of its own called `position` — Apex
+			// permits `:position` at the root beside the field names, so the two share a
+			// key. An unpassed ordering must not clobber the field: spreading a bare
+			// `position` would write `undefined` over it and JSON.stringify would then
+			// drop the field entirely, silently discarding a value the editor typed.
+			await client.updateContentLibraryRecord('focus_area', RECORD_ID, { position: 'third' });
+			await client.updateContentLibraryRecord(
+				'focus_area',
+				RECORD_ID,
+				{ position: 'third' },
+				{},
+				7
+			);
+			assert.equal('position' in bodies[0], false);
+			assert.equal(bodies[1].position, null);
+			assert.equal(bodies[2].position, 5);
+			assert.equal(bodies[3].position, 'third', 'an unpassed ordering leaves the field alone');
+			assert.equal(bodies[4].position, 7, 'an explicit ordering wins');
+		});
+
+		it('refuses a position that is not an integer', async () => {
+			const apex = apexWithPosition({ id: RECORD_ID, updated_at: 'then' });
+			const ctx = ctxWith(apex);
+			for (const value of [1.5, '2', true]) {
+				const response = await handleUpdateRecord(
+					patch(await signIn(ctx), { position: value }),
+					ctx,
+					{
+						schema: 'focus_area',
+						recordId: RECORD_ID
+					}
+				);
+				assert.equal(response.status, 400, `position ${JSON.stringify(value)} is refused`);
+			}
+			assert.equal(apex.writes.length, 0);
+		});
 	});
 });
