@@ -32,14 +32,28 @@ export async function handleDeleteImage(
 	options: { gallery?: string } = {}
 ): Promise<Response> {
 	const gallery = options.gallery ?? 'images';
-	// The audit row names the gallery actually addressed — never "images" for a file.
+	/**
+	 * NEITHER AUDIT COLUMN TAKES A CALLER'S STRING.
+	 *
+	 * This meta is built BEFORE `imageIdSchema` runs, so `${params.imageId}` in the
+	 * path wrote an arbitrary caller-supplied value into `bff_audit_log.path` on every
+	 * refused request — the rule `reject.ts` states and every other operation follows.
+	 * `gallery` is the same hazard one step removed: Godrej's route wrapper validates
+	 * it against `isLibraryGallery` before delegating, but this operation is the one
+	 * that WRITES the row and must not depend on a caller doing that.
+	 *
+	 * So the path is the route TEMPLATE and `action` is narrowed to a name this kit
+	 * actually serves. The validated id goes in `detail` once there is one.
+	 */
+	const known = (GALLERY_NAMES as readonly string[]).includes(gallery);
 	const meta = {
-		action: `${gallery}.delete`,
+		// The audit row names the gallery actually addressed — never "images" for a file.
+		action: `${known ? gallery : 'gallery'}.delete`,
 		method: 'DELETE',
 		path:
-			gallery === 'images'
-				? `/api/admin/images/${params.imageId}`
-				: `/api/admin/galleries/${gallery}/${params.imageId}`,
+			known && gallery === 'images'
+				? '/api/admin/images/[imageId]'
+				: '/api/admin/galleries/[gallery]/[imageId]',
 		requestId: request.headers.get('cf-ray')
 	};
 

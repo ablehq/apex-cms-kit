@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
 	allowRichTextClasses,
+	allowRichTextTags,
 	decodeReferences,
 	isSafeUrl,
 	plainTextForAttribute,
@@ -377,4 +378,33 @@ test('the paragraph sink is total over odd input and keeps its output inert', ()
 			`${entry.name}: sink emitted an event handler — ${output}`
 		);
 	}
+});
+
+/**
+ * DECLARED LAST ON PURPOSE. `ALLOWED_TAGS` is module state, so a test that widens
+ * it would widen it for every test after it in this file. Nothing follows.
+ */
+test('a site may add a PRESENTATIONAL element, and may not add an executable one', () => {
+	// The default list is an editorial decision — `h1` is off it because a page has
+	// one `h1` — and one site's rich text is authored against a different decision.
+	// Poovayya's hero headline is an authored `<h1>`; unwrapping it resizes a live
+	// homepage, which is not a price a security fix should quietly charge.
+	assert.equal(sanitizeHtml('<mark>x</mark>'), 'x', 'unknown tags are unwrapped by default');
+	allowRichTextTags(['MARK']);
+	assert.equal(sanitizeHtml('<mark>x</mark>'), '<mark>x</mark>', 'and case-folded on the way in');
+
+	// The bound: an element that executes, loads or carries executable children is
+	// refused OUT LOUD, so a caller cannot believe the call did something.
+	for (const executable of ['script', 'svg', 'iframe', 'object', 'math', 'style']) {
+		assert.throws(
+			() => allowRichTextTags([executable]),
+			/refusing to allow an executable element/u
+		);
+	}
+	for (const nonsense of ['a b', '<script>', '', 'div/script', 'h1!']) {
+		assert.throws(() => allowRichTextTags([nonsense]), /not an element name/u);
+	}
+	// And the refusal really is a refusal, not a partial application.
+	assert.equal(sanitizeHtml('<script>alert(1)</script>'), '');
+	assert.equal(sanitizeHtml('<svg><animate/></svg>'), '');
 });

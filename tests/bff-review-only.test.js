@@ -9,6 +9,7 @@ import { handlePatchPageStatus } from '../src/server/bff/operations/patch-page-s
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
 import { createMemorySessionStore } from './harness/session-store.ts';
+import { createMigratedDatabase } from './harness/d1.ts';
 
 const ORIGIN = 'https://site.test';
 const CSRF = 'csrf-review-only';
@@ -186,6 +187,61 @@ describe('the three kit operations that enforce the review-only rule', () => {
 			// the code, not the status.
 			const error = response.status === 400 ? (await response.json()).error : null;
 			assert.notEqual(error, 'field not allowed', `${testCase.name} should not be gated`);
+		});
+	}
+});
+
+describe('a page operation puts NO unvalidated route input in an audit column', () => {
+	/**
+	 * codex on P4, finding 3. Both page operations built their meta with
+	 * `pageId: params.pageId` BEFORE `pageIdSchema` ran, and `auditRejection` writes
+	 * that to its own indexed `page_id` column — so a refused request stored an
+	 * arbitrary caller-supplied string, which is the same rule `path` already
+	 * follows. The id is added back the moment there IS a validated one.
+	 */
+	const injected = '../../etc/passwd<script>alert(1)</script>';
+
+	for (const [name, run] of [
+		['page status', (request, ctx, pageId) => handlePatchPageStatus(request, ctx, { pageId })],
+		[
+			'page structure save',
+			(request, ctx, pageId) => handleSavePageStructure(request, ctx, { pageId })
+		]
+	]) {
+		it(`${name}: a bad page id is audited with the TEMPLATE and no page_id`, async () => {
+			const db = await createMigratedDatabase();
+			const ctx = { ...ctxWith([]), db };
+			const session = await signIn(ctx);
+			const response = await run(
+				write(session, '/api/admin/pages/x/status', { status_event: 'publish' }),
+				ctx,
+				injected
+			);
+			assert.equal(response.status, 400);
+			const { results } = await db.prepare('SELECT * FROM bff_audit_log').bind().all();
+			assert.equal(results.length, 1, 'the refusal IS audited');
+			assert.equal(results[0].page_id, null, 'but not with the caller’s string');
+			assert.doesNotMatch(results[0].path, /script|passwd/u);
+			db.close();
+		});
+
+		it(`${name}: a LATER refusal still records the validated id`, async () => {
+			// The information must not be lost with the hazard: once the id has passed
+			// `pageIdSchema` it belongs in the column, and every refusal after that point
+			// carries it.
+			const db = await createMigratedDatabase();
+			const ctx = { ...ctxWith([]), db };
+			const session = await signIn(ctx);
+			const response = await run(
+				write(session, `/api/admin/pages/${PAGE_ID}/status`, { nonsense: true }),
+				ctx,
+				PAGE_ID
+			);
+			assert.equal(response.status, 400);
+			const { results } = await db.prepare('SELECT * FROM bff_audit_log').bind().all();
+			assert.equal(results.length, 1);
+			assert.equal(results[0].page_id, PAGE_ID);
+			db.close();
 		});
 	}
 });

@@ -137,8 +137,19 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 		readVersion(pageId) {
 			return get(`/api/admin/pages/${pageId}/version`);
 		},
+		/**
+		 * BOTH SEGMENTS ARE ENCODED. The server validates and encodes them again
+		 * (`assertEntityTypeRef` / `assertUuid` in `apex-admin-client.ts`), which is
+		 * where the guarantee lives — but the URL built HERE decides which of OUR OWN
+		 * routes the request reaches, and that is decided before any of that runs. A
+		 * caller passing `..` would address a different admin route entirely, and P4a
+		 * widened the type segment from a uuid to a SLUG, which is the shape a caller
+		 * is most likely to build from something it read.
+		 */
 		patchEntityFields(entityTypeId, entityId, fieldsData) {
-			return mutate(`/api/admin/entities/${entityTypeId}/${entityId}`, 'PATCH', {
+			const type = encodeURIComponent(entityTypeId);
+			const id = encodeURIComponent(entityId);
+			return mutate(`/api/admin/entities/${type}/${id}`, 'PATCH', {
 				fields_data: fieldsData
 			});
 		},

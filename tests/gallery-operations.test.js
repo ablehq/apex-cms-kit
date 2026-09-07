@@ -246,10 +246,47 @@ describe('cross-gallery membership — the check every edit and delete stands on
 			const row = audit[0];
 			assert.ok(row, 'an audit row was written');
 			assert.ok(row.includes(`files.${op}`), `audit action names the gallery: ${row.join('|')}`);
+			// The route TEMPLATE, with BOTH placeholders left in. It used to interpolate
+			// `gallery` and `imageId`, and the meta carrying them is built before either
+			// is validated — so a refused request wrote a caller-supplied string into an
+			// indexed column (codex on P4, finding 3).
 			assert.ok(
-				row.some((v) => typeof v === 'string' && v.startsWith('/api/admin/galleries/files/')),
-				'audit path is the route addressed'
+				row.includes('/api/admin/galleries/[gallery]/[imageId]'),
+				`audit path is the route TEMPLATE: ${row.join('|')}`
 			);
+			// The validated id is still recorded — in `detail`, which is where a value
+			// belongs once it has been checked.
+			assert.ok(
+				row.some((v) => typeof v === 'string' && v.includes(FILE)),
+				'the id is still recorded, in a column that is not `path`'
+			);
+		});
+
+		it(`${op}: a bad id and an unknown gallery reach NEITHER audit column`, async () => {
+			// The refusal path is the one on which the interpolated value actually landed:
+			// the id fails `imageIdSchema` AFTER the meta is built, and that refusal is
+			// audited.
+			const calls = [];
+			const audit = [];
+			const ctx = ctxWith(calls, audit);
+			const session = await signIn(ctx);
+			const method = op === 'update' ? 'PATCH' : 'DELETE';
+			const body = op === 'update' ? { caption: 'renamed' } : undefined;
+			const injected = '../../secrets<script>alert(1)</script>';
+			const bad = await run(
+				req(session, '/api/admin/galleries/files/x', method, body),
+				ctx,
+				injected,
+				injected
+			);
+			assert.equal(bad.status, 400);
+			const row = audit[0];
+			assert.ok(row, 'the refusal IS audited');
+			assert.ok(
+				!row.some((v) => typeof v === 'string' && /script|secrets/u.test(v)),
+				`no caller string in any column: ${row.join('|')}`
+			);
+			assert.ok(row.includes('gallery.' + op), 'an unknown gallery is not named either');
 		});
 	}
 

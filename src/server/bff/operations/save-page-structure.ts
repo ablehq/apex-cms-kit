@@ -127,7 +127,10 @@ export async function handleSavePageStructure(
 		// the audit table's `path` on every refused request. The validated values go
 		// in `detail`.
 		path: '/api/admin/pages/[pageId]/structure',
-		pageId: params.pageId,
+		// NO `pageId` HERE. `auditRejection` writes it to its own indexed column, and
+		// this meta is built before `pageIdSchema` runs — so an unvalidated route
+		// parameter reached that column on every guard failure. It is added below, once
+		// there is a validated id to add.
 		requestId: request.headers.get('cf-ray')
 	};
 
@@ -139,20 +142,22 @@ export async function handleSavePageStructure(
 	const idResult = pageIdSchema.safeParse(params.pageId);
 	if (!idResult.success)
 		return rejectMutation(ctx, actorMeta, 400, 'invalid page id', 'invalid page id');
+	// From here the id HAS been validated, so it may go in the column it belongs in.
+	const validMeta = { ...actorMeta, pageId: idResult.data };
 
 	let bodyJson: unknown;
 	try {
 		bodyJson = await request.json();
 	} catch {
-		return rejectMutation(ctx, actorMeta, 400, 'invalid json', 'invalid json');
+		return rejectMutation(ctx, validMeta, 400, 'invalid json', 'invalid json');
 	}
 
 	if (containsReviewOnlyField(bodyJson, ctx.reviewOnlyFields)) {
-		return rejectMutation(ctx, actorMeta, 400, 'field not allowed', 'review-only field');
+		return rejectMutation(ctx, validMeta, 400, 'field not allowed', 'review-only field');
 	}
 
 	const parsed = savePageStructureBodySchema.safeParse(bodyJson);
-	if (!parsed.success) return rejectMutation(ctx, actorMeta, 400, 'invalid body', 'invalid body');
+	if (!parsed.success) return rejectMutation(ctx, validMeta, 400, 'invalid body', 'invalid body');
 
 	// Ownership: every id the body names must be in the addressed page's tree, read
 	// FRESH here (never from the body). Anything else is refused before the PATCH,
@@ -169,7 +174,7 @@ export async function handleSavePageStructure(
 	if (foreign) {
 		return rejectMutation(
 			ctx,
-			{ ...actorMeta, detail: { key: foreign.key } },
+			{ ...validMeta, detail: { key: foreign.key } },
 			400,
 			'block not on this page',
 			'foreign id'

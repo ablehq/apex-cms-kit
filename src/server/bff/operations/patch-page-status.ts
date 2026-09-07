@@ -45,7 +45,10 @@ export async function handlePatchPageStatus(
 		// the audit table's `path` on every refused request. The validated values go
 		// in `detail`.
 		path: '/api/admin/pages/[pageId]/status',
-		pageId: params.pageId,
+		// NO `pageId` HERE. `auditRejection` writes it to its own indexed column, and
+		// this meta is built before `pageIdSchema` runs — so an unvalidated route
+		// parameter reached that column on every guard failure. It is added below, once
+		// there is a validated id to add.
 		requestId: request.headers.get('cf-ray')
 	};
 
@@ -62,18 +65,14 @@ export async function handlePatchPageStatus(
 			'invalid page id'
 		);
 	}
+	// From here the id HAS been validated, so it may go in the column it belongs in.
+	const validMeta = { ...meta, actorEmail: guard.actor.email, pageId: idResult.data };
 
 	let bodyJson: unknown;
 	try {
 		bodyJson = await request.json();
 	} catch {
-		return rejectMutation(
-			ctx,
-			{ ...meta, actorEmail: guard.actor.email },
-			400,
-			'invalid json',
-			'invalid json'
-		);
+		return rejectMutation(ctx, validMeta, 400, 'invalid json', 'invalid json');
 	}
 
 	if (
@@ -81,24 +80,12 @@ export async function handlePatchPageStatus(
 		bodyJson !== null &&
 		ctx.reviewOnlyFields.some((field) => field in bodyJson)
 	) {
-		return rejectMutation(
-			ctx,
-			{ ...meta, actorEmail: guard.actor.email },
-			400,
-			'field not allowed',
-			'review-only field'
-		);
+		return rejectMutation(ctx, validMeta, 400, 'field not allowed', 'review-only field');
 	}
 
 	const bodyResult = statusBodySchema.safeParse(bodyJson);
 	if (!bodyResult.success) {
-		return rejectMutation(
-			ctx,
-			{ ...meta, actorEmail: guard.actor.email },
-			400,
-			'invalid body',
-			'invalid body'
-		);
+		return rejectMutation(ctx, validMeta, 400, 'invalid body', 'invalid body');
 	}
 
 	const apexResponse = await guard.apex.changePageStatus(

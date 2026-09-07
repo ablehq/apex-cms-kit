@@ -75,3 +75,32 @@ describe('the admin BFF client: the HTTP status is never shadowed by the body', 
 		assert.equal(seen[0].method, 'PATCH');
 	});
 });
+
+describe('the admin BFF client builds the path it means to', () => {
+	/**
+	 * codex on P4, finding 5. `patchEntityFields` interpolated both segments raw.
+	 * The SERVER validates and encodes them again — that is where the guarantee
+	 * lives — but this URL decides which of OUR OWN admin routes the request
+	 * reaches, and that is settled before any server code runs. P4a also widened the
+	 * type segment from a uuid to a SLUG, which is the shape a caller is most likely
+	 * to build out of something it read.
+	 */
+	it('encodes both entity segments, so a caller cannot address a different route', async () => {
+		const { seen, client } = clientAnswering(200, { ok: true });
+		await client.patchEntityFields('quote-item', '8f14e45f-ceea-467a-9a3c-3f1a7c9d2b55', { a: 1 });
+		assert.equal(
+			seen[0].path,
+			'/api/admin/entities/quote-item/8f14e45f-ceea-467a-9a3c-3f1a7c9d2b55',
+			'an ordinary slug and uuid are unchanged'
+		);
+
+		const escaped = clientAnswering(200, { ok: true });
+		await escaped.client.patchEntityFields('../pages', 'x/y', {});
+		assert.equal(
+			escaped.seen[0].path,
+			'/api/admin/entities/..%2Fpages/x%2Fy',
+			'a separator cannot leave the segment it was given in'
+		);
+		assert.doesNotMatch(escaped.seen[0].path, /\/api\/admin\/pages/u);
+	});
+});

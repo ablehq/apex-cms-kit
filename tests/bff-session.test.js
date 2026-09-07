@@ -22,6 +22,7 @@ import {
 	SESSION_ABSOLUTE_TTL_MS,
 	SESSION_IDLE_TTL_MS
 } from '../src/server/bff/session.ts';
+import { createMigratedDatabase } from './harness/d1.ts';
 import { createMemorySessionStore, createStubAuthClient } from './harness/session-store.ts';
 
 /**
@@ -378,6 +379,46 @@ describe('login: Apex decides, and the browser never sees a token', () => {
 		assert.equal(huge.status, 413);
 
 		assert.equal(auth.calls.passwordGrant.length, 0, 'nothing reached Apex');
+	});
+
+	it('a boundary refusal writes NO audit row, and a credential failure still does', async () => {
+		/**
+		 * codex on P4, finding 2. `/api/admin/auth/login` is reachable by anyone on the
+		 * open internet, and its boundary refusal — cross-origin, or no CSRF token —
+		 * wrote one D1 INSERT per attempt with the actor `unknown`. That is the write
+		 * amplification `rejectGuardFailure` exists to stop everywhere else, and login
+		 * was the one operation still doing it.
+		 *
+		 * The other half is the point: a FAILED PASSWORD GRANT is still audited. It is
+		 * reachable only past the same-origin + double-submit CSRF check, so it is a
+		 * real browser on our own origin, and a failed login attempt by one is exactly
+		 * what the log is for. Losing it would be a worse bug than the one being fixed.
+		 */
+		const db = await createMigratedDatabase();
+		const { ctx } = buildTestContext({ ctx: { db } });
+		const rows = async () => (await db.prepare('SELECT * FROM bff_audit_log').bind().all()).results;
+
+		for (let i = 0; i < 50; i += 1) {
+			const crossOrigin = await handleLogin(
+				new Request(`${ORIGIN}/api/admin/auth/login`, {
+					method: 'POST',
+					headers: { origin: 'https://evil.test', 'content-type': 'application/json' },
+					body: JSON.stringify({ email: EDITOR, password: PASSWORD })
+				}),
+				ctx
+			);
+			assert.equal(crossOrigin.status, 403);
+		}
+		assert.deepEqual(await rows(), [], 'fifty anonymous attempts cost the table nothing');
+
+		const wrongPassword = await handleLogin(loginRequest(EDITOR, 'not-the-password'), ctx);
+		assert.equal(wrongPassword.status, 401);
+		const audited = await rows();
+		assert.equal(audited.length, 1, 'a credential failure IS still recorded');
+		assert.equal(audited[0].outcome, 'rejected');
+		assert.equal(audited[0].actor_email, EDITOR);
+		assert.match(JSON.parse(audited[0].detail).reason, /invalid credentials/u);
+		db.close();
 	});
 });
 

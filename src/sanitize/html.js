@@ -137,6 +137,38 @@ export function allowRichTextClasses(classes) {
 	for (const name of classes) ALLOWED_CLASSES.add(name);
 }
 
+/**
+ * A site's own PRESENTATIONAL elements join the allowlist once, the same way its
+ * classes do — and under the same rule: nothing that executes, loads or navigates.
+ *
+ * The default list is an editorial decision as much as a security one. `h1` is
+ * off it because a page has one `h1` and rich text should not mint a second — true
+ * for the sites this module was written for, and NOT true for Poovayya, whose hero
+ * headline is authored as `<h1>` inside a template's `<h2>`. Unwrapping it there
+ * would resize the homepage headline of a live site: a silent rendering change
+ * bought with a security fix nobody asked to pay for it.
+ *
+ * So the tag list gets the extension point the class list already has, rather than
+ * the default widening under two sibling sites that are code-complete. What a site
+ * may add is bounded by what this module can safely emit: every element here is
+ * re-serialized from its parsed name with only its allowlisted attributes, so a
+ * presentational tag adds no sink. AN EXECUTABLE ONE WOULD, and is refused —
+ * `DROP_WITH_CONTENT` wins over this list by construction (`sanitizeHtml` checks it
+ * first), and an attempt to add one of those names throws rather than silently
+ * doing nothing, so a caller cannot believe it succeeded.
+ *
+ * @param {string[]} tags
+ */
+export function allowRichTextTags(tags) {
+	for (const name of tags) {
+		const tag = name.toLowerCase();
+		if (!/^[a-z][a-z0-9]{0,15}$/u.test(tag)) throw new Error(`not an element name: ${name}`);
+		if (DROP_WITH_CONTENT.has(tag))
+			throw new Error(`refusing to allow an executable element: ${tag}`);
+		ALLOWED_TAGS.add(tag);
+	}
+}
+
 const ALLOWED_CLASSES = new Set([
 	'ql-align-center',
 	'ql-align-justify',
