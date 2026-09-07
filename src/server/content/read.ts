@@ -144,12 +144,22 @@ export async function readContent(kv: ContentStore | undefined): Promise<Content
 			const snapshot =
 				memo && version === memo.version ? memo : (JSON.parse(raw) as ContentSnapshot);
 			const stamp = publishedAtMs(snapshot.publishedAt);
-			// A publish landed while this read was in flight, or KV handed back bytes
-			// older than the publish clock this isolate has already seen: hand THIS
-			// caller what KV gave us, but do not memoise it — the next read re-fetches
-			// and sees the new value rather than waiting out a minute on old bytes.
+			// KV handed back bytes older than the publish clock this isolate has already
+			// seen — its edge cache answering a post-publish read with pre-publish
+			// content. They are never memoised, so the next read re-fetches instead of
+			// waiting out a minute on them.
 			const olderThanFloor = stamp !== null && memoFloor > 0 && stamp < memoFloor;
-			if (generation === startedAt && !olderThanFloor) {
+			if (olderThanFloor) {
+				// KV handed back bytes older than the publish clock this isolate has
+				// already seen. They are not installed — but if a NEWER snapshot is still
+				// in hand, serving the OLDER one to this caller would be going backwards
+				// for no reason: the memo is past the floor by construction (the floor is
+				// raised to a snapshot's stamp as it is installed, and a reset clears the
+				// memo with the floor it sets). Hand back the memo; the TTL has expired,
+				// so the next read still goes to KV.
+				return memo ?? snapshot;
+			}
+			if (generation === startedAt) {
 				memo = snapshot;
 				memoCheckedAt = Date.now();
 				if (stamp !== null && stamp > memoFloor) memoFloor = stamp;

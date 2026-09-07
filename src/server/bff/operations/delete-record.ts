@@ -1,7 +1,7 @@
 import { auditOutcome } from '../audit';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
+import { rejectGuardFailure, rejectMutation } from '../reject';
 import { countReferencesTo } from './record-shape';
 import { recordIdSchema } from './get-record';
 import { contractOf, noContractResponse } from '../content-contract-guard';
@@ -54,12 +54,18 @@ export async function handleDeleteRecord(
 	const meta = {
 		action: 'records.delete',
 		method: 'DELETE',
-		path: `/api/admin/records/${params.schema}/${params.recordId}`,
+		// The route TEMPLATE, not the request's own path. `reject.ts` states the rule
+		// and `postRouteMeta` already follows it: a route parameter is
+		// attacker-controlled until validated, and this meta is built BEFORE the
+		// validation, so interpolating it would write an arbitrary caller string into
+		// the audit table's `path` on every refused request. The validated values go
+		// in `detail`.
+		path: '/api/admin/records/[schema]/[recordId]',
 		requestId: request.headers.get('cf-ray')
 	};
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 
 	const actorMeta = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 

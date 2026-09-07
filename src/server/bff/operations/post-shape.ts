@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { bffError, noStoreJson } from '../boundary';
 import { canonicalize } from '../../../cms/canonical-json.js';
 import { sanitizeHtml } from '../../../sanitize/html.js';
+import { MAX_FIELD_VALUE_CHARS } from '../../../sanitize/write-boundary';
 import {
 	archetypeIdSchema,
 	cleanString,
@@ -398,7 +399,7 @@ const blockSchema = z
 	.object({
 		id: postIdSchema.nullable().optional(),
 		kind: z.enum(['rich_text', 'quote']),
-		html: z.string().max(200_000).optional(),
+		html: z.string().max(MAX_FIELD_VALUE_CHARS).optional(),
 		quote: z.string().max(20_000).optional(),
 		quotedBy: z.string().max(300).optional()
 	})

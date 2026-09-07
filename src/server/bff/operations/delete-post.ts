@@ -1,7 +1,7 @@
 import { auditOutcome } from '../audit';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
+import { rejectGuardFailure, rejectMutation } from '../reject';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import { loadPostView, postIdSchema, postRouteMeta, postSchemaOf, readPostIds } from './post-shape';
 import type { BffContext } from '../context';
@@ -29,7 +29,7 @@ export async function handleDeletePost(
 	const meta = postRouteMeta(request, 'posts.delete', 'DELETE', true);
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 	const actor = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 
 	if (!postSchemaOf(contract, params.schema)) {

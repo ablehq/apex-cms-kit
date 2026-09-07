@@ -25,7 +25,10 @@ import {
 import { handleGetPost } from '../src/server/bff/operations/get-post.ts';
 import { handleCreatePost } from '../src/server/bff/operations/create-post.ts';
 import { handleDeletePost } from '../src/server/bff/operations/delete-post.ts';
-import { postStatusBodySchema } from '../src/server/bff/operations/patch-post-status.ts';
+import {
+	handlePatchPostStatus,
+	postStatusBodySchema
+} from '../src/server/bff/operations/patch-post-status.ts';
 import { countReferencesTo } from '../src/server/bff/operations/record-shape.ts';
 import { handleListPosts, loadPostCatalogue } from '../src/server/bff/operations/post-list.ts';
 import { createApexAdminClient } from '../src/server/bff/apex-admin-client.ts';
@@ -552,6 +555,14 @@ function apexStub(calls, options = {}) {
 		async deletePost(slug, id) {
 			calls.push(['deletePost', slug, id]);
 			return { ok: true, status: 200, body: null };
+		},
+		async changePostStatus(id, statusEvent) {
+			calls.push(['changePostStatus', id, statusEvent]);
+			// Stateful on purpose: the route RE-READS rather than echoing the event, so
+			// the double has to be able to answer differently afterwards or the test
+			// cannot tell an echo from a read.
+			options.view = { ...(options.view ?? {}), status: 'published' };
+			return { ok: true, status: 200, body: { data: { id } } };
 		}
 	};
 }
@@ -962,5 +973,34 @@ describe('countReferencesTo — posts are counted through the archetypes surface
 			}
 		});
 		assert.deepEqual(await countReferencesTo(contract, apex, 'focus_area', FA1), { ok: false });
+	});
+});
+
+describe('the status route does not put a post status in a key called `status`', () => {
+	/**
+	 * `bff-client.js`'s `mutate` writes the HTTP status onto its result and THEN
+	 * spreads the body over it, so a body key called `status` REPLACES the real one.
+	 * Nine operations were fixed when the numeric case was found; this one held a
+	 * post-status STRING, which is worse — `result.status === 'published'` type-checks
+	 * and reads like a deliberate API, and a caller comparing it to `200` sees false.
+	 */
+	it('answers { ok, postStatus } and never a body key named status', async () => {
+		const calls = [];
+		const ctx = ctxWith(calls, {});
+		const session = await signIn(ctx);
+		const res = await handlePatchPostStatus(
+			request(`/api/admin/posts/story/${POST}/status`, 'POST', { statusEvent: 'publish' }, session),
+			ctx,
+			{ schema: 'story', postId: POST }
+		);
+		assert.equal(res.status, 200);
+		const body = await res.json();
+		assert.equal(body.ok, true);
+		assert.equal(body.postStatus, 'published');
+		assert.equal('status' in body, false, 'the key that shadows the HTTP status is gone');
+		assert.deepEqual(
+			calls.filter((call) => call[0] === 'changePostStatus'),
+			[['changePostStatus', POST, 'publish']]
+		);
 	});
 });

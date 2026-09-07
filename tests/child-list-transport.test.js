@@ -917,7 +917,9 @@ describe('the audit row says what actually happened', () => {
 		);
 		const rows = await auditRows(db);
 		assert.equal(rows.length, 1, 'and the attempt is still recorded');
-		assert.equal(rows[0].outcome, 'apex_error');
+		// `rejected`, not `apex_error`: the client refused on the way IN and Apex was
+		// never asked, so the bucket that means "upstream failed" would be a lie.
+		assert.equal(rows[0].outcome, 'rejected');
 		assert.equal(rows[0].detail.thrown, true);
 		assert.match(rows[0].detail.thrownReason, /not a content-library archetype schema/u);
 		assert.equal(rows[0].detail.apexStatus, undefined, 'NOT relabelled as "no answer"');

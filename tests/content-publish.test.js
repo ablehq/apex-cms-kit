@@ -521,17 +521,25 @@ describe('readContent', () => {
 			const later = realNow() + 120_000;
 			Date.now = () => later;
 			backwards.state.serve = stale;
+			const readsBefore = backwards.state.reads;
+			// The memo IS re-checked past the TTL and KV DOES go backwards — but the
+			// newer snapshot is still in hand, so that is what the caller gets. Serving
+			// the older bytes would be this isolate going backwards for a request, which
+			// the floor exists to prevent; not installing them was only half of it.
 			assert.equal(
 				(await readContent(backwards)).version,
-				staleVersion,
-				'the lapsed memo re-checks, and KV goes backwards'
+				freshVersion,
+				'the older bytes are neither served nor installed while a newer memo is held'
 			);
+			assert.equal(backwards.state.reads, readsBefore + 1, 'and it really did re-read KV');
+			assert.notEqual(staleVersion, freshVersion, 'the two snapshots are distinguishable');
 			backwards.state.serve = null;
 			assert.equal(
 				(await readContent(backwards)).version,
 				freshVersion,
 				'the older snapshot never took the memo — a third read gets the newer one'
 			);
+			assert.equal(backwards.state.reads, readsBefore + 2, 'the memo was not refreshed either');
 		} finally {
 			Date.now = realNow;
 		}

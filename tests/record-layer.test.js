@@ -5,8 +5,11 @@ import { describe, it } from 'node:test';
 import {
 	hasManyDiff,
 	countReferencesTo,
+	recordBodySchema,
+	referenceFieldNames,
 	summarizeRecord
 } from '../src/server/bff/operations/record-shape.ts';
+import { containsNullPrimitive } from '../src/server/bff/authorization.ts';
 import { handleDeleteRecord } from '../src/server/bff/operations/delete-record.ts';
 import { handleCreateRecord } from '../src/server/bff/operations/create-record.ts';
 import { handleUpdateRecord } from '../src/server/bff/operations/update-record.ts';
@@ -641,5 +644,88 @@ describe('the write path refuses what must never reach Apex', () => {
 			}
 			assert.equal(apex.writes.length, 0);
 		});
+	});
+});
+
+describe('where a `null` is legitimate, and where it destroys a row (§3.6.4)', () => {
+	/**
+	 * Poovayya's own record operation called \`containsNullPrimitive\` with NO
+	 * reference list, so EVERY \`null\` in \`fields\` was refused. The kit passes
+	 * \`referenceFieldNames(...)\` and is more permissive — and this is exactly how much
+	 * more, because the input in question is the one that destroys data: a \`null\` on a
+	 * PRIMITIVE destroys that field's \`archetype_item\` row and strands the old value
+	 * in \`primitives\`, the exact key a public site renders.
+	 *
+	 * The rule is split across two checks on purpose, and both halves are here: the
+	 * predicate decides where a null is DESTRUCTIVE, and the contract-built body
+	 * schema decides where the key is legal at all. A null gets past the first only
+	 * to meet the second.
+	 */
+	const nullContract = {
+		...contract,
+		primitiveFieldDefs: (slug) =>
+			slug === 'partner'
+				? [
+						{
+							field_name: 'title',
+							display_name: 'Title',
+							validator_kind: null,
+							text_inclusion: null,
+							is_required: false,
+							place_holder: null,
+							default_value: null
+						}
+					]
+				: [],
+		referenceItems: (slug) =>
+			slug === 'partner'
+				? [
+						{
+							name: 'owner',
+							kind: 'reference',
+							position: 0,
+							field_defs: null,
+							relationship_kind: 'has_one',
+							target_schema: 'focus_area',
+							reference_display_field: null
+						},
+						{
+							name: 'focus_area',
+							kind: 'reference',
+							position: 1,
+							field_defs: null,
+							relationship_kind: 'has_many',
+							target_schema: 'focus_area',
+							reference_display_field: null
+						}
+					]
+				: []
+	};
+	const names = referenceFieldNames(nullContract, 'partner');
+	const schema = recordBodySchema(nullContract, 'partner');
+	const TARGET = '3f1b0c2e-0000-4000-8000-000000000000';
+
+	it('a null on a PRIMITIVE is destructive, and the predicate says so', () => {
+		assert.equal(containsNullPrimitive({ title: null }, names), true);
+		// And the site that passes no reference list at all refuses every null, which
+		// is what Poovayya did — stricter, never looser.
+		assert.equal(containsNullPrimitive({ owner: null }, []), true);
+	});
+
+	it('a null on a REFERENCE NAME is not destructive, but is not a field either', () => {
+		assert.equal(containsNullPrimitive({ owner: null }, names), false);
+		// It gets past the predicate and meets the schema, which is `.strict()` over
+		// the PRIMITIVE names — so `fields: { owner: null }` is still refused.
+		assert.equal(schema.safeParse({ fields: { owner: null } }).success, false);
+	});
+
+	it('a null on a has_one in `references` is ACCEPTED — the only way to clear one', () => {
+		assert.equal(schema.safeParse({ references: { owner: null } }).success, true);
+		assert.equal(schema.safeParse({ references: { owner: TARGET } }).success, true);
+	});
+
+	it('a null on a has_many is REFUSED — `[]` is how a desired set is cleared', () => {
+		assert.equal(schema.safeParse({ references: { focus_area: null } }).success, false);
+		assert.equal(schema.safeParse({ references: { focus_area: [] } }).success, true);
 	});
 });

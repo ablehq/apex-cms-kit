@@ -3,7 +3,7 @@ import { appendAuditEntry } from '../audit';
 
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
+import { rejectGuardFailure, rejectMutation } from '../reject';
 import type { BffContext } from '../context';
 
 /**
@@ -38,13 +38,19 @@ export async function handlePatchPageStatus(
 	const meta = {
 		action: 'pages.status_event',
 		method: 'PATCH',
-		path: `/api/admin/pages/${params.pageId}/status`,
+		// The route TEMPLATE, not the request's own path. `reject.ts` states the rule
+		// and `postRouteMeta` already follows it: a route parameter is
+		// attacker-controlled until validated, and this meta is built BEFORE the
+		// validation, so interpolating it would write an arbitrary caller string into
+		// the audit table's `path` on every refused request. The validated values go
+		// in `detail`.
+		path: '/api/admin/pages/[pageId]/status',
 		pageId: params.pageId,
 		requestId: request.headers.get('cf-ray')
 	};
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 
 	const idResult = pageIdSchema.safeParse(params.pageId);
 	if (!idResult.success) {
@@ -109,7 +115,7 @@ export async function handlePatchPageStatus(
 			actorSub: guard.actor.sub,
 			action: 'pages.status_event',
 			method: 'PATCH',
-			path: `/api/admin/pages/${idResult.data}/status`,
+			path: '/api/admin/pages/[pageId]/status',
 			accountId: ctx.accountId ?? null,
 			pageId: idResult.data,
 			requestId: request.headers.get('cf-ray'),

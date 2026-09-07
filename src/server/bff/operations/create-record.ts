@@ -2,7 +2,7 @@ import { auditOutcome } from '../audit';
 import { containsNullPrimitive } from '../authorization';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
+import { refuseOversizedFields, rejectGuardFailure, rejectMutation } from '../reject';
 import { cleanString, unwrapArchetypeRecord } from '../archetype-record';
 import { recordBodySchema, referenceFieldNames, summarizeRecord } from './record-shape';
 import { childListFieldNames } from './child-list';
@@ -41,12 +41,18 @@ export async function handleCreateRecord(
 	const meta = {
 		action: 'records.create',
 		method: 'POST',
-		path: `/api/admin/records/${params.schema}`,
+		// The route TEMPLATE, not the request's own path. `reject.ts` states the rule
+		// and `postRouteMeta` already follows it: a route parameter is
+		// attacker-controlled until validated, and this meta is built BEFORE the
+		// validation, so interpolating it would write an arbitrary caller string into
+		// the audit table's `path` on every refused request. The validated values go
+		// in `detail`.
+		path: '/api/admin/records/[schema]',
 		requestId: request.headers.get('cf-ray')
 	};
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 
 	const actorMeta = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 
@@ -65,6 +71,11 @@ export async function handleCreateRecord(
 	if (submitted && containsNullPrimitive(submitted, referenceFieldNames(contract, params.schema))) {
 		return rejectMutation(ctx, actorMeta, 400, 'null-field', 'null primitive');
 	}
+
+	// The per-field ceiling, named before the shape check so the refusal can say
+	// WHICH field is over it (`field-too-large`) rather than a generic `invalid body`.
+	const tooLarge = await refuseOversizedFields(ctx, actorMeta, submitted);
+	if (tooLarge) return tooLarge;
 
 	const parsed = recordBodySchema(contract, params.schema).safeParse(bodyJson);
 	if (!parsed.success) {

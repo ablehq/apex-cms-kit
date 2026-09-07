@@ -1,6 +1,7 @@
 import { bffError } from './boundary';
 import { auditRejection } from './audit';
 import { resolveSession } from './guard';
+import { oversizedFieldNames } from '../../sanitize/write-boundary';
 import type { GuardResult } from './guard';
 import type { BffContext } from './context';
 
@@ -94,4 +95,25 @@ export async function rejectGuardFailure(
 		guard.reason,
 		guard.reason
 	);
+}
+
+/**
+ * The per-field ceiling refusal, written once for every write path that has one.
+ *
+ * `MAX_FIELD_VALUE_CHARS` is the mechanic (see `sanitize/write-boundary.ts`); this
+ * is how a route says no to it. Returns `null` when nothing is over — so a caller
+ * reads as `const tooLarge = await refuseOversizedFields(…); if (tooLarge) return
+ * tooLarge;` — and a typed 400 `field-too-large` naming the fields when something
+ * is, rather than folding it into the generic `invalid body` a zod `.max()` would
+ * produce or letting the value reach Apex, where the flat surface answers 200 over
+ * what it did not store.
+ */
+export async function refuseOversizedFields(
+	ctx: BffContext,
+	meta: RejectMeta,
+	fields: unknown
+): Promise<Response | null> {
+	const over = oversizedFieldNames(fields);
+	if (over.length === 0) return null;
+	return rejectMutation(ctx, meta, 400, 'field-too-large', `field too large: ${over.join(', ')}`);
 }

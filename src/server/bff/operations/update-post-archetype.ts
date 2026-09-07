@@ -2,7 +2,7 @@ import { auditOutcome } from '../audit';
 import { containsNullPrimitive } from '../authorization';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
+import { refuseOversizedFields, rejectGuardFailure, rejectMutation } from '../reject';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import {
 	hasManyDiff,
@@ -52,7 +52,7 @@ export async function handleUpdatePostArchetype(
 	const meta = postRouteMeta(request, 'posts.update_archetype', 'PUT', true, '/archetype');
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 	const actor = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 
 	if (!postSchemaOf(contract, params.schema)) {
@@ -72,6 +72,11 @@ export async function handleUpdatePostArchetype(
 	if (submitted && containsNullPrimitive(submitted, referenceFieldNames(contract, params.schema))) {
 		return rejectMutation(ctx, actor, 400, 'null-field', 'null primitive');
 	}
+	// The per-field ceiling, named before the shape check so the refusal can say
+	// WHICH field is over it (`field-too-large`) rather than a generic `invalid body`.
+	const tooLarge = await refuseOversizedFields(ctx, actor, submitted);
+	if (tooLarge) return tooLarge;
+
 	const parsed = recordBodySchema(contract, params.schema).safeParse(bodyJson);
 	if (!parsed.success) return rejectMutation(ctx, actor, 400, 'invalid body', 'invalid body');
 

@@ -4,7 +4,7 @@ import { appendAuditEntry } from '../audit';
 import { containsReviewOnlyField } from '../authorization';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
+import { rejectGuardFailure, rejectMutation } from '../reject';
 import { pageIdSchema } from './get-page';
 import { computePageVersion } from '../page-version';
 import type { BffContext } from '../context';
@@ -120,13 +120,19 @@ export async function handleSavePageStructure(
 	const meta = {
 		action: 'pages.structure.save',
 		method: 'PATCH',
-		path: `/api/admin/pages/${params.pageId}/structure`,
+		// The route TEMPLATE, not the request's own path. `reject.ts` states the rule
+		// and `postRouteMeta` already follows it: a route parameter is
+		// attacker-controlled until validated, and this meta is built BEFORE the
+		// validation, so interpolating it would write an arbitrary caller string into
+		// the audit table's `path` on every refused request. The validated values go
+		// in `detail`.
+		path: '/api/admin/pages/[pageId]/structure',
 		pageId: params.pageId,
 		requestId: request.headers.get('cf-ray')
 	};
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 
 	const actorMeta = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 

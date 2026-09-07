@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { auditOutcome } from '../audit';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
+import { rejectGuardFailure, rejectMutation } from '../reject';
 import { unwrapArchetypeRecord } from '../archetype-record';
 import { computePageVersion } from '../page-version';
 import { getPageSlugValidationError } from '../../../cms/page-slug-validation.js';
@@ -46,7 +46,7 @@ export async function handleCreatePage(request: Request, ctx: BffContext): Promi
 	};
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 	const actor = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 
 	let bodyJson: unknown;

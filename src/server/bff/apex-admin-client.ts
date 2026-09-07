@@ -237,6 +237,24 @@ export function assertSchemaItemSlug(name: string): void {
 	if (!/^[a-z0-9_-]{1,128}$/iu.test(name)) throw new Error('invalid schema item slug');
 }
 
+/**
+ * An entity TYPE, which Apex addresses by uuid OR by slug.
+ *
+ * `content_library/entities_controller.rb:10-11` resolves `:entity_type_id` with
+ * `where(id: …).or(where(slug: …))`, so both are legal upstream — and one of the two
+ * sites on this kit has no entity-type uuids to give: Poovayya's `array_ref`
+ * validator names the child type by SLUG (`array_ref/entity-type/quote-item`) and its
+ * committed contract carries no ids at all. A uuid-only check here would have made
+ * the kit's entity write unreachable from that site.
+ *
+ * Still a closed shape, not a free string: the same alphabet a slug or a uuid can be
+ * spelled in, so nothing carrying a path separator, a dot segment or a
+ * percent-encoding reaches the URL.
+ */
+export function assertEntityTypeRef(ref: string): void {
+	if (!/^[0-9a-z][0-9a-z-]{0,119}$/iu.test(ref)) throw new Error('invalid entity type');
+}
+
 export function assertUuid(id: string): void {
 	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu.test(id)) {
 		// Belt-and-suspenders: the route already zod-validates the id, but the client
@@ -688,7 +706,9 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			});
 		},
 		async updateEntityFields(entityTypeId, entityId, fieldsData) {
-			assertUuid(entityTypeId);
+			// The TYPE may be a uuid or a slug (see `assertEntityTypeRef`); the ENTITY
+			// is always a uuid.
+			assertEntityTypeRef(entityTypeId);
 			assertUuid(entityId);
 			return call(
 				`${ENTITY_TYPES_BASE}/${encodeURIComponent(entityTypeId)}/entities/${encodeURIComponent(entityId)}`,

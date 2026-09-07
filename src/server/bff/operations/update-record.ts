@@ -2,7 +2,7 @@ import { auditOutcome } from '../audit';
 import { containsNullPrimitive } from '../authorization';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
+import { refuseOversizedFields, rejectGuardFailure, rejectMutation } from '../reject';
 import { readUpdatedAt, unbackedPrimitiveKeys, unwrapArchetypeRecord } from '../archetype-record';
 import {
 	hasManyDiff,
@@ -68,12 +68,18 @@ export async function handleUpdateRecord(
 	const meta = {
 		action: 'records.update',
 		method: 'PATCH',
-		path: `/api/admin/records/${params.schema}/${params.recordId}`,
+		// The route TEMPLATE, not the request's own path. `reject.ts` states the rule
+		// and `postRouteMeta` already follows it: a route parameter is
+		// attacker-controlled until validated, and this meta is built BEFORE the
+		// validation, so interpolating it would write an arbitrary caller string into
+		// the audit table's `path` on every refused request. The validated values go
+		// in `detail`.
+		path: '/api/admin/records/[schema]/[recordId]',
 		requestId: request.headers.get('cf-ray')
 	};
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 
 	const actorMeta = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 
@@ -96,6 +102,11 @@ export async function handleUpdateRecord(
 	if (submitted && containsNullPrimitive(submitted, referenceFieldNames(contract, params.schema))) {
 		return rejectMutation(ctx, actorMeta, 400, 'null-field', 'null primitive');
 	}
+
+	// The per-field ceiling, named before the shape check so the refusal can say
+	// WHICH field is over it (`field-too-large`) rather than a generic `invalid body`.
+	const tooLarge = await refuseOversizedFields(ctx, actorMeta, submitted);
+	if (tooLarge) return tooLarge;
 
 	const parsed = recordBodySchema(contract, params.schema).safeParse(bodyJson);
 	if (!parsed.success) {
@@ -324,7 +335,12 @@ export async function handleUpdateRecord(
 			if (!(error instanceof ApexTransportError)) {
 				try {
 					await auditOutcome(ctx, meta, guard.actor, {
-						outcome: 'apex_error',
+						// NOT `apex_error`. Apex was never asked: the client threw on the way
+						// in — an array on a flat field, a malformed id — so the bucket that
+						// says "upstream failed" would be a lie in the one table that has to
+						// stay honest about who broke what. `thrown: true` still marks it as
+						// a throw rather than a validated refusal.
+						outcome: 'rejected',
 						detail: {
 							schema: params.schema,
 							recordId: idResult.data,

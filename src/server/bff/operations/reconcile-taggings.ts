@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { auditOutcome } from '../audit';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
+import { rejectGuardFailure, rejectMutation } from '../reject';
 import {
 	archetypeIdSchema,
 	cleanString,
@@ -203,7 +203,7 @@ export async function handleSetPostTags(
 	const meta = postRouteMeta(request, 'posts.tags.put', 'PUT', true, '/tags');
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 	const actor = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 
 	if (!postSchemaOf(contract, params.schema)) {
@@ -277,7 +277,7 @@ export async function handleCreateTag(request: Request, ctx: BffContext): Promis
 	};
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 	const actor = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 
 	let bodyJson: unknown;

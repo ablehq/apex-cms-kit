@@ -10,7 +10,7 @@ import {
 	uploadClaimId,
 	uploadClaimMessage
 } from '../media-claim';
-import { rejectMutation } from '../reject';
+import { rejectGuardFailure, rejectMutation } from '../reject';
 import { readGalleryId } from './list-gallery-images';
 import { CAPTION_MAX_LENGTH, galleryMedia, refuseUpload } from '../../../admin/media-types.js';
 import type { ApexAdminClient, ApexResponse } from '../apex-admin-client';
@@ -210,7 +210,7 @@ export async function handleSignMediaUpload(request: Request, ctx: BffContext): 
 		requestId: request.headers.get('cf-ray')
 	};
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 	const actorMeta = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 
 	let bodyJson: unknown;
@@ -322,7 +322,7 @@ export async function handleFinalizeMediaUpload(
 		requestId: request.headers.get('cf-ray')
 	};
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 	const actorMeta = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 
 	let bodyJson: unknown;

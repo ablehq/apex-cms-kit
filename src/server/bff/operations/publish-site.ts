@@ -1,7 +1,7 @@
 import { appendAuditEntry } from '../audit';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
+import { rejectGuardFailure } from '../reject';
 import { publishContent, ContentPublishError } from '../../content/publish';
 import { ContentUnavailableError, manifestOf, readContent } from '../../content/read';
 import type { BffContext } from '../context';
@@ -29,7 +29,7 @@ export async function handlePublishSite(request: Request, ctx: BffContext): Prom
 	};
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 
 	if (!ctx.content) {
 		await audit(ctx, guard.actor, 'apex_error', { reason: 'not_configured' });
