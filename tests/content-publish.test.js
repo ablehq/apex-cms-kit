@@ -335,4 +335,89 @@ describe('readContent', () => {
 		const next = await readContent(slowKv);
 		assert.equal(next.version, 'published-during-the-read', 'the next read is not stale');
 	});
+
+	it('a foreign read completing does not free the in-flight slot for a third read', async () => {
+		/**
+		 * THE OVERLAP THE GENERATION COUNTER DOES NOT COVER, found by review.
+		 *
+		 * The counter stops a read that began BEFORE an invalidation from installing
+		 * what it fetched. It says nothing about two reads that both began AFTER one
+		 * — and those could overlap, because the pre-reset promise's `finally` used
+		 * to clear the shared `inflight` slot UNCONDITIONALLY, freeing it while a
+		 * later read was still running. A third read then started against KV's
+		 * 60-second edge cache, and whichever of the two landed last won. Both
+		 * sibling sites' public loaders go through this reader.
+		 *
+		 * The slot is now cleared only by the promise that owns it, so the second
+		 * read continues to de-duplicate every later caller. Reverting that makes the
+		 * KV read count below go from 2 to 3.
+		 */
+		resetContentMemo();
+		const kv = memoryStore();
+		await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'e', now: 1000 });
+		const bytes = kv.map.get(CONTENT_KEY);
+
+		let releaseFirst = () => {};
+		let releaseSecond = () => {};
+		const first = new Promise((resolve) => {
+			releaseFirst = resolve;
+		});
+		const second = new Promise((resolve) => {
+			releaseSecond = resolve;
+		});
+		let reads = 0;
+		const slowKv = {
+			async get() {
+				// The call index is captured BEFORE any await. Re-reading the shared
+				// counter afterwards makes read 1 fall into read 2's gate the moment
+				// read 2 has incremented it, and the test deadlocks on its own stub.
+				const nth = ++reads;
+				if (nth === 1) await first;
+				if (nth === 2) await second;
+				return bytes;
+			},
+			put: kv.put.bind(kv)
+		};
+
+		const a = readContent(slowKv); // read 1, pre-reset, held
+		resetContentMemo(); // frees the slot for a new generation
+		const b = readContent(slowKv); // read 2, post-reset, held — OWNS the slot
+
+		releaseFirst();
+		await a; // read 1 settles, and its `finally` must NOT free read 2's slot
+
+		const c = readContent(slowKv); // must de-duplicate onto read 2
+		assert.equal(reads, 2, 'no third KV read: the slot was still read 2\u2019s');
+
+		releaseSecond();
+		assert.equal(await c, await b, 'the third caller was served read 2\u2019s own promise');
+	});
+
+	it('clears the slot when its own read settles, so a later read is not served a corpse', async () => {
+		/**
+		 * The mirror image of the test above, and the bug the first attempt at this
+		 * fix actually shipped: comparing against a promise that is not the one in the
+		 * slot makes the condition permanently false, the slot is never cleared, and
+		 * every later read is handed a long-settled promise forever.
+		 *
+		 * It has to be proved on a FAILING read. A successful one installs the memo,
+		 * which short-circuits the next call, and every other path here runs a publish
+		 * in between — and a publish resets the memo, which clears the slot anyway. An
+		 * empty store rejects, memoises nothing, and resets nothing, so the only thing
+		 * that can free the slot is the read's own completion.
+		 */
+		resetContentMemo();
+		let reads = 0;
+		const empty = {
+			async get() {
+				reads += 1;
+				return null;
+			},
+			async put() {}
+		};
+		await assert.rejects(readContent(empty), /nothing has been published/);
+		assert.equal(reads, 1);
+		await assert.rejects(readContent(empty), /nothing has been published/);
+		assert.equal(reads, 2, 'the settled read released the slot; this is a NEW read');
+	});
 });

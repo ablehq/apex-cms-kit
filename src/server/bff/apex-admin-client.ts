@@ -179,6 +179,17 @@ export interface GalleryItemFields {
  * or the path stays open for the next caller. Array-shaped fields go through
  * `createArchetypeItem` / `updateArchetypeItem` instead.
  *
+ * ── PROVISIONAL, NOT PERMANENT ───────────────────────────────────────────────
+ * This is a CAPABILITY GATE on the backend build, and it comes OUT at plan 08's
+ * transition — in the same reviewed kit change that stops splitting lists out of
+ * the flat payload, because once `archetype_models` permits list-shaped fields the
+ * lists ride the atomic PATCH with everything else and a refusal here would block
+ * the very write that replaces this one. Until that fix is DEPLOYED and VERIFIED
+ * (not merely merged), it stays on: production still destroys the list silently.
+ *
+ * Do not confuse it with the partial-write guard in `handleUpdateRecord`, which is
+ * permanent — that one is about a record's own shape, not about a backend version.
+ *
  * Keyed on the VALUE being an array rather than on the validator kind, because
  * `text_array` and `number_array` are emptied identically and this file has no
  * contract to read kinds from. Reference values are arrays too — they are a
@@ -318,6 +329,24 @@ export interface ApexAdminClient {
 		references?: Record<string, HasManyEntry[] | string | null>,
 		position?: number | null
 	): Promise<ApexResponse>;
+	//
+	// THIS METHOD DOES NOT CARRY THE PARTIAL-WRITE GUARD, and a direct caller needs
+	// to know it. `handleUpdateRecord` reads the record first and refuses a partial
+	// field write to one whose `primitives` no `archetype_item` accounts for,
+	// because on such a record the upstream rebuild deletes every unsent field. A
+	// caller that reaches this method directly — GLC's `update-author.ts:94`,
+	// `update-resource.ts:85` and `ingest-resource.ts:115` all do — gets the ARRAY
+	// refusal above but not that one.
+	//
+	// DELIBERATE, not an oversight (plan 07, P3 review finding 9). Those records are
+	// created through the API and so are item-backed from birth; the hazard needs a
+	// record whose `primitives` were written directly, which no GLC path produces.
+	// And `ingest-resource.ts` documents a considered "write first, never read"
+	// design — a failed read cannot tell "deleted" from "Apex is down", and reading
+	// it as absent creates a duplicate. A caller that DOES need the protection
+	// should route through `handleUpdateRecord`, or call `unbackedPrimitiveKeys`
+	// (`archetype-record.ts`) on its own pre-write read; it is exported for that.
+	//
 	deleteContentLibraryRecord(slug: string, id: string): Promise<ApexResponse>;
 	/**
 	 * Create the ONE `archetype_item` row that holds an array-shaped field's whole

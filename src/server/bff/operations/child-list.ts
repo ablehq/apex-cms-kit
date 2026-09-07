@@ -19,6 +19,14 @@ import type { ContentContract } from '../content-contract';
  * re-read. `assertNoArrayFields` in the Apex client refuses that payload outright;
  * this module is the other half, the route the value actually takes.
  *
+ * ── THIS WHOLE MODULE IS PROVISIONAL ─────────────────────────────────────────
+ * Plan 08 makes `archetype_models` permit list-shaped fields, the way the entity
+ * controller already does. When that is DEPLOYED and VERIFIED — not merely merged
+ * — a record's lists ride the same atomic PATCH as every other field and this
+ * module, its partial-failure reporting and its convergence argument all go, in
+ * one reviewed kit change that also removes `assertNoArrayFields`. It is kept
+ * until then because it is what works against the backend production is on.
+ *
  * ── ONE ROW PER LIST, NOT ONE PER CHILD ──────────────────────────────────────
  * A Primitive schema item is forced `has_one` upstream, and a second POST for the
  * same field answers 422 (measured). So the whole ordered list lives in ONE
@@ -118,9 +126,19 @@ export async function writeChildLists(
 	for (const { field, value } of childLists) {
 		const itemId = readPrimitiveItemId(record, field);
 		const fieldsData = { [field]: value };
-		const response = itemId
-			? await apex.updateArchetypeItem(slug, recordId, field, itemId, fieldsData)
-			: await apex.createArchetypeItem(slug, recordId, field, fieldsData);
+		let response;
+		try {
+			response = itemId
+				? await apex.updateArchetypeItem(slug, recordId, field, itemId, fieldsData)
+				: await apex.createArchetypeItem(slug, recordId, field, fieldsData);
+		} catch {
+			// The client RETHROWS a network fault when no abort signal was passed, and
+			// the admin path passes none. Caught HERE rather than at the call site
+			// because this is the only frame that knows WHICH list was in flight —
+			// and after a committed flat write, "which one" is the whole report.
+			// `status: 0` is "never got an answer", distinct from any HTTP refusal.
+			return { ok: false, written, field, status: 0 };
+		}
 		if (!response.ok) return { ok: false, written, field, status: response.status };
 		written.push(field);
 	}

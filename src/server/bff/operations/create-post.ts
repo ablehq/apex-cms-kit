@@ -41,7 +41,18 @@ import type { BffContext } from '../context';
 export function createPostBodySchema(contract: ContentContract, slug: string) {
 	const fieldsShape: Record<string, z.ZodTypeAny> = {};
 	for (const def of contract.primitiveFieldDefs(slug)) {
-		fieldsShape[def.field_name] = z.unknown().optional();
+		// AN ARRAY IS REFUSED HERE, in the currency a caller can act on.
+		//
+		// `z.unknown()` accepted one, `toApexFields` passed it through, and
+		// `createPost` → `assertNoArrayFields` then THREW — a framework 500 where a
+		// 400 belongs. There is no child-list transport for a post: an array-shaped
+		// field on a post schema is not writable at all, and saying so is better than
+		// crashing. No post schema on any site declares one today; the next one that
+		// does must not find out in production.
+		fieldsShape[def.field_name] = z
+			.unknown()
+			.refine((value) => !Array.isArray(value), 'a post field does not hold a list')
+			.optional();
 	}
 	return z
 		.object({

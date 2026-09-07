@@ -13,7 +13,7 @@ import {
 import { splitChildListFields, writeChildLists } from './child-list';
 import { recordIdSchema } from './get-record';
 import { sanitizeFieldValue } from '../../../sanitize/write-boundary';
-import type { ContentLibraryFields, HasManyEntry } from '../apex-admin-client';
+import type { ApexResponse, ContentLibraryFields, HasManyEntry } from '../apex-admin-client';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import type { BffContext } from '../context';
 
@@ -132,9 +132,17 @@ export async function handleUpdateRecord(
 	if (writesFields || Object.keys(wantedReferences).length > 0) {
 		const read = await guard.apex.getContentLibraryRecord(params.schema, idResult.data);
 		if (read.status === 404) return rejectMutation(ctx, actorMeta, 404, 'not found', 'not found');
-		if (!read.ok) return bffError(502, 'upstream error');
+		// AUDITED, where a bare `bffError` left no row at all. Nothing was written, so
+		// `rejectMutation`'s best-effort form is the right one — a D1 hiccup must not
+		// turn a correct 502 into a 500 — but a save that failed before it started is
+		// still a save somebody made, and the audit is where they would look for it.
+		if (!read.ok) {
+			return rejectMutation(ctx, actorMeta, 502, 'upstream error', 'pre-write read failed');
+		}
 		current = unwrapArchetypeRecord(read.body);
-		if (!current) return bffError(502, 'unexpected upstream shape');
+		if (!current) {
+			return rejectMutation(ctx, actorMeta, 502, 'upstream error', 'pre-write read shape');
+		}
 
 		/**
 		 * ── THE PARTIAL-WRITE GUARD ────────────────────────────────────────────
@@ -174,15 +182,27 @@ export async function handleUpdateRecord(
 		if (writesFields) {
 			const unbacked = unbackedPrimitiveKeys(current);
 			if (unbacked.length > 0) {
-				await auditOutcome(ctx, meta, guard.actor, {
-					outcome: 'rejected',
-					detail: {
-						schema: params.schema,
-						recordId: idResult.data,
-						reason: 'unbacked-record',
-						unbackedFields: unbacked
-					}
-				});
+				// BEST-EFFORT, unlike every other `auditOutcome` in this file, and the
+				// difference is the write. Elsewhere a row that fails to land after Apex
+				// accepted a write must not be swallowed — the caller would be told
+				// everything is fine. Here NOTHING was written, so letting `auditOutcome`
+				// throw would replace a correct, deliberate 409 with a framework 500 and
+				// hide the very refusal this guard exists to make. Same rule as
+				// `rejectMutation`, which cannot be used here because the body names the
+				// fields.
+				try {
+					await auditOutcome(ctx, meta, guard.actor, {
+						outcome: 'rejected',
+						detail: {
+							schema: params.schema,
+							recordId: idResult.data,
+							reason: 'unbacked-record',
+							unbackedFields: unbacked
+						}
+					});
+				} catch {
+					// swallow — auditing a refusal must not change the refusal's outcome
+				}
 				// The field NAMES travel back, not their values: "this record cannot be
 				// edited" is unactionable, while "these fields have no rows behind them"
 				// names what the backfill has to repair.
@@ -259,15 +279,48 @@ export async function handleUpdateRecord(
 	 * child-list write at all. Going the other way round would have the common
 	 * refusal arrive after the lists had already changed.
 	 */
-	const apexResponse = await guard.apex.updateContentLibraryRecord(
-		params.schema,
-		idResult.data,
-		flat,
-		references,
-		position
-	);
+	/**
+	 * BOTH WRITES ARE WRAPPED, and the reason is the second one.
+	 *
+	 * `call` in the Apex client RETHROWS a network fault unless the caller passed an
+	 * abort signal, and the admin path passes none. So a connection reset on the
+	 * second of three lists would escape this operation as a framework 500 — after
+	 * the flat write and the first list had already committed — with NO audit row
+	 * for any of it. The one record of a half-applied save would be missing exactly
+	 * when it is most needed.
+	 *
+	 * A thrown fault is therefore turned into the same typed failure an HTTP one
+	 * produces, so the audit below runs either way. The error itself is never
+	 * forwarded: it can carry a URL and upstream detail, and this response is read
+	 * by a browser.
+	 */
+	const flatHasWork =
+		Object.keys(flat).length > 0 || Object.keys(references).length > 0 || position !== undefined;
+	let apexResponse: ApexResponse;
+	if (!flatHasWork) {
+		// A LIST-ONLY save has nothing for the flat surface, and sending it an empty
+		// body is a round trip that can only fail. Treated as an accepted no-op so the
+		// child-list writes below run exactly as they would after a real flat write.
+		apexResponse = { status: 200, ok: true, body: null };
+	} else {
+		try {
+			apexResponse = await guard.apex.updateContentLibraryRecord(
+				params.schema,
+				idResult.data,
+				flat,
+				references,
+				position
+			);
+		} catch {
+			apexResponse = { status: 0, ok: false, body: null };
+		}
+	}
 
-	/** The child lists, once the flat write has been accepted. */
+	/**
+	 * The child lists, once the flat write has been accepted. `writeChildLists`
+	 * catches a thrown transport fault itself — it is the frame that knows which
+	 * list was in flight — so nothing escapes past here unaudited.
+	 */
 	const childResult =
 		apexResponse.ok && childLists.length > 0
 			? await writeChildLists(guard.apex, params.schema, idResult.data, current!, childLists)
@@ -341,7 +394,11 @@ export async function handleUpdateRecord(
 				error: 'child-list-write-failed',
 				code: 'child-list-write-failed',
 				field: childResult.field,
-				status: childResult.status,
+				// NOT `status`. `bff-client.js`'s `mutate` writes the HTTP status onto
+				// its result and then spreads the body over it, so a body key called
+				// `status` REPLACES the real one — a 502 silently reported as the 500
+				// that caused it. `0` here means "no answer at all" (a transport fault).
+				upstreamStatus: childResult.status,
 				written: childResult.written
 			},
 			childResult.status >= 400 && childResult.status < 500 ? childResult.status : 502

@@ -11,6 +11,7 @@ import {
 	summarizeRecord
 } from './record-shape';
 import { toApexFields } from './update-record';
+import { childListFieldNames } from './child-list';
 import {
 	buildPostLoad,
 	loadPostView,
@@ -78,6 +79,24 @@ export async function handleUpdatePostArchetype(
 	const wantedReferences = parsed.data.references ?? {};
 	if (Object.keys(fields).length === 0 && Object.keys(wantedReferences).length === 0) {
 		return rejectMutation(ctx, actor, 400, 'empty patch', 'empty patch');
+	}
+	/**
+	 * A post archetype has NO child-list transport, and this is the refusal that
+	 * says so in the right currency.
+	 *
+	 * `recordBodySchema` accepts an array on an array-shaped field — it has to, for
+	 * the content-library path that routes them to the items endpoint — and
+	 * `toApexFields` passes it through. There is no such routing here, so the value
+	 * would reach `updatePostArchetype`, whose `assertNoArrayFields` THROWS: an
+	 * uncaught framework 500 where a caller deserves a typed 400. No post schema on
+	 * any site declares an array-shaped field today; the next one that does would
+	 * find this out in production.
+	 */
+	const childListsOnPost = childListFieldNames(contract, params.schema).filter(
+		(name) => fields[name] !== undefined
+	);
+	if (childListsOnPost.length > 0) {
+		return rejectMutation(ctx, actor, 400, 'child list on post', 'child list on post');
 	}
 
 	const view = await loadPostView(guard.apex, params.schema, idResult.data);

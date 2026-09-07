@@ -69,7 +69,13 @@ export async function readContent(kv: ContentStore | undefined): Promise<Content
 	if (!kv) throw new ContentUnavailableError('the CONTENT binding is not configured');
 	if (memo && Date.now() - memoCheckedAt < MEMO_TTL_MS) return memo;
 	if (!inflight) {
-		inflight = (async () => {
+		// Declared before it is assigned so the `finally` below can compare against
+		// the promise that is ACTUALLY in the slot. `inflight = mine.finally(…)` puts
+		// a DIFFERENT promise there, `inflight === mine` is then never true, and the
+		// slot is never cleared — every later read past the memo TTL would be handed
+		// a long-resolved promise forever. Caught by a test that deadlocked.
+		let mine: Promise<ContentSnapshot>;
+		mine = (async () => {
 			const startedAt = generation;
 			const raw = await kv.get(CONTENT_KEY, { cacheTtl: 60 });
 			if (!raw) throw new ContentUnavailableError('nothing has been published yet');
@@ -84,9 +90,23 @@ export async function readContent(kv: ContentStore | undefined): Promise<Content
 				memoCheckedAt = Date.now();
 			}
 			return snapshot;
+			// CLEAR THE SLOT ONLY IF IT IS STILL OURS.
+			//
+			// An unconditional `inflight = null` clears whatever is there, INCLUDING A
+			// LATER READ'S PROMISE. That is how two reads end up running at once: a
+			// pre-reset read settles, frees the post-reset read's slot, and a third
+			// read starts against KV's 60-second edge cache — after which whichever
+			// lands last wins, and a slower one holding older bytes can install them
+			// over a newer memo for a full `MEMO_TTL_MS`.
+			//
+			// With the slot owned, at most one read is ever installing per generation,
+			// and a read that spans a reset is refused by the generation check above.
+			// Together those two are complete: there is no remaining path by which an
+			// older snapshot replaces a newer one.
 		})().finally(() => {
-			inflight = null;
+			if (inflight === mine) inflight = null;
 		});
+		inflight = mine;
 	}
 	return inflight;
 }

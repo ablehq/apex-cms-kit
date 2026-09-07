@@ -202,7 +202,6 @@ export function readTaggingsStrict(record: Record<string, unknown>): StrictTaggi
 	return { ok: true, taggings: rows };
 }
 
-/** `updated_at` as a plain string — the stale-save token for a single record. */
 /**
  * Read a PRIMITIVE field's value, preferring the `archetype_item` row over
  * `primitives`.

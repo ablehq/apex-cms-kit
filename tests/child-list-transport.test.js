@@ -10,10 +10,13 @@ import {
 import { unbackedPrimitiveKeys, readPrimitiveItemId } from '../src/server/bff/archetype-record.ts';
 import { handleUpdateRecord } from '../src/server/bff/operations/update-record.ts';
 import { handleCreateRecord } from '../src/server/bff/operations/create-record.ts';
+import { handleUpdatePostArchetype } from '../src/server/bff/operations/update-post-archetype.ts';
+import { handleCreatePost } from '../src/server/bff/operations/create-post.ts';
 import { createApexAdminClient } from '../src/server/bff/apex-admin-client.ts';
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
 import { createMemorySessionStore } from './harness/session-store.ts';
+import { createMigratedDatabase } from './harness/d1.ts';
 
 /**
  * P3: THE CHILD-LIST TRANSPORT, THE FLAT-SURFACE REFUSAL, AND THE PARTIAL-WRITE
@@ -62,23 +65,34 @@ function fieldDef(field_name, validator_kind) {
 	};
 }
 
+const TEAM_MEMBER_FIELDS = [
+	fieldDef('name', null),
+	fieldDef('biography', 'rich_text'),
+	fieldDef('expertise_items', 'array_ref/entity-type/expertise-text-item'),
+	fieldDef('highlights', 'array_ref/entity-type/text-item'),
+	fieldDef('tag_names', 'text_array'),
+	fieldDef('scores', 'number_array')
+];
+
 const contract = {
 	schema: (slug) =>
-		slug === 'team_member'
-			? { slug, display_name: slug, target_model: null, id: null, items: [] }
+		slug === 'team_member' || slug === 'article'
+			? {
+					slug,
+					display_name: slug,
+					target_model: slug === 'article' ? 'Cms::Post' : null,
+					id: null,
+					items: []
+				}
 			: null,
 	isContentLibrarySlug: (slug) => slug === 'team_member',
-	primitiveFieldDefs: (slug) =>
-		slug === 'team_member'
-			? [
-					fieldDef('name', null),
-					fieldDef('biography', 'rich_text'),
-					fieldDef('expertise_items', 'array_ref/entity-type/expertise-text-item'),
-					fieldDef('highlights', 'array_ref/entity-type/text-item'),
-					fieldDef('tag_names', 'text_array'),
-					fieldDef('scores', 'number_array')
-				]
-			: [],
+	primitiveFieldDefs: (slug) => {
+		if (slug === 'team_member') return TEAM_MEMBER_FIELDS;
+		// A POST schema that declares an array-shaped field. No site has one today;
+		// the next one that does must not find out in production.
+		if (slug === 'article') return [fieldDef('kind', null), fieldDef('tag_names', 'text_array')];
+		return [];
+	},
 	referenceItems: () => [],
 	referrersTo: () => ({ countable: [], uncounted: [] })
 };
@@ -157,10 +171,11 @@ function fakeApex({ items = [], unbackedPrimitives = null, failItemWrite = null 
 	};
 }
 
-function ctxWith(apex) {
+function ctxWith(apex, db) {
 	return {
 		allowedOrigins: parseAllowedOrigins(ORIGIN),
 		sessions: createMemorySessionStore(),
+		...(db ? { db } : {}),
 		auth: {
 			async passwordGrant() {
 				return null;
@@ -398,6 +413,24 @@ describe('the flat archetype_models surface REFUSES an array, in the client', ()
 		assert.equal(called, 0, 'nothing reached Apex');
 	});
 
+	it('checks EVERY key, not just the first — a scalar first field is not a pass', async () => {
+		let called = 0;
+		const apex = client(async () => {
+			called += 1;
+			return new Response('{}', { headers: { 'content-type': 'application/json' } });
+		});
+		await assert.rejects(
+			() =>
+				apex.updateContentLibraryRecord('team_member', RECORD_ID, {
+					name: 'Asha',
+					biography: { html: '<p>x</p>' },
+					expertise_items: [CHILD_A]
+				}),
+			/array on the flat archetype_models surface: expertise_items/
+		);
+		assert.equal(called, 0);
+	});
+
 	it('refuses on the POST archetype surface too — it is the same endpoint', async () => {
 		const apex = client();
 		await assert.rejects(
@@ -455,7 +488,7 @@ describe('the items endpoint — the surface that actually stores a list', () =>
 		assert.deepEqual(sent[0].body, { fields_data: { expertise_items: [CHILD_A] } });
 	});
 
-	it('PATCHes the EXISTING row by its item id', async () => {
+	it('PATCHes the EXISTING row by its item id, and its BODY is the envelope', async () => {
 		const { apex, sent } = recording();
 		await apex.updateArchetypeItem('team_member', RECORD_ID, 'expertise_items', CHILD_B, {
 			expertise_items: [CHILD_A]
@@ -465,6 +498,12 @@ describe('the items endpoint — the surface that actually stores a list', () =>
 			`https://apex.test/api/platform/v1/specification/archetypes/${RECORD_ID}/schema_item/expertise_items/items/${CHILD_B}`
 		);
 		assert.equal(sent[0].method, 'PATCH');
+		// The BODY, asserted whole. `fields_data` is not decoration: the controller
+		// branches on `permitted_params[:fields_data].blank?` and, when it is blank,
+		// updates the item's own columns instead — so an empty map, or the same keys
+		// spread at the root, is a SILENT NO-OP on the list. This is the common leg
+		// (POST happens once per field, ever), and it was the one going unasserted.
+		assert.deepEqual(sent[0].body, { fields_data: { expertise_items: [CHILD_A] } });
 	});
 
 	it('sends `position` only when asked, so an unpassed one cannot reorder the row', async () => {
@@ -650,7 +689,11 @@ describe('PATCH /records/:schema/:id — a child-list failure is named, not flat
 		const body = await response.json();
 		assert.equal(body.error, 'child-list-write-failed');
 		assert.equal(body.field, 'expertise_items');
-		assert.equal(body.status, 500);
+		// `upstreamStatus`, NOT `status`: the browser client spreads the body over its
+		// own result, so a body key called `status` would replace the real HTTP 502
+		// with the 500 that caused it.
+		assert.equal(body.upstreamStatus, 500);
+		assert.equal('status' in body, false, 'the body must not shadow the HTTP status');
 		assert.deepEqual(body.written, []);
 	});
 
@@ -692,6 +735,283 @@ describe('PATCH /records/:schema/:id — a child-list failure is named, not flat
 			false,
 			'the lists were never reached'
 		);
+	});
+});
+
+describe('the guard\u2019s boundary and its partial cases', () => {
+	it('refuses on ONE unbacked key as readily as on many', async () => {
+		// `> 0`, not `> 1`. A fixture that only ever carries two would let the
+		// off-by-one through, and one lost field is still a lost field.
+		const apex = fakeApex({
+			items: [
+				{ id: '44444444-4444-4444-8444-444444444444', field: 'name', fields_data: { name: 'Asha' } }
+			],
+			unbackedPrimitives: { designation: 'Partner' }
+		});
+		const ctx = ctxWith(apex);
+		const response = await update(ctx, { fields: { name: 'Asha Rao' } });
+		assert.equal(response.status, 409);
+		assert.deepEqual((await response.json()).unbackedFields, ['designation']);
+		assert.equal(apex.calls.length, 0);
+	});
+
+	it('refuses a PARTIALLY backed record — one row does not vouch for the rest', async () => {
+		// The dangerous middle state: a backfill that stopped, or a record one field
+		// of which was written by hand. `unbackedPrimitiveKeys` must be per-KEY;
+		// "does this record have any PropertySet row at all?" would call this healthy
+		// and then destroy the two keys with no row.
+		const apex = fakeApex({
+			items: [
+				{ id: '44444444-4444-4444-8444-444444444444', field: 'name', fields_data: { name: 'Asha' } }
+			],
+			unbackedPrimitives: { designation: 'Partner', email: 'a@b.test', alma_mater: 'NLS' }
+		});
+		const ctx = ctxWith(apex);
+		const response = await update(ctx, { fields: { name: 'Asha Rao' } });
+		assert.equal(response.status, 409);
+		assert.deepEqual((await response.json()).unbackedFields.sort(), [
+			'alma_mater',
+			'designation',
+			'email'
+		]);
+		assert.equal(apex.calls.length, 0, 'and it wrote nothing at all');
+	});
+});
+
+describe('the audit row says what actually happened', () => {
+	async function auditRows(db) {
+		return db.sqlite
+			.prepare('SELECT action, outcome, detail FROM bff_audit_log ORDER BY occurred_at, rowid')
+			.all()
+			.map((row) => ({ ...row, detail: row.detail ? JSON.parse(row.detail) : null }));
+	}
+
+	it('records which lists travelled and which landed', async () => {
+		const db = await createMigratedDatabase();
+		const apex = fakeApex({ items: backedItems() });
+		const ctx = ctxWith(apex, db);
+		assert.equal(
+			(await update(ctx, { fields: { expertise_items: [CHILD_B], tag_names: ['a'] } })).status,
+			200
+		);
+		const rows = await auditRows(db);
+		assert.equal(rows.length, 1);
+		assert.equal(rows[0].outcome, 'accepted');
+		assert.deepEqual(rows[0].detail.childLists, ['expertise_items', 'tag_names']);
+		assert.deepEqual(rows[0].detail.childListsWritten, ['expertise_items', 'tag_names']);
+		db.close();
+	});
+
+	it('a half-applied save is NEVER audited as accepted', async () => {
+		// The flat write and the first list are committed and cannot be taken back,
+		// so this row is the only record that the record is now in a mixed state.
+		const db = await createMigratedDatabase();
+		const apex = fakeApex({ items: backedItems(), failItemWrite: 'highlights' });
+		const ctx = ctxWith(apex, db);
+		const response = await update(ctx, {
+			fields: { name: 'Asha Rao', expertise_items: [CHILD_B], highlights: [CHILD_A] }
+		});
+		assert.equal(response.status, 502);
+		const rows = await auditRows(db);
+		assert.equal(rows.length, 1, 'one row, not two');
+		assert.equal(rows[0].outcome, 'apex_error');
+		assert.equal(rows[0].detail.childListFailedOn, 'highlights');
+		assert.equal(rows[0].detail.childListStatus, 500);
+		assert.deepEqual(rows[0].detail.childListsWritten, ['expertise_items']);
+		assert.deepEqual(rows[0].detail.fields.sort(), ['expertise_items', 'highlights', 'name']);
+		db.close();
+	});
+
+	it('a refused unbacked write is audited as rejected, with the fields named', async () => {
+		const db = await createMigratedDatabase();
+		const apex = fakeApex({ items: [], unbackedPrimitives: { name: 'Asha', email: 'a@b.test' } });
+		const ctx = ctxWith(apex, db);
+		assert.equal((await update(ctx, { fields: { name: 'x' } })).status, 409);
+		const rows = await auditRows(db);
+		assert.equal(rows.length, 1);
+		assert.equal(rows[0].outcome, 'rejected');
+		assert.equal(rows[0].detail.reason, 'unbacked-record');
+		assert.deepEqual(rows[0].detail.unbackedFields.sort(), ['email', 'name']);
+		db.close();
+	});
+
+	it('a TRANSPORT fault mid-list is audited too, and names the list it died on', async () => {
+		// `call` rethrows a network fault when no abort signal was passed, and the
+		// admin path passes none. Without the catch this escaped as a framework 500
+		// AFTER the flat write had committed, with no audit row for any of it.
+		const db = await createMigratedDatabase();
+		const apex = fakeApex({ items: backedItems() });
+		apex.updateArchetypeItem = async () => {
+			throw new TypeError('fetch failed');
+		};
+		const ctx = ctxWith(apex, db);
+		const response = await update(ctx, {
+			fields: { name: 'Asha Rao', expertise_items: [CHILD_B] }
+		});
+		assert.equal(response.status, 502);
+		const body = await response.json();
+		assert.equal(body.error, 'child-list-write-failed');
+		assert.equal(body.field, 'expertise_items');
+		assert.equal(body.upstreamStatus, 0, '`0` is "no answer", not an HTTP refusal');
+		const rows = await auditRows(db);
+		assert.equal(rows.length, 1);
+		assert.equal(rows[0].outcome, 'apex_error');
+		assert.equal(rows[0].detail.childListFailedOn, 'expertise_items');
+		db.close();
+	});
+
+	it('a thrown FLAT write is audited too, rather than escaping as a 500', async () => {
+		const db = await createMigratedDatabase();
+		const apex = fakeApex({ items: backedItems() });
+		apex.updateContentLibraryRecord = async () => {
+			throw new TypeError('fetch failed');
+		};
+		const ctx = ctxWith(apex, db);
+		const response = await update(ctx, { fields: { name: 'Asha Rao' } });
+		assert.equal(response.status, 502);
+		const rows = await auditRows(db);
+		assert.equal(rows.length, 1);
+		assert.equal(rows[0].outcome, 'apex_error');
+		assert.equal(rows[0].detail.apexStatus, 0);
+		db.close();
+	});
+});
+
+describe('what a save costs, and what it records when it fails before it starts', () => {
+	it('a LIST-ONLY save sends no empty flat PATCH', async () => {
+		// Nothing belongs on the flat surface, and an empty body is a round trip that
+		// can only fail. The child writes must still run exactly as they would after
+		// a real one.
+		const apex = fakeApex({ items: backedItems() });
+		const ctx = ctxWith(apex);
+		const response = await update(ctx, { fields: { expertise_items: [CHILD_B] } });
+		assert.equal(response.status, 200, await response.clone().text());
+		assert.equal(
+			apex.calls.some((call) => call.kind === 'flat'),
+			false,
+			'no flat write was attempted'
+		);
+		assert.deepEqual(apex.record().primitives.expertise_items, [CHILD_B], 'and the list landed');
+	});
+
+	it('still sends the flat PATCH when a scalar, a reference or a reorder is in the save', async () => {
+		for (const [label, body] of [
+			['a scalar', { fields: { name: 'Asha Rao', expertise_items: [CHILD_B] } }],
+			['a reorder', { position: 7, fields: { expertise_items: [CHILD_B] } }]
+		]) {
+			const apex = fakeApex({ items: backedItems() });
+			const ctx = ctxWith(apex);
+			assert.equal((await update(ctx, body)).status, 200, label);
+			assert.ok(
+				apex.calls.some((call) => call.kind === 'flat'),
+				`${label} still travels flat`
+			);
+		}
+	});
+
+	it('an unreadable record is a 502 WITH an audit row, not a silent one', async () => {
+		// The pre-write read failing used to return a bare `bffError` before the audit
+		// block, so a save that failed before it started left no trace at all.
+		const db = await createMigratedDatabase();
+		const apex = fakeApex({ items: backedItems() });
+		apex.getContentLibraryRecord = async () => ({ status: 503, ok: false, body: null });
+		const ctx = ctxWith(apex, db);
+		const response = await update(ctx, { fields: { name: 'Asha Rao' } });
+		assert.equal(response.status, 502);
+		const rows = db.sqlite
+			.prepare('SELECT outcome, detail FROM bff_audit_log')
+			.all()
+			.map((row) => ({ ...row, detail: row.detail ? JSON.parse(row.detail) : null }));
+		assert.equal(rows.length, 1);
+		assert.equal(rows[0].outcome, 'rejected');
+		assert.equal(rows[0].detail.reason, 'pre-write read failed');
+		db.close();
+	});
+
+	it('an unbacked refusal survives a broken audit log — a 409 never becomes a 500', async () => {
+		// Nothing was written, so a D1 hiccup must not replace the deliberate refusal
+		// with a framework error and hide the very thing the guard exists to say.
+		const db = await createMigratedDatabase();
+		db.sqlite.exec('DROP TABLE bff_audit_log');
+		const apex = fakeApex({ items: [], unbackedPrimitives: { name: 'Asha', email: 'a@b.test' } });
+		const ctx = ctxWith(apex, db);
+		const response = await update(ctx, { fields: { name: 'x' } });
+		assert.equal(response.status, 409, 'the refusal still arrives');
+		assert.equal((await response.json()).error, 'unbacked-record');
+		db.close();
+	});
+});
+
+describe('PATCH /posts/:schema/:id — an array on a post archetype is a 400, not a 500', () => {
+	it('refuses it with a typed status instead of letting the client throw', async () => {
+		// `recordBodySchema` accepts an array on an array-shaped field — it has to,
+		// for the record path that routes them to the items endpoint — and
+		// `toApexFields` passes it through. There is NO such routing for a post, so
+		// the value would reach `updatePostArchetype`, whose `assertNoArrayFields`
+		// throws: an uncaught framework 500 where the caller deserves a 400.
+		const apex = {
+			async listPosts() {
+				throw new Error('the refusal must land before any upstream read');
+			},
+			async updatePostArchetype() {
+				throw new Error('must not write');
+			}
+		};
+		const ctx = ctxWith(apex);
+		const session = await signIn(ctx);
+		const postId = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+		const response = await handleUpdatePostArchetype(
+			new Request(`${ORIGIN}/api/admin/posts/article/${postId}`, {
+				method: 'PATCH',
+				headers: {
+					origin: ORIGIN,
+					'sec-fetch-site': 'same-origin',
+					'x-csrf-token': CSRF,
+					'content-type': 'application/json',
+					cookie: `apex_admin_session=${session}; apex_bff_csrf=${CSRF}`
+				},
+				body: JSON.stringify({ fields: { tag_names: ['a', 'b'] } })
+			}),
+			ctx,
+			{ schema: 'article', postId }
+		);
+		assert.equal(response.status, 400);
+		assert.equal((await response.json()).error, 'child list on post');
+	});
+});
+
+describe('POST /posts/:schema — an array on a post CREATE is a 400, not a 500', () => {
+	it('refuses it in the body schema, before the client can throw', async () => {
+		// Same trapdoor as the post UPDATE: `z.unknown()` accepted an array,
+		// `toApexFields` passed it, and `createPost` → `assertNoArrayFields` threw.
+		const apex = {
+			async createPost() {
+				throw new Error('must not write');
+			}
+		};
+		const ctx = ctxWith(apex);
+		const session = await signIn(ctx);
+		const response = await handleCreatePost(
+			new Request(`${ORIGIN}/api/admin/posts/article`, {
+				method: 'POST',
+				headers: {
+					origin: ORIGIN,
+					'sec-fetch-site': 'same-origin',
+					'x-csrf-token': CSRF,
+					'content-type': 'application/json',
+					cookie: `apex_admin_session=${session}; apex_bff_csrf=${CSRF}`
+				},
+				body: JSON.stringify({
+					title: 'A post',
+					slug: 'a-post',
+					fields: { tag_names: ['a', 'b'] }
+				})
+			}),
+			ctx,
+			{ schema: 'article' }
+		);
+		assert.equal(response.status, 400);
+		assert.equal((await response.json()).error, 'invalid body');
 	});
 });
 
