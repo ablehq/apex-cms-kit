@@ -107,13 +107,40 @@ export function readPosition(record: Record<string, unknown>): number | null {
  * separately by `containsNullPrimitive`, which can tell a null on a primitive from
  * a null on a reference. Doing it in zod would need the same distinction and would
  * report it as a shape failure rather than as what it is.
+ *
+ * ARRAYS ARE DECIDED BY THE FIELD'S KIND, not left to `z.unknown()`:
+ *
+ *   - an ARRAY-SHAPED field (`array_ref/…`, `text_array`, `number_array`) takes an
+ *     array and only an array, checked down to its entries. It leaves the flat
+ *     surface entirely — see `child-list.ts`;
+ *   - EVERY OTHER field REFUSES an array. `z.unknown()` accepted one, and an array
+ *     on a scalar field is stored as `[]` by the flat surface with a 200. The Apex
+ *     client throws on the same input; this makes it a named 400 before the throw,
+ *     so a caller gets told what was wrong with its body instead of a 500.
  */
 export function recordBodySchema(contract: ContentContract, slug: string) {
-	const fieldNames = contract.primitiveFieldDefs(slug).map((def) => def.field_name);
+	const fieldDefs = contract.primitiveFieldDefs(slug);
 	const references = contract.referenceItems(slug);
 
 	const fieldsShape: Record<string, z.ZodTypeAny> = {};
-	for (const name of fieldNames) fieldsShape[name] = z.unknown().optional();
+	for (const def of fieldDefs) {
+		const kind = def.validator_kind ?? '';
+		if (kind.startsWith('array_ref')) {
+			// The entries are content-library ENTITY ids. A malformed one would reach
+			// the items endpoint and come back as a bare 500 (see `updateArchetypeItem`),
+			// so it is worth refusing here where the field can still be named.
+			fieldsShape[def.field_name] = z.array(z.string().uuid()).max(200).optional();
+		} else if (kind === 'text_array') {
+			fieldsShape[def.field_name] = z.array(z.string()).max(200).optional();
+		} else if (kind === 'number_array') {
+			fieldsShape[def.field_name] = z.array(z.number()).max(200).optional();
+		} else {
+			fieldsShape[def.field_name] = z
+				.unknown()
+				.refine((value) => !Array.isArray(value), 'this field does not hold a list')
+				.optional();
+		}
+	}
 
 	const referencesShape: Record<string, z.ZodTypeAny> = {};
 	for (const item of references) {

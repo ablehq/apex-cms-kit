@@ -5,6 +5,7 @@ import { guardRequest } from '../guard';
 import { rejectMutation } from '../reject';
 import { cleanString, unwrapArchetypeRecord } from '../archetype-record';
 import { recordBodySchema, referenceFieldNames, summarizeRecord } from './record-shape';
+import { childListFieldNames } from './child-list';
 import { toApexFields } from './update-record';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import type { BffContext } from '../context';
@@ -79,6 +80,28 @@ export async function handleCreateRecord(
 	// opens a moment later, through the update path that actually sends it.
 	if (parsed.data.position !== undefined) {
 		return rejectMutation(ctx, actorMeta, 400, 'position on create', 'position on create');
+	}
+	/**
+	 * NOR IS A CHILD LIST WRITABLE ON CREATE, and it too is refused rather than
+	 * dropped.
+	 *
+	 * An array-shaped field has to go to `/specification/archetypes/:id/schema_item/
+	 * :field/items`, which needs the archetype id this call is about to mint. Sent
+	 * flat on the create it would answer 201 and store `[]` — the same silent loss
+	 * `assertNoArrayFields` refuses on the update — so the create would report
+	 * success over a list that was never written. The editor sets them a moment
+	 * later, on the screen that opens against the real id, through the update path
+	 * that routes them properly.
+	 *
+	 * Refused by NAME, not by value shape: `[]` on a child list is just as much a
+	 * caller that thinks this call writes lists, and the body schema has already
+	 * refused a non-array on one.
+	 */
+	const childListsOnCreate = childListFieldNames(contract, params.schema).filter(
+		(name) => (parsed.data.fields ?? {})[name] !== undefined
+	);
+	if (childListsOnCreate.length > 0) {
+		return rejectMutation(ctx, actorMeta, 400, 'child list on create', 'child list on create');
 	}
 
 	const fields = toApexFields(parsed.data.fields ?? {});

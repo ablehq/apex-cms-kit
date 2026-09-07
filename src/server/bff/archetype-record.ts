@@ -231,6 +231,62 @@ export function readPrimitiveValue(record: Record<string, unknown>, name: string
 	return name in primitives ? primitives[name] : undefined;
 }
 
+/**
+ * The id of the PRIMITIVE `archetype_item` row that holds one field, or null.
+ *
+ * This is the row a child-list write addresses. A Primitive schema item is forced
+ * `has_one` upstream (`archetype_schema_item/primitive.rb` sets
+ * `relationship_kind = "has_one"` in a `before_validation`), and
+ * `ArchetypeItem#validate_schema_item` refuses a SECOND row for the same schema
+ * item — measured: a second `POST …/schema_item/expertise_items/items` answers
+ * **422**. So a list is ONE row holding the whole array, and writing one is
+ * "PATCH the row if it exists, POST only when it does not".
+ *
+ * `relatable_type` is the discriminator, not the name: a primitive's row is backed
+ * by a `PropertySet` and a reference's by a `Specification::Archetype`, and both
+ * carry `fields_data` under the item's own name.
+ */
+export function readPrimitiveItemId(record: Record<string, unknown>, name: string): string | null {
+	for (const item of readArchetypeItems(record)) {
+		if (item.relatable_type !== 'PropertySet') continue;
+		const schemaItem = isRecord(item.archetype_schema_item) ? item.archetype_schema_item : null;
+		if (!schemaItem) continue;
+		if (schemaItem.name !== name && schemaItem.slug !== name) continue;
+		const itemId = cleanString(item.id);
+		if (itemId) return itemId;
+	}
+	return null;
+}
+
+/**
+ * Which keys of `primitives` NO Primitive `archetype_item` row accounts for — the
+ * measurement the partial-write guard is built on.
+ *
+ * `Archetype#primitives` is a CACHE, not storage. `Archetype#on_primitive_changed`
+ * rebuilds it from scratch out of every Primitive item's `fields_data` on each item
+ * save and each item destroy (`archetype.rb:206-218`, `archetype_item.rb:184-197`).
+ * So a key that lives in `primitives` with no item behind it survives only until
+ * the next write of ANY field on that record, at which point the rebuild simply
+ * does not produce it and it is gone — silently, with a 200.
+ *
+ * An empty answer therefore means "every stored value has a row to be rebuilt
+ * from", which is the state every record created through any admin is in from
+ * birth. A non-empty answer names exactly what a partial write would destroy.
+ *
+ * Conservative on purpose: an item whose `fields_data` does not carry the key is
+ * NOT counted as covering it, because the rebuild would not carry it either.
+ */
+export function unbackedPrimitiveKeys(record: Record<string, unknown>): string[] {
+	const covered = new Set<string>();
+	for (const item of readArchetypeItems(record)) {
+		if (item.relatable_type !== 'PropertySet') continue;
+		const fieldsData = isRecord(item.fields_data) ? item.fields_data : null;
+		if (!fieldsData) continue;
+		for (const key of Object.keys(fieldsData)) covered.add(key);
+	}
+	return Object.keys(readPrimitives(record)).filter((key) => !covered.has(key));
+}
+
 /** One entry of a reference relation: the JOIN ROW and the record it points at. */
 export interface ArchetypeReference {
 	/**
