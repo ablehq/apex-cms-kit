@@ -11,7 +11,7 @@
 import { fetchAllPages } from '../../cms/pagination.js';
 import { collectArchetypeReferences, createArchetypesDataEntry } from '../../cms/archetype-data.js';
 import type { ApexAdminClient } from '../bff/apex-admin-client';
-import { CONTENT_KEY } from './read';
+import { CONTENT_KEY, resetContentMemo, versionOf } from './read';
 import type { ContentSnapshot, ContentStore } from './read';
 
 const PLATFORM = '/api/platform/v1';
@@ -77,7 +77,12 @@ export type PublishResult =
 	  }
 	| {
 			ok: false;
-			error: 'account_unpinned' | 'account_mismatch' | 'empty_collection' | 'too_large';
+			error:
+				| 'account_unpinned'
+				| 'account_mismatch'
+				| 'empty_collection'
+				| 'too_large'
+				| 'concurrent_publish';
 			detail: string;
 	  };
 
@@ -99,6 +104,42 @@ export async function publishContent(options: PublishOptions): Promise<PublishRe
 			detail: 'PRIVATE_APEX_ACCOUNT_ID is not set; a publish must be pinned to one Apex account.'
 		};
 	}
+
+	/**
+	 * THE VERSION THE STORE HELD WHEN THIS PUBLISH STARTED — the left half of the
+	 * compare-and-set below, and the reason it is read here rather than later.
+	 *
+	 * Everything between this line and the `kv.put` at the end is a long fetch: 27
+	 * upstream requests on Poovayya, tens of seconds. The write was unconditional,
+	 * so a publish that STARTED first could FINISH last and permanently restore
+	 * older content — reproduced by pausing publish A, letting B complete with newer
+	 * content, and resuming A. Two tabs, two editors, or one slow request and a
+	 * retry all reach it.
+	 *
+	 * WHAT THIS IS AND IS NOT. Workers KV has no atomic compare-and-set and no
+	 * lock, so this cannot be a guarantee; a true one needs a Durable Object to
+	 * serialise the whole span, which is infrastructure neither site has. What it
+	 * does is collapse the window from the WHOLE FETCH (seconds to a minute, and
+	 * wide open by construction) to the gap between the final read and the write
+	 * (one JSON.stringify and a byte count). That is a different order of risk, and
+	 * it fails the safe way: the loser is told to publish again, having written
+	 * nothing.
+	 *
+	 * THE COST is one extra `kv.get` of the whole snapshot per publish — the same
+	 * read the empty-collection guard already makes, taken once more at the start.
+	 * KV has no metadata-only read for a value, so the version cannot be had more
+	 * cheaply; against 27 upstream requests it is not the term that matters.
+	 *
+	 * THE OTHER COST is liveness for an AUTOMATED caller: GLC's ingest finalize
+	 * republishes the site, and a finalize that races an editor now logs a refusal
+	 * and republishes nothing rather than racing (`ingest-audio.ts:483-493` already
+	 * treats a refusal as a logged non-failure). The new content goes live on the
+	 * next publish instead of possibly clobbering, or being clobbered by, the
+	 * editor's. A retry-on-conflict would restore the liveness; it is deliberately
+	 * not here, because re-running the whole fetch is a decision a caller should
+	 * make, not one this function should make for a human waiting on a button.
+	 */
+	const startedFrom = versionOf(await kv.get(CONTENT_KEY));
 
 	const configResponse = await apex.readCmsConfig();
 	if (!configResponse.ok)
@@ -144,6 +185,21 @@ export async function publishContent(options: PublishOptions): Promise<PublishRe
 	const { files, warnings } = await project(raw, { apex });
 
 	const previousRaw = await kv.get(CONTENT_KEY);
+	// The right half of the compare-and-set. Checked BEFORE the empty-collection
+	// guard on purpose: if someone else published while this one was fetching, the
+	// counts below would be compared against a snapshot this publish never saw, and
+	// "the site has 12" would be a sentence about somebody else's write.
+	const heldNow = versionOf(previousRaw);
+	if (heldNow !== startedFrom) {
+		return {
+			ok: false,
+			error: 'concurrent_publish',
+			detail:
+				startedFrom === null
+					? 'another publish finished while this one was gathering content; nothing was written. Publish again.'
+					: `another publish finished while this one was gathering content (the site is now on ${heldNow ?? 'nothing'}, this run started from ${startedFrom}); nothing was written. Publish again.`
+		};
+	}
 	const previous = previousRaw ? (JSON.parse(previousRaw) as ContentSnapshot).counts : null;
 	const counts = Object.fromEntries(
 		files.map((file) => [file.name, Array.isArray(file.records) ? file.records.length : 0])
@@ -195,6 +251,12 @@ export async function publishContent(options: PublishOptions): Promise<PublishRe
 		};
 	}
 	await kv.put(CONTENT_KEY, serialised);
+	// A publish used to invalidate nothing, so the isolate that made it kept serving
+	// the PREVIOUS snapshot for up to a minute — the admin rail included, which is
+	// the one reader guaranteed to be looking. This removes the self-inflicted half
+	// of that delay. KV's own 60 s edge cache and every other isolate's memo are
+	// untouched, so a visitor elsewhere still waits; see `resetContentMemo`.
+	resetContentMemo();
 	return { ok: true, version, counts, previous, warnings };
 }
 

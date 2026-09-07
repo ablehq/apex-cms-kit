@@ -41,21 +41,49 @@ let memo: ContentSnapshot | null = null;
 /** When the memo was last confirmed against KV; re-checked at most once a minute. */
 let memoCheckedAt = 0;
 let inflight: Promise<ContentSnapshot> | null = null;
+/**
+ * Bumped by every `resetContentMemo`. A read that started before an invalidation
+ * must not install what it fetched: its bytes are older than the event that
+ * invalidated the memo, and installing them would restore the stale snapshot for a
+ * whole `MEMO_TTL_MS` — undoing the invalidation the publish just paid for.
+ */
+let generation = 0;
 const MEMO_TTL_MS = 60_000;
 
 const VERSION_PREFIX = /^\{"version":"([^"]+)"/u;
+
+/**
+ * The `version` of a stored snapshot, read from the first bytes without parsing.
+ *
+ * Exported because the PUBLISH compares it too: the version the store held when a
+ * publish started, against the version it holds just before the write. One regex,
+ * one place — a second copy that drifted would make the concurrency check pass on
+ * snapshots it should refuse.
+ */
+export function versionOf(raw: string | null | undefined): string | null {
+	if (!raw) return null;
+	return VERSION_PREFIX.exec(raw)?.[1] ?? null;
+}
 
 export async function readContent(kv: ContentStore | undefined): Promise<ContentSnapshot> {
 	if (!kv) throw new ContentUnavailableError('the CONTENT binding is not configured');
 	if (memo && Date.now() - memoCheckedAt < MEMO_TTL_MS) return memo;
 	if (!inflight) {
 		inflight = (async () => {
+			const startedAt = generation;
 			const raw = await kv.get(CONTENT_KEY, { cacheTtl: 60 });
 			if (!raw) throw new ContentUnavailableError('nothing has been published yet');
-			const version = VERSION_PREFIX.exec(raw)?.[1];
-			if (!memo || version !== memo.version) memo = JSON.parse(raw) as ContentSnapshot;
-			memoCheckedAt = Date.now();
-			return memo;
+			const version = versionOf(raw);
+			const snapshot =
+				memo && version === memo.version ? memo : (JSON.parse(raw) as ContentSnapshot);
+			// A publish landed while this read was in flight: hand THIS caller what KV
+			// gave us, but do not memoise it — the next read re-fetches and sees the new
+			// value rather than waiting out a minute on bytes fetched before the write.
+			if (generation === startedAt) {
+				memo = snapshot;
+				memoCheckedAt = Date.now();
+			}
+			return snapshot;
 		})().finally(() => {
 			inflight = null;
 		});
@@ -68,9 +96,20 @@ export function manifestOf(snapshot: ContentSnapshot): ContentManifest {
 	return manifest;
 }
 
-/** Tests only: forget the isolate memo. */
+/**
+ * Forget the isolate memo — called by `publishContent` after the write, and by
+ * tests that want a cold reader.
+ *
+ * A publish invalidating its own isolate's memo is not a nicety: without it a
+ * publish reaches the READER that made it no sooner than any other visitor, so the
+ * admin rail and any SSR in that isolate keep serving the previous snapshot for up
+ * to `MEMO_TTL_MS`. It removes the self-inflicted half of the delay. It does NOT
+ * remove KV's own edge cache (`cacheTtl: 60` above) and it does not reach any other
+ * isolate — a visitor on a different one still waits.
+ */
 export function resetContentMemo() {
 	memo = null;
 	memoCheckedAt = 0;
 	inflight = null;
+	generation += 1;
 }

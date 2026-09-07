@@ -171,6 +171,83 @@ describe('publishContent', () => {
 		assert.equal(allowed.previous.authors, 1);
 	});
 
+	it('refuses a publish whose store moved underneath it, and keeps the newer content', async () => {
+		/**
+		 * THE LOST UPDATE, REPRODUCED. Publish A starts, is paused mid-fetch, B
+		 * finishes with newer content, A resumes — and before P3 A's older content
+		 * won, permanently, because the write was unconditional. Two tabs, two
+		 * editors, or one slow request and a retry all reach it.
+		 *
+		 * A is paused inside the FETCH, after it has read the version it started
+		 * from, which is exactly where the real window is. Reverting the
+		 * `startedFrom`/`heldNow` comparison in `publish.ts` makes this fail with
+		 * B's content overwritten by A's.
+		 */
+		const kv = memoryStore();
+		assert.equal(
+			(await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'first' })).ok,
+			true
+		);
+
+		let release = () => {};
+		const paused = new Promise((resolve) => {
+			release = resolve;
+		});
+		const slowApex = stubApex();
+		const originalGet = slowApex.get;
+		let held = false;
+		slowApex.get = async (path, query) => {
+			if (!held) {
+				held = true;
+				await paused;
+			}
+			return originalGet(path, query);
+		};
+
+		const a = publishContent({ apex: slowApex, kv, accountId: ACCOUNT, publishedBy: 'A' });
+		// B publishes to completion while A is still gathering.
+		const b = await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'B' });
+		assert.equal(b.ok, true);
+		release();
+
+		const refused = await a;
+		assert.deepEqual([refused.ok, refused.error], [false, 'concurrent_publish']);
+		assert.match(refused.detail, /another publish finished/u);
+		const stored = JSON.parse(kv.map.get(CONTENT_KEY));
+		assert.equal(stored.publishedBy, 'B', "B's content survives; A wrote nothing");
+		assert.equal(stored.version, b.version);
+	});
+
+	it('refuses a first publish that raced another first publish', async () => {
+		// The `null` → something transition is the same race with no previous version
+		// to name, and it has to refuse too: otherwise the very first two publishes on
+		// a new deployment are a coin toss.
+		const kv = memoryStore();
+		let release = () => {};
+		const paused = new Promise((resolve) => {
+			release = resolve;
+		});
+		const slowApex = stubApex();
+		const originalGet = slowApex.get;
+		let held = false;
+		slowApex.get = async (path, query) => {
+			if (!held) {
+				held = true;
+				await paused;
+			}
+			return originalGet(path, query);
+		};
+		const a = publishContent({ apex: slowApex, kv, accountId: ACCOUNT, publishedBy: 'A' });
+		assert.equal(
+			(await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'B' })).ok,
+			true
+		);
+		release();
+		const refused = await a;
+		assert.deepEqual([refused.ok, refused.error], [false, 'concurrent_publish']);
+		assert.equal(JSON.parse(kv.map.get(CONTENT_KEY)).publishedBy, 'B');
+	});
+
 	it('throws on an Apex failure and writes nothing', async () => {
 		const kv = memoryStore();
 		const apex = stubApex({ '/api/platform/v1/tags/search_and_filter': undefined });
@@ -202,12 +279,60 @@ describe('readContent', () => {
 		assert.equal(await readContent(counting), first, 'served from the memo within the minute');
 		assert.equal(reads, 2, 'no KV read inside the memo window');
 
+		// A PUBLISH NOW INVALIDATES THIS ISOLATE'S MEMO. Until P3 this line read
+		// "still the memo until the minute is up", and it was true: the reader that
+		// had just published kept serving the PREVIOUS snapshot for up to a minute —
+		// the admin rail included, which is the one reader certain to be looking.
 		await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'e', now: 1 });
-		assert.equal(await readContent(counting), first, 'still the memo until the minute is up');
-		resetContentMemo(); // stands in for the minute passing
-		const next = await readContent(counting);
-		assert.notEqual(next.version, first.version);
+		const afterPublish = await readContent(counting);
+		assert.notEqual(afterPublish.version, first.version, 'the publish is visible at once');
+		assert.equal(reads, 3, 'the invalidated memo cost exactly one more KV read');
+		// …and then memoises again, so the invalidation is one read, not a disabled memo.
+		assert.equal(await readContent(counting), afterPublish, 'memoised again after the publish');
 		assert.equal(reads, 3);
 		await assert.rejects(readContent(undefined), /CONTENT binding is not configured/);
+	});
+
+	it('does not let a read that started before a publish re-install the old snapshot', async () => {
+		/**
+		 * The invalidation is worth nothing if an in-flight read can undo it. A
+		 * visitor's read begins, KV hands back the OLD bytes, a publish lands and
+		 * resets the memo — and then the read completes and memoises what it fetched,
+		 * restoring the stale snapshot for a whole minute. Reverting the generation
+		 * check in `read.ts` makes this fail: the second read is served the old
+		 * version out of a memo the publish had already cleared.
+		 */
+		resetContentMemo();
+		const kv = memoryStore();
+		await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'e', now: 1 });
+		const old = kv.map.get(CONTENT_KEY);
+		const oldVersion = JSON.parse(old).version;
+
+		let release = () => {};
+		const held = new Promise((resolve) => {
+			release = resolve;
+		});
+		let slow = true;
+		const slowKv = {
+			async get(key) {
+				// The bytes are taken FIRST and the response is slow — which is what KV
+				// handing back a value that goes stale in flight actually looks like.
+				const value = kv.map.get(key) ?? null;
+				if (slow) await held;
+				return value;
+			},
+			put: kv.put.bind(kv)
+		};
+
+		const reading = readContent(slowKv); // starts, blocks inside kv.get
+		// The publish lands (and invalidates) while that read is still in flight.
+		kv.map.set(CONTENT_KEY, old.replace(oldVersion, 'published-during-the-read'));
+		resetContentMemo();
+		release();
+		assert.equal((await reading).version, oldVersion, 'the in-flight read keeps its own bytes');
+
+		slow = false;
+		const next = await readContent(slowKv);
+		assert.equal(next.version, 'published-during-the-read', 'the next read is not stale');
 	});
 });
