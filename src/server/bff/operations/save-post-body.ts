@@ -1,10 +1,11 @@
 import { auditOutcome } from '../audit';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectGuardFailure, rejectMutation } from '../reject';
+import { refuseOversizedFields, rejectGuardFailure, rejectMutation } from '../reject';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import {
 	apexBlockRows,
+	blockHtmlValues,
 	buildBlocksAttributes,
 	loadPostView,
 	normalizeBlocks,
@@ -55,6 +56,13 @@ export async function handleSavePostBody(
 	} catch {
 		return rejectMutation(ctx, actor, 400, 'invalid json', 'invalid json');
 	}
+	// The per-field ceiling, in the same currency as every other write path. The
+	// schema's `.max(MAX_FIELD_VALUE_CHARS)` already refused an over-long block, but
+	// as a generic `invalid body` — which does not say WHICH of up to two hundred
+	// blocks was the one. Run first, so the typed answer wins.
+	const tooLarge = await refuseOversizedFields(ctx, actor, blockHtmlValues(bodyJson));
+	if (tooLarge) return tooLarge;
+
 	const parsed = savePostBodySchema.safeParse(bodyJson);
 	if (!parsed.success) return rejectMutation(ctx, actor, 400, 'invalid body', 'invalid body');
 

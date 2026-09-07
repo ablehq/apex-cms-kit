@@ -407,6 +407,31 @@ const blockSchema = z
 
 export const savePostBodySchema = z.object({ blocks: z.array(blockSchema).max(200) }).strict();
 
+/**
+ * The block bodies in an UNVALIDATED save, keyed so a refusal can name the block.
+ *
+ * `blockSchema.html` carries `.max(MAX_FIELD_VALUE_CHARS)`, which is the same
+ * ceiling every other write path enforces — but a zod `.max()` fails as
+ * `invalid body`, and an editor who pasted a document into the third block of
+ * twelve cannot act on that. This lets `handleSavePostBody` run the SAME
+ * `refuseOversizedFields` the record, entity and archetype paths run, before the
+ * shape check, so the answer is a typed `field-too-large` naming `blocks[2].html`.
+ *
+ * Deliberately tolerant of a malformed body: anything that is not an array of
+ * objects contributes no key, and the shape check that follows refuses it.
+ */
+export function blockHtmlValues(body: unknown): Record<string, unknown> {
+	const blocks = (body as { blocks?: unknown })?.blocks;
+	if (!Array.isArray(blocks)) return {};
+	const out: Record<string, unknown> = {};
+	blocks.forEach((block, index) => {
+		if (!block || typeof block !== 'object' || Array.isArray(block)) return;
+		const html = (block as { html?: unknown }).html;
+		if (html !== undefined) out[`blocks[${index}].html`] = html;
+	});
+	return out;
+}
+
 export type DesiredBlock = z.infer<typeof blockSchema>;
 
 /** The `blockable_type` an editable kind maps to. */

@@ -6,6 +6,8 @@ import { handlePatchEntityFields } from '../src/server/bff/operations/patch-enti
 import { handleCreateRecord } from '../src/server/bff/operations/create-record.ts';
 import { handleUpdateRecord } from '../src/server/bff/operations/update-record.ts';
 import { handleUpdatePostArchetype } from '../src/server/bff/operations/update-post-archetype.ts';
+import { handleCreatePost } from '../src/server/bff/operations/create-post.ts';
+import { handleSavePostBody } from '../src/server/bff/operations/save-post-body.ts';
 import { MAX_FIELD_VALUE_CHARS } from '../src/sanitize/write-boundary.ts';
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
@@ -43,6 +45,7 @@ const TYPE_ID = '5c9f0a21-1b2c-4d3e-8f40-a1b2c3d4e5f6';
 const ENTITY_ID = '8f14e45f-ceea-467a-9a3c-3f1a7c9d2b55';
 const POST_ID = '7d1a2b3c-4e5f-4061-8172-9a8b7c6d5e4f';
 const ARCHETYPE_ID = '1b2c3d4e-5f60-4718-a293-b4c5d6e7f809';
+const DOCUMENT_ID = '2c3d4e5f-6071-4829-b3a4-c5d6e7f80912';
 
 function fieldDef(field_name, validator_kind) {
 	return {
@@ -89,7 +92,14 @@ const contract = {
  * double invented.
  */
 function recordingApex() {
-	const stored = { entityFields: null, flat: null, created: null, postFlat: null };
+	const stored = {
+		entityFields: null,
+		flat: null,
+		created: null,
+		postFlat: null,
+		postCreated: null,
+		documentBlocks: null
+	};
 	const record = () => ({
 		id: RECORD_ID,
 		updated_at: '2026-09-08T00:00:00Z',
@@ -140,6 +150,7 @@ function recordingApex() {
 							status: 'draft',
 							title: 'A story',
 							updated_at: '2026-09-08T00:00:00Z',
+							document: { id: DOCUMENT_ID },
 							primitives: { kind: 'news' },
 							archetype_items: []
 						}
@@ -147,6 +158,18 @@ function recordingApex() {
 					pagination: { total_pages: 1 }
 				}
 			};
+		},
+		async createPost(slug, attributes, fields) {
+			stored.postCreated = { slug, attributes, fields };
+			return {
+				status: 201,
+				ok: true,
+				body: { data: { id: ARCHETYPE_ID, target_model_id: POST_ID } }
+			};
+		},
+		async updateDocumentBlocks(documentId, attributes) {
+			stored.documentBlocks = { documentId, attributes };
+			return { status: 200, ok: true, body: { data: {} } };
 		},
 		async updatePostArchetype(slug, archetypeId, fields) {
 			stored.postFlat = { slug, archetypeId, fields };
@@ -264,6 +287,22 @@ async function createRecord(ctx, body) {
 		signedRequest(session, '/api/admin/records/team_member', body, 'POST'),
 		ctx,
 		{ schema: 'team_member' }
+	);
+}
+
+async function createPost(ctx, body) {
+	const session = await signIn(ctx);
+	return handleCreatePost(signedRequest(session, '/api/admin/posts/article', body, 'POST'), ctx, {
+		schema: 'article'
+	});
+}
+
+async function savePostBody(ctx, body) {
+	const session = await signIn(ctx);
+	return handleSavePostBody(
+		signedRequest(session, `/api/admin/posts/article/${POST_ID}/body`, body, 'PUT'),
+		ctx,
+		{ schema: 'article', postId: POST_ID }
 	);
 }
 
@@ -386,6 +425,53 @@ describe('patch-entity-fields sanitizes what it stores', () => {
 		assert.equal(refused.stored.entityFields, null);
 	});
 
+	it('stores none of the EIGHT payloads the P4 review proved reached Apex verbatim', async () => {
+		/**
+		 * Every one of these was sent through this operation against the recording
+		 * stub during the P4 review and arrived UNCHANGED. Three were a REGRESSION
+		 * the kit/Poovayya sanitizer merge introduced — the old
+		 * `sanitize-rich-text.ts` stripped every character reference before judging a
+		 * URL, so `&Tab;` and an over-long numeric reference had nowhere to hide.
+		 * The other five were live in both.
+		 *
+		 * The assertion is on the STORED value, not the status: a 200 over an
+		 * unsanitized store is exactly the failure this file exists to catch.
+		 */
+		const apex = recordingApex();
+		const ctx = ctxWith(apex);
+		await patchEntity(ctx, {
+			// (a) `&Tab;` — the real entity. The local table spelled it `tab`.
+			named_tab: '<a href="java&Tab;script:alert(1)">x</a>',
+			// (b) references longer than the decoder's 7-decimal / 6-hex windows. A
+			// browser has no window; these ARE `javascript:` to it.
+			long_decimal: '<a href="&#00000000106;avascript:alert(1)">x</a>',
+			long_hex: '<a href="&#x0000006A;avascript:alert(1)">x</a>',
+			// (c) a handler with no whitespace before it — a slash, a quote, a slash.
+			svg_onload: '<svg/onload=alert(1)></svg>',
+			img_onerror: '<img src="x"onerror=alert(1)>',
+			anchor_onclick: '<a href="/x"/onclick=alert(1)>y</a>',
+			// (d) a URL sink that is not `href`, and an SVG animation that needs no
+			// handler and no href on the element the allowlist was watching.
+			form_action: '<button formaction="javascript:alert(1)">go</button>',
+			svg_animate: '<svg><animate attributeName="href" values="javascript:alert(1)"/></svg>'
+		});
+		assert.deepEqual(apex.stored.entityFields.fieldsData, {
+			named_tab: '<a>x</a>',
+			long_decimal: '<a>x</a>',
+			long_hex: '<a>x</a>',
+			svg_onload: '',
+			img_onerror: '<img src="x">',
+			anchor_onclick: '<a href="/x"/>y</a>',
+			form_action: '',
+			svg_animate: ''
+		});
+		// And the blunt cross-check: nothing executable survives anywhere in the store.
+		const serialized = JSON.stringify(apex.stored.entityFields.fieldsData);
+		assert.doesNotMatch(serialized, /javascript/iu);
+		assert.doesNotMatch(serialized, /on(?:load|error|click)\s*=/iu);
+		assert.doesNotMatch(serialized, /<(?:svg|button|animate)/iu);
+	});
+
 	it('leaves an ordinary value exactly as it arrived', async () => {
 		const apex = recordingApex();
 		const ctx = ctxWith(apex);
@@ -489,6 +575,62 @@ describe('the per-field ceiling, on every write path', () => {
 		assert.equal(response.status, 400);
 		assert.equal((await response.json()).error, 'field-too-large');
 		assert.equal(refuse.stored.postFlat, null, 'nothing was sent upstream');
+	});
+
+	it('create-post: 200 000 passes, 200 001 is a typed 400 and never reaches Apex', async () => {
+		// P4 review finding 2: this path had NO ceiling. `fields` is `z.unknown()` per
+		// primitive (`create-post.ts:59`), so nothing capped it between the null check
+		// and `toApexFields` — the only create on the kit that could push an unbounded
+		// value into Apex while its three siblings refused it.
+		const pass = recordingApex();
+		await createPost(ctxWith(pass), {
+			title: 'A story',
+			slug: 'a-story',
+			fields: { kind: atCeiling }
+		});
+		assert.equal(pass.stored.postCreated.fields.kind.length, MAX_FIELD_VALUE_CHARS);
+
+		const refuse = recordingApex();
+		const response = await createPost(ctxWith(refuse), {
+			title: 'A story',
+			slug: 'a-story',
+			fields: { kind: overCeiling }
+		});
+		assert.equal(response.status, 400);
+		assert.equal((await response.json()).error, 'field-too-large');
+		assert.equal(refuse.stored.postCreated, null, 'nothing was sent upstream');
+	});
+
+	it('save-post-body: an over-long block is `field-too-large` NAMING the block', async () => {
+		// The block path always refused — `blockSchema.html` carries the same
+		// `.max(MAX_FIELD_VALUE_CHARS)` — but as a generic `invalid body`, which does
+		// not tell an editor which of up to two hundred blocks to fix.
+		const pass = recordingApex();
+		assert.equal(
+			(await savePostBody(ctxWith(pass), { blocks: [{ kind: 'rich_text', html: atCeiling }] }))
+				.status,
+			200
+		);
+
+		const refuse = recordingApex();
+		const db = await createMigratedDatabase();
+		const response = await savePostBody(ctxWith(refuse, db), {
+			blocks: [
+				{ kind: 'rich_text', html: '<p>fine</p>' },
+				{ kind: 'rich_text', html: '<p>also fine</p>' },
+				{ kind: 'rich_text', html: overCeiling }
+			]
+		});
+		assert.equal(response.status, 400);
+		assert.equal((await response.json()).error, 'field-too-large');
+		assert.equal(refuse.stored.documentBlocks, null, 'nothing was sent upstream');
+		// The name is carried where every other ceiling refusal carries it: the audit
+		// row's `reason`. The wire body stays opaque (`bffError`).
+		const { results } = await db.prepare('SELECT outcome, detail FROM bff_audit_log').bind().all();
+		assert.equal(results.length, 1);
+		assert.equal(results[0].outcome, 'rejected');
+		assert.match(JSON.parse(results[0].detail).reason, /blocks\[2\]\.html/u);
+		db.close();
 	});
 
 	it('a structured value is measured by what actually travels, and the refusal names the field', async () => {

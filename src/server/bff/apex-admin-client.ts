@@ -60,15 +60,21 @@ export interface ApexResponse {
 	ok: boolean;
 	body: unknown;
 	/**
-	 * True only when the shared deadline aborted this call (status is 0). A typed
-	 * failure, not an exception, so a route maps it to its own error code without
-	 * a try/catch at every call site. Absent on every non-aborted response.
+	 * True only when the shared deadline aborted this call. A typed failure, not an
+	 * exception, so a route maps it to its own error code without a try/catch at
+	 * every call site. Absent on every non-aborted response.
+	 *
+	 * `status` is 0 when the abort landed before any response arrived; it is the
+	 * REAL HTTP STATUS when the response arrived and the abort interrupted the body
+	 * stream. `ok` is false either way — a body we could not finish reading is not a
+	 * success, whatever the status line said.
 	 */
 	aborted?: boolean;
 	/**
 	 * True when the fetch itself failed (DNS, TLS, reset) on a signal-carrying
-	 * call (status is 0). Same typed-failure discipline as `aborted`; callers
-	 * without a signal see the exception instead, unchanged.
+	 * call. Same typed-failure discipline as `aborted`; callers without a signal see
+	 * the exception instead, unchanged. `status` follows the same rule as `aborted`:
+	 * 0 before a response, the real status when the BODY stream failed.
 	 */
 	networkError?: boolean;
 }
@@ -234,7 +240,13 @@ function assertNoArrayFields(fields: ContentLibraryFields): void {
  * a field name at all.
  */
 export function assertSchemaItemSlug(name: string): void {
-	if (!/^[a-z0-9_-]{1,128}$/iu.test(name)) throw new Error('invalid schema item slug');
+	// NO `i` FLAG. Under `iu`, unicode case folding puts U+212A (KELVIN SIGN) and
+	// U+017F (LATIN SMALL LETTER LONG S) inside `[a-z]`, so two characters that are
+	// not ASCII at all satisfied a check whose whole job is "ASCII slug alphabet".
+	// Harmless in practice — the value is `encodeURIComponent`'d into one path
+	// segment and Apex 404s it — but a shape check that accepts what it says it
+	// refuses is the wrong thing to leave behind (P4 review, finding 4).
+	if (!/^[a-z0-9_-]{1,128}$/u.test(name)) throw new Error('invalid schema item slug');
 }
 
 /**
@@ -252,7 +264,9 @@ export function assertSchemaItemSlug(name: string): void {
  * percent-encoding reaches the URL.
  */
 export function assertEntityTypeRef(ref: string): void {
-	if (!/^[0-9a-z][0-9a-z-]{0,119}$/iu.test(ref)) throw new Error('invalid entity type');
+	// NO `i` FLAG, for the reason on `assertSchemaItemSlug`. Both a slug and a uuid
+	// are lower case everywhere Apex mints them, so nothing legitimate needed it.
+	if (!/^[0-9a-z][0-9a-z-]{0,119}$/u.test(ref)) throw new Error('invalid entity type');
 }
 
 export function assertUuid(id: string): void {
@@ -661,7 +675,44 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 		let body: unknown = null;
 		const contentType = response.headers.get('content-type') ?? '';
 		if (contentType.includes('application/json')) {
-			body = await response.json().catch(() => null);
+			/**
+			 * THE BODY IS READ AND PARSED IN TWO STEPS, and the split is the point.
+			 *
+			 * `await response.json().catch(() => null)` conflated two different facts:
+			 * "Apex sent something that is not JSON" (a shape error — `body: null` is
+			 * the right answer, and the status still means what it says) and "the
+			 * connection died while we were reading the body" (a TRANSPORT failure —
+			 * the response is INCOMPLETE, and answering `ok: true` with `body: null`
+			 * tells the caller the write succeeded and returned nothing). A 2xx over a
+			 * reset body therefore read as success. Found by codex on the P3 fix pass
+			 * (finding 4): it was the one transport shape `ApexTransportError` and the
+			 * typed `networkError` still did not cover.
+			 *
+			 * Reading the text first isolates the stream failure; `JSON.parse` after it
+			 * keeps malformed JSON exactly as it was — a shape error, not a fault.
+			 *
+			 * THE HTTP STATUS IS PRESERVED in the failure shape, unlike the pre-response
+			 * failures above which have none: we know what Apex answered, we only failed
+			 * to read the rest of it, and a caller deciding whether to retry a write
+			 * wants that difference.
+			 */
+			let text: string;
+			try {
+				text = await response.text();
+			} catch (error) {
+				if (signal?.aborted) {
+					return { status: response.status, ok: false, body: null, aborted: true };
+				}
+				if (signal) {
+					return { status: response.status, ok: false, body: null, networkError: true };
+				}
+				throw new ApexTransportError(error);
+			}
+			try {
+				body = JSON.parse(text);
+			} catch {
+				body = null;
+			}
 		}
 		// Note: upstream Set-Cookie is intentionally never read or propagated.
 		return { status: response.status, ok: response.ok, body };

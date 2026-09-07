@@ -248,9 +248,15 @@ export function decodeReferences(value) {
  * them is what stops `java\u200bscript:` and `jav\tascript:` from reading as a
  * relative path to a naive scheme test.
  *
+ * Exported for the WRITE boundary (`sanitize/write-boundary.ts`), which judges the
+ * same URLs a request earlier and must not do it with a second, weaker strip — the
+ * merged write sanitizer had its own `[\u0000-\u001f\u007f]` range, which let
+ * `java\u200bscript:` and a NBSP-hidden scheme past a judge the render side already
+ * refused. One grammar, used by both.
+ *
  * @param {string} value
  */
-function stripInvisible(value) {
+export function stripInvisible(value) {
 	let out = '';
 	for (const character of value) {
 		const code = character.codePointAt(0) ?? 0;

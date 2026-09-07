@@ -273,23 +273,32 @@ describe('readContent', () => {
 		};
 		await assert.rejects(readContent(counting), /nothing has been published/);
 		await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'e' });
+
+		// A PUBLISH INSTALLS WHAT IT WROTE (codex on the P3 fix pass, finding 3).
+		// It used to CLEAR the memo and set a wall-clock floor, which left the next
+		// read to KV's edge cache with `stamp < memoFloor` as its only protection —
+		// and an EQUAL millisecond from a second publishing isolate is not less. The
+		// bytes we just put are the bytes to serve; nothing has to be fetched to
+		// learn that, so the invalidation now costs zero reads instead of one.
+		const published = await readContent(counting);
+		assert.equal(reads, 1, 'only the failed read: the publish installed its own snapshot');
+
+		// Cold again, and the de-duplication and the memo window are what they were.
+		resetContentMemo();
 		const [first, concurrent] = await Promise.all([readContent(counting), readContent(counting)]);
 		assert.equal(concurrent, first, 'concurrent misses share one read');
-		assert.equal(reads, 2, 'one failed read, then one parse');
+		assert.equal(reads, 2, 'the failed read, then one parse');
+		assert.equal(first.version, published.version, 'and KV holds what the publish installed');
 		assert.equal(await readContent(counting), first, 'served from the memo within the minute');
 		assert.equal(reads, 2, 'no KV read inside the memo window');
 
-		// A PUBLISH NOW INVALIDATES THIS ISOLATE'S MEMO. Until P3 this line read
-		// "still the memo until the minute is up", and it was true: the reader that
-		// had just published kept serving the PREVIOUS snapshot for up to a minute —
-		// the admin rail included, which is the one reader certain to be looking.
 		await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'e', now: 1 });
 		const afterPublish = await readContent(counting);
 		assert.notEqual(afterPublish.version, first.version, 'the publish is visible at once');
-		assert.equal(reads, 3, 'the invalidated memo cost exactly one more KV read');
-		// …and then memoises again, so the invalidation is one read, not a disabled memo.
-		assert.equal(await readContent(counting), afterPublish, 'memoised again after the publish');
-		assert.equal(reads, 3);
+		assert.equal(reads, 2, 'and it cost no read at all — the snapshot came from the publish');
+		// …and stays memoised, so the swap is not a disabled memo.
+		assert.equal(await readContent(counting), afterPublish, 'memoised after the publish');
+		assert.equal(reads, 2);
 		await assert.rejects(readContent(undefined), /CONTENT binding is not configured/);
 	});
 
@@ -356,6 +365,9 @@ describe('readContent', () => {
 		const kv = memoryStore();
 		await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'e', now: 1000 });
 		const bytes = kv.map.get(CONTENT_KEY);
+		// The publish INSTALLS its snapshot, so go cold: this test is about the slot,
+		// and a warm memo would short-circuit every read below.
+		resetContentMemo();
 
 		let releaseFirst = () => {};
 		let releaseSecond = () => {};
@@ -449,11 +461,16 @@ describe('readContent', () => {
 		};
 	}
 
-	it('does not memoise bytes older than the publish that just invalidated the memo', async () => {
-		// O4 / codex 1: the publish path KNOWS the timestamp it wrote, and passes it as
-		// the floor. Without it the very next read — which started AFTER the reset, so
-		// the generation check waves it through — installs whatever the edge cache
+	it('does not memoise bytes older than the floor a cold reader was given', async () => {
+		// O4 / codex 1: a caller that goes cold KNOWING a publish timestamp passes it
+		// as the floor. Without it the very next read — which started AFTER the reset,
+		// so the generation check waves it through — installs whatever the edge cache
 		// happened to hold and serves it for a minute.
+		//
+		// The PUBLISH path no longer takes this route: it installs the snapshot it
+		// wrote (see `installContentMemo`), which is strictly stronger, because a
+		// wall-clock floor cannot refuse an EQUAL stamp from a second isolate. The
+		// floor still governs every cold reader, so it is exercised here directly.
 		resetContentMemo();
 		const kv = memoryStore();
 		await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'e', now: 1000 });
@@ -466,8 +483,10 @@ describe('readContent', () => {
 			publishedBy: 'e',
 			now: 60_000
 		});
-		const freshVersion = JSON.parse(kv.map.get(CONTENT_KEY)).version;
+		const fresh = JSON.parse(kv.map.get(CONTENT_KEY));
+		const freshVersion = fresh.version;
 		assert.notEqual(staleVersion, freshVersion);
+		resetContentMemo(fresh.publishedAt); // cold, with the floor the publish would set
 
 		const backwards = goingBackwards(kv);
 		backwards.state.serve = stale; // KV's edge cache answers pre-publish bytes
@@ -482,6 +501,50 @@ describe('readContent', () => {
 			'the stale bytes were NOT installed: the next read went back to KV'
 		);
 		assert.equal(backwards.state.reads, 2, 'and it really did read again');
+	});
+
+	it('a publish is not undone by a rival snapshot carrying the SAME millisecond', async () => {
+		/**
+		 * codex on the P3 fix pass, finding 3 — the case a wall-clock floor cannot
+		 * decide. `publishedAt` is captured BEFORE a fetch that takes tens of seconds
+		 * (`publish.ts`) and KV's compare-and-set is explicitly non-atomic, so a second
+		 * publishing isolate can carry an EQUAL or lower millisecond. The floor test is
+		 * `stamp < memoFloor`, and equal is not less: the isolate that had just
+		 * published could be handed the rival's PRE-publish bytes by KV's edge cache,
+		 * pass the floor, and memoise them for a full `MEMO_TTL_MS` — serving, as the
+		 * publisher, something older than what it published.
+		 *
+		 * The fix is not a better comparison; there is no comparison that works, because
+		 * two machines' clocks are not a total order at any precision. It is to stop
+		 * asking: install the snapshot the `put` just wrote.
+		 *
+		 * MUTATION: `installContentMemo(snapshot)` → `resetContentMemo(snapshot.publishedAt)`
+		 * in `publish.ts` fails this test on the version assertion below.
+		 */
+		resetContentMemo();
+		const kv = memoryStore();
+		// The rival's publish, which landed first and carries the same millisecond.
+		await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'e', now: 5000 });
+		const rival = kv.map.get(CONTENT_KEY);
+		const rivalVersion = JSON.parse(rival).version;
+		// Ours, written second — the one this isolate must serve.
+		await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'e', now: 5000 });
+		const ours = JSON.parse(kv.map.get(CONTENT_KEY));
+		assert.notEqual(rivalVersion, ours.version, 'the two snapshots are distinguishable');
+		assert.equal(JSON.parse(rival).publishedAt, ours.publishedAt, 'and share a millisecond');
+
+		const backwards = goingBackwards(kv);
+		backwards.state.serve = rival; // KV's edge cache answers the rival's bytes
+		assert.equal(
+			(await readContent(backwards)).version,
+			ours.version,
+			'the publisher serves what it published, not an equal-stamped rival'
+		);
+		assert.equal(
+			backwards.state.reads,
+			0,
+			'and it never asked KV, so there was nothing to get wrong'
+		);
 	});
 
 	it('does not let KV replace a NEWER memo with older bytes once the memo window lapses', async () => {

@@ -3,7 +3,7 @@ import { auditOutcome } from '../audit';
 import { containsNullPrimitive } from '../authorization';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectGuardFailure, rejectMutation } from '../reject';
+import { refuseOversizedFields, rejectGuardFailure, rejectMutation } from '../reject';
 import { cleanString, unwrapArchetypeRecord } from '../archetype-record';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import { toApexFields } from './update-record';
@@ -107,6 +107,17 @@ export async function handleCreatePost(
 	if (submitted && containsNullPrimitive(submitted)) {
 		return rejectMutation(ctx, actor, 400, 'null-field', 'null primitive');
 	}
+
+	// The per-field ceiling, named before the shape check so the refusal can say
+	// WHICH field is over it (`field-too-large`) rather than a generic `invalid body`.
+	//
+	// THIS PATH HAD NO CEILING AT ALL. `fields` is `z.unknown()` per primitive, so
+	// nothing capped it on the way to `toApexFields` — the one create path where an
+	// unbounded value could reach Apex, the snapshot and every render of the field,
+	// while its three siblings refused it. Found by the P4 review (finding 2).
+	const tooLarge = await refuseOversizedFields(ctx, actor, submitted);
+	if (tooLarge) return tooLarge;
+
 	const parsed = createPostBodySchema(contract, params.schema).safeParse(bodyJson);
 	if (!parsed.success) return rejectMutation(ctx, actor, 400, 'invalid body', 'invalid body');
 

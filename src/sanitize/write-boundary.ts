@@ -7,7 +7,20 @@
  * covers everything already in Apex and everything written by any other client.
  * Neither is a substitute for the other, and they are named apart so a caller
  * cannot reach for one meaning the other.
+ *
+ * ONE REFERENCE GRAMMAR, SHARED. The decoding half is imported from `html.js`
+ * rather than written again here. This module had its own `decodeEntities` and its
+ * own control-character strip, and both were WEAKER than the render side's: a
+ * lowercase-only named table that missed `&Tab;` (the real entity; `tab` is not
+ * one), and a strip that left `\u200b` and NBSP in place. `sanitize-rich-text.ts`,
+ * the Poovayya sanitizer this one replaced, stripped every reference before judging
+ * — so the merge that produced this file was a REGRESSION on those inputs. Sharing
+ * `decodeReferences` and `stripInvisible` is what stops the two judges drifting
+ * apart again; `sanitize-html.test.js` already locks the decode grammar to the
+ * escape grammar, so all three now move together.
  */
+
+import { decodeReferences, stripInvisible } from './html.js';
 
 /** The protocols a link or a source may use. Everything else is dropped. */
 const SAFE_PROTOCOLS = new Set(['http:', 'https:', 'mailto:', 'tel:']);
@@ -29,27 +42,45 @@ const SAFE_PROTOCOLS = new Set(['http:', 'https:', 'mailto:', 'tel:']);
 export const MAX_FIELD_VALUE_CHARS = 200_000;
 
 /**
- * C0 controls and DEL, which a scheme can hide inside.
+ * A character reference that SURVIVED decoding — the write boundary's fail-closed rule.
  *
- * `new URL` removes ASCII tab, LF and CR for us — they are stripped by the URL
- * parser itself, which is why `java<TAB>script:` already fails. It does NOT remove
- * the rest of the C0 range, so `java<NUL>script:` and `java<VT>script:` reach the
- * parser intact, fail scheme parsing, and resolve as a RELATIVE url — which reads
- * as safe. That is what a browser does with them too, so this is defence rather
- * than a live bypass; a URL has no legitimate use for a raw control character, and
- * Poovayya's sanitizer refused them, so the kit's does now as well.
+ * `decodeReferences` recognises the same windows the render escaper writes through:
+ * 7 decimal digits, 6 hex, a named entity of at most 32 characters. A browser has no
+ * such windows. `&#00000000106;avascript:` and `&#x0000006A;avascript:` are
+ * `javascript:` to every browser and are left ALONE by the decoder, so judging the
+ * decoded string waves them through — the bypass the P4 review proved live.
  *
- * Only the control range is removed. Poovayya stripped everything outside printable
- * ASCII (`[^!-~]`), which also destroys legitimate IDN hosts and unicode paths, so
- * that part is deliberately NOT carried over.
+ * The render side does not have this problem: whatever it cannot resolve it
+ * re-escapes to `&amp;…`, so an unresolved reference reaches the page as text. NOTHING
+ * RE-ESCAPES AT THE WRITE BOUNDARY — the value is stored as authored — so the only
+ * safe answer here is to refuse. A URL that still carries `&#…` or `&name;` after a
+ * full decode is not a URL any editor typed; it is an encoding this judge cannot
+ * read, and "cannot be read" must not resolve to "safe".
+ *
+ * Deliberately asymmetric: a NUMERIC reference is refused with or without its
+ * semicolon, because a browser decodes `&#106` unterminated too, while a NAMED one is
+ * refused only when terminated — an ordinary query string is full of `&name=value`
+ * and none of the unterminated legacy names produce a letter or a colon.
  */
-const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/gu;
+const RESIDUAL_REFERENCE = /&(?:#[0-9]|#[xX][0-9a-fA-F]|[a-zA-Z][a-zA-Z0-9]{1,31};)/u;
 
 /** Any base will do: it decides only what a RELATIVE url resolves to. */
 const RESOLUTION_BASE = 'https://sanitizer.invalid/';
 
-/** ` onclick="…"`, ` onerror=…` — quoted either way, or bare. */
-const EVENT_ATTRIBUTE = /\son[a-z0-9_:-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/giu;
+/**
+ * ` onclick="…"`, ` onerror=…` — quoted either way, or bare.
+ *
+ * THE SEPARATOR IS NOT ALWAYS WHITESPACE. This was `\son…`, and the HTML parser is
+ * happy with none: `<svg/onload=alert(1)>`, `<img src="x"onerror=alert(1)>` and
+ * `<a href="/x"/onclick=alert(1)>` all execute, and all three walked past a `\s`.
+ * A quote or a slash ends an attribute just as well, so they start the next one.
+ *
+ * The whitespace case CONSUMES the space (so `<p onclick=x>x</p>` comes back
+ * `<p>x</p>`, not `<p >x</p>`); the quote and slash cases are a LOOKBEHIND, because
+ * that character belongs to the attribute before it and removing it would join two
+ * tokens that were separate.
+ */
+const EVENT_ATTRIBUTE = /(?:\s|(?<=["'/]))on[a-z0-9_:-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/giu;
 
 /**
  * Elements that execute or load, removed with their content.
@@ -64,55 +95,69 @@ const EVENT_ATTRIBUTE = /\son[a-z0-9_:-]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/giu;
  * a protocol allowlist plus a denylist of the few elements that are executable
  * rather than presentational. The second alternative catches an unclosed `<script`
  * with no matching close tag, so a truncated tag cannot slip past the pair.
+ *
+ * `svg` and `math` carry executable children of their own — `<svg><animate
+ * attributeName="href" values="javascript:…">` needs no event attribute and no
+ * `href` on the svg itself, so neither the handler strip nor the protocol allowlist
+ * sees it. `form`, `button` and `input` bring `formaction`, which is a navigation
+ * target spelled somewhere the allowlist was not looking. All five are dropped with
+ * their contents, which is what `html.js` already does with them on the render side
+ * (`DROP_WITH_CONTENT`) — the two lists are meant to agree.
  */
 const EXECUTABLE_ELEMENT =
-	/<(script|style|iframe|object|embed|link|meta|base)\b[^>]*>[\s\S]*?<\/\1\s*>|<\/?(?:script|style|iframe|object|embed|link|meta|base)\b[^>]*>?/giu;
-
-/** ` href="…"`, ` src='…'`, ` xlink:href=…` — where a protocol can hide. */
-const URL_ATTRIBUTE = /\s(?:href|src|xlink:href)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*))/giu;
-
-const NAMED_ENTITIES: Record<string, string> = {
-	amp: '&',
-	lt: '<',
-	gt: '>',
-	quot: '"',
-	apos: "'",
-	colon: ':',
-	tab: '\t',
-	newline: '\n',
-	NewLine: '\n'
-};
+	/<(script|style|iframe|object|embed|link|meta|base|svg|math|form|button|input)\b[^>]*>[\s\S]*?<\/\1\s*>|<\/?(?:script|style|iframe|object|embed|link|meta|base|svg|math|form|button|input)\b[^>]*>?/giu;
 
 /**
- * Decode the entities an attribute value may hide a protocol behind.
+ * ` href="…"`, ` src='…'`, ` xlink:href=…` — where a protocol can hide.
  *
- * The browser decodes attribute values before it parses them as URLs, so
- * `href="&#106;avascript:alert(1)"` IS `javascript:` by the time it matters. Check
- * the decoded form or the check is decoration.
+ * The list is longer than the three attributes rich text is supposed to hold,
+ * because a URL sink is not always spelled `href`: `formaction` on a submit button
+ * and `action` on a form both navigate; `values`, `to` and `from` are how SVG
+ * animation writes one; `poster`, `background`, `ping` and `data` are the rest of
+ * the browser's URL-valued attributes on elements this sanitizer might otherwise
+ * leave standing. The elements that carry most of them are dropped outright above —
+ * this is the second lock on the same door, for the shapes the element denylist
+ * cannot see.
+ *
+ * `data` matches only a whole attribute name: `data-foo="…"` has a `-` where the
+ * `=` must be, so custom data attributes are untouched.
+ *
+ * The separator is read the same way `EVENT_ATTRIBUTE` reads it — whitespace
+ * consumed, a closing quote or a slash matched by lookbehind — so
+ * `<img src="x"formaction="javascript:…">` cannot hide behind the absence of a
+ * space either.
  */
-function decodeEntities(value: string): string {
-	return value
-		.replace(/&#x([0-9a-f]{1,6});?/giu, (match, hex: string) => codePoint(parseInt(hex, 16), match))
-		.replace(/&#(\d{1,7});?/gu, (match, dec: string) => codePoint(parseInt(dec, 10), match))
-		.replace(/&([a-z]+);/giu, (match, name: string) => NAMED_ENTITIES[name] ?? match);
-}
-
-function codePoint(value: number, fallback: string): string {
-	if (!Number.isFinite(value) || value < 0 || value > 0x10ffff) return fallback;
-	return String.fromCodePoint(value);
-}
+const URL_ATTRIBUTE =
+	/(?:\s|(?<=["'/]))(?:href|src|xlink:href|formaction|action|values|to|from|poster|background|ping|data)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*))/giu;
 
 /**
  * Is this attribute value something we are willing to store?
  *
- * Resolved with `new URL`, not string-matched: the URL parser strips the tabs and
- * newlines `java\tscript:` hides behind, and it is the same parser the browser will
- * use. A relative or anchor value resolves against the base and comes back
- * `https:`, which is why they need no case of their own. The remaining C0 controls
- * the URL parser leaves in place are removed first — see `CONTROL_CHARACTERS`.
+ * Three steps, in this order, and each of them was a live bypass at some point:
+ *
+ *   1. DECODE, with the render side's grammar (`decodeReferences`). The browser
+ *      decodes an attribute value before it parses it as a URL, so
+ *      `href="&#106;avascript:…"` IS `javascript:` by the time it matters.
+ *   2. REFUSE ANYTHING STILL ENCODED (`RESIDUAL_REFERENCE`). Fail closed: the
+ *      decoder's digit windows are narrower than a browser's, and nothing
+ *      re-escapes at the write boundary.
+ *   3. STRIP THE INVISIBLES, again with the render side's function. `new URL`
+ *      removes tab, LF and CR itself; it leaves the rest of C0, C1, NBSP and the
+ *      zero-width and bidi marks in place, and a value that then fails scheme
+ *      parsing resolves as a RELATIVE url — which reads as safe.
+ *
+ * Only then `new URL`, not a string match: it is the same parser the browser will
+ * use, and a relative or anchor value resolves against the base and comes back
+ * `https:`, which is why they need no case of their own.
+ *
+ * A non-ASCII HOST survives all of this — `stripInvisible` removes formatting
+ * characters, not letters — which is what Poovayya's `[^!-~]` strip destroyed and
+ * the reason that half was never carried over.
  */
 export function isSafeUrlValue(raw: string): boolean {
-	const value = decodeEntities(raw).replace(CONTROL_CHARACTERS, '').trim();
+	const decoded = decodeReferences(raw);
+	if (RESIDUAL_REFERENCE.test(decoded)) return false;
+	const value = stripInvisible(decoded);
 	if (value === '') return true;
 	try {
 		return SAFE_PROTOCOLS.has(new URL(value, RESOLUTION_BASE).protocol);

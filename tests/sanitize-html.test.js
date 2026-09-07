@@ -161,6 +161,14 @@ test('isSafeUrl judges what a browser would navigate to', () => {
 		'java​script:alert(1)',
 		'javascript&#58;alert(1)',
 		'javascript&colon;alert(1)',
+		// The named lookup is case-INSENSITIVE, and it has to be: `&Tab;` is the real
+		// HTML entity (`&tab;` is not one at all), and a browser turns it into a tab
+		// the URL parser then strips. The write boundary shares this decoder, so a
+		// mutation that drops the `toLowerCase()` opens both judges at once — this is
+		// the case that catches it.
+		'java&Tab;script:alert(1)',
+		'java&NewLine;script:alert(1)',
+		'javascript&Colon;alert(1)',
 		'data:text/html,<script>alert(1)</script>',
 		'vbscript:msgbox(1)',
 		'file:///etc/passwd',

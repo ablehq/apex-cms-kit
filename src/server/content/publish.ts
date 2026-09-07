@@ -11,7 +11,7 @@
 import { fetchAllPages } from '../../cms/pagination.js';
 import { collectArchetypeReferences, createArchetypesDataEntry } from '../../cms/archetype-data.js';
 import type { ApexAdminClient } from '../bff/apex-admin-client';
-import { CONTENT_KEY, resetContentMemo, versionOf } from './read';
+import { CONTENT_KEY, installContentMemo, versionOf } from './read';
 import type { ContentSnapshot, ContentStore } from './read';
 
 const PLATFORM = '/api/platform/v1';
@@ -255,14 +255,17 @@ export async function publishContent(options: PublishOptions): Promise<PublishRe
 	// the PREVIOUS snapshot for up to a minute — the admin rail included, which is
 	// the one reader guaranteed to be looking. This removes the self-inflicted half
 	// of that delay. Every OTHER isolate's memo is untouched, so a visitor elsewhere
-	// still waits; see `resetContentMemo`.
+	// still waits; see `installContentMemo`.
 	//
-	// The timestamp travels with the reset because KV's own 60 s edge cache can serve
-	// this isolate PRE-publish bytes on the very next read, and nothing about that
-	// read looks stale from the inside — it started after the reset, so the
-	// generation check waves it through. Passing what we just wrote makes it the memo
-	// floor, so those bytes are served once and never installed.
-	resetContentMemo(snapshot.publishedAt);
+	// INSTALL WHAT WE WROTE — do not clear and re-read. The earlier version cleared
+	// the memo and set a floor from `snapshot.publishedAt`, which left the next read
+	// to KV's 60 s edge cache with only a wall-clock comparison to protect it. Two
+	// publishing isolates can carry the SAME millisecond (the clock is captured above,
+	// before a fetch that takes tens of seconds), and `stamp < memoFloor` lets an
+	// equal one through — so the isolate could memoise a rival's older snapshot for a
+	// whole minute immediately after publishing. The bytes we just put are the bytes
+	// we want served; nothing needs to be fetched to find that out.
+	installContentMemo(snapshot);
 	return { ok: true, version, counts, previous, warnings };
 }
 

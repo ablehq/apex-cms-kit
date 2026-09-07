@@ -203,3 +203,43 @@ export function resetContentMemo(publishedAt?: string) {
 	generation += 1;
 	memoFloor = publishedAtMs(publishedAt) ?? 0;
 }
+
+/**
+ * Adopt the snapshot this isolate JUST WROTE, instead of clearing the memo and
+ * trusting KV to hand it back.
+ *
+ * WHAT WAS WRONG WITH CLEARING. `publishContent` used to call
+ * `resetContentMemo(snapshot.publishedAt)`: memo empty, floor set to the stamp it
+ * had written, next read goes to KV. The floor is a WALL CLOCK, and two publishing
+ * isolates do not share one. Publish B, running on another isolate, can capture a
+ * millisecond EQUAL TO or LOWER THAN A's — the clock is read before a fetch that
+ * takes tens of seconds (`publish.ts`), and KV's concurrency check is explicitly
+ * non-atomic — so B's reset installs a floor no higher than A's stamp, and the very
+ * next read on that isolate can be handed A's older bytes by KV's edge cache and
+ * MEMOISE them, because the floor test is `stamp < memoFloor` and equal is not
+ * less. The isolate then serves, for a whole `MEMO_TTL_MS`, a snapshot older than
+ * the one it just published.
+ *
+ * Installing what we wrote removes the read entirely: there is nothing for the edge
+ * cache to answer wrongly, the publisher sees its own publish immediately (which is
+ * what the invalidation was for), and the publish costs ZERO extra KV reads instead
+ * of one. The floor moves only UPWARD here — a publish must never lower a bar this
+ * isolate has already cleared.
+ *
+ * ⚠ ACCEPTED LIMITATION, and it is not fixable here. This orders what ONE isolate
+ * serves. It does not order two isolates' WRITES: whichever `put` lands last wins
+ * in KV regardless of its timestamp, and `publish.ts`'s read-compare-write narrows
+ * that window without closing it. Strict cross-isolate ordering needs a SERIALIZED
+ * REVISION — a Durable Object, or a store with compare-and-set — because wall
+ * clocks on different machines cannot provide one, at any precision. The
+ * `publishedAt` floor is a staleness bound, not a total order, and must not be read
+ * as one.
+ */
+export function installContentMemo(snapshot: ContentSnapshot) {
+	inflight = null;
+	generation += 1;
+	memo = snapshot;
+	memoCheckedAt = Date.now();
+	const stamp = publishedAtMs(snapshot.publishedAt);
+	if (stamp !== null && stamp > memoFloor) memoFloor = stamp;
+}

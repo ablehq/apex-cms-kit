@@ -63,6 +63,46 @@ describe('isSafeUrlValue', () => {
 		assert.deepEqual(isSafeUrlValue('&#x6a;avascript:alert(1)'), false);
 		assert.deepEqual(isSafeUrlValue('javascript&colon;alert(1)'), false);
 	});
+
+	it('rejects `&Tab;`, the entity this module used to spell in lower case', () => {
+		// P4 review finding 1(a). The local table held `tab`, which is not an HTML
+		// entity; the real one is `&Tab;`, and a browser turns it into a tab the URL
+		// parser then strips. The judge now decodes with `html.js`'s grammar, which
+		// lower-cases the name before the lookup, so both spellings resolve.
+		assert.deepEqual(isSafeUrlValue('java&Tab;script:alert(1)'), false);
+		assert.deepEqual(isSafeUrlValue('java&tab;script:alert(1)'), false);
+		assert.deepEqual(isSafeUrlValue('java&NewLine;script:alert(1)'), false);
+	});
+
+	it('refuses a reference too long for the decoder rather than judging it decoded', () => {
+		// P4 review finding 1(b). The decode windows are 7 decimal digits and 6 hex;
+		// a browser has no window at all, so a zero-padded reference IS `javascript:`
+		// to it and was left untouched — and therefore judged safe — here. Nothing
+		// re-escapes at the write boundary, so the answer is to refuse.
+		assert.deepEqual(isSafeUrlValue('&#00000000106;avascript:alert(1)'), false);
+		assert.deepEqual(isSafeUrlValue('&#x0000006A;avascript:alert(1)'), false);
+		// Unterminated too: a browser decodes `&#106` without the semicolon.
+		assert.deepEqual(isSafeUrlValue('&#106avascript:alert(1)'), false);
+		// And any other unresolved reference, whatever it spells.
+		assert.deepEqual(isSafeUrlValue('https://example.com/?a=&unknownentity;'), false);
+	});
+
+	it('still accepts an ordinary escaped query string', () => {
+		// The fail-closed rule must not refuse the `&amp;` every editor's link
+		// carries: it DECODES, so nothing is left over to refuse.
+		assert.deepEqual(isSafeUrlValue('https://example.com/s?q=a&amp;b=c'), true);
+		assert.deepEqual(isSafeUrlValue('https://example.com/s?q=a&b=c'), true);
+		assert.deepEqual(isSafeUrlValue('/areas?a=1&b=2'), true);
+	});
+
+	it('rejects a scheme hidden behind a zero-width or non-breaking space', () => {
+		// The local strip was `[\u0000-\u001f\u007f]`; `html.js`'s covers the C1
+		// range, NBSP, and the zero-width and bidi marks, which browsers also skip
+		// while reading a scheme. Sharing it is what closed these.
+		assert.deepEqual(isSafeUrlValue('java\u200bscript:alert(1)'), false);
+		assert.deepEqual(isSafeUrlValue('java\u00a0script:alert(1)'), false);
+		assert.deepEqual(isSafeUrlValue('\ufeffjavascript:alert(1)'), false);
+	});
 });
 
 describe('sanitizeHtml', () => {
@@ -119,7 +159,63 @@ describe('sanitizeHtml', () => {
 			'<img src="/a.png">'
 		);
 		assert.deepEqual(sanitizeWriteHtml('<p onclick=alert(1)>x</p>'), '<p>x</p>');
-		assert.deepEqual(sanitizeWriteHtml("<svg onload='alert(1)'></svg>"), '<svg></svg>');
+		// `<svg>` is now dropped with its contents (see EXECUTABLE_ELEMENT), so the
+		// handler goes with the element rather than being stripped off a survivor.
+		assert.deepEqual(sanitizeWriteHtml("<svg onload='alert(1)'></svg>"), '');
+	});
+
+	it('drops a handler that follows a quote or a slash, with no whitespace at all', () => {
+		// P4 review finding 1(c). `\son…` required whitespace; the HTML parser does
+		// not, and all three of these execute in a browser.
+		assert.deepEqual(sanitizeWriteHtml('<img src="x"onerror=alert(1)>'), '<img src="x">');
+		assert.deepEqual(
+			sanitizeWriteHtml('<a href="/x"/onclick=alert(1)>y</a>'),
+			'<a href="/x"/>y</a>'
+		);
+		assert.deepEqual(sanitizeWriteHtml("<p id='a'onmouseover=alert(1)>y</p>"), "<p id='a'>y</p>");
+		// The whitespace case still consumes its space rather than leaving `<p >`.
+		assert.deepEqual(sanitizeWriteHtml('<p onclick="alert(1)">y</p>'), '<p>y</p>');
+	});
+
+	it('drops the elements that carry executable children or a form target', () => {
+		// P4 review finding 1(d). `<animate>` needs no event attribute and no href on
+		// the svg itself; `formaction` is a navigation target the old attribute list
+		// never looked at.
+		assert.deepEqual(
+			sanitizeWriteHtml('<svg><animate attributeName="href" values="javascript:alert(1)"/></svg>'),
+			''
+		);
+		assert.deepEqual(
+			sanitizeWriteHtml('<form action="javascript:alert(1)"><button>go</button></form>'),
+			''
+		);
+		assert.deepEqual(sanitizeWriteHtml('<math><mtext>x</mtext></math>'), '');
+		assert.deepEqual(sanitizeWriteHtml('<p>a</p><input value="x">'), '<p>a</p>');
+	});
+
+	it('drops a URL-valued attribute that is not spelled href or src', () => {
+		// The second lock: even on an element the denylist leaves standing.
+		assert.deepEqual(sanitizeWriteHtml('<p formaction="javascript:alert(1)">x</p>'), '<p>x</p>');
+		assert.deepEqual(sanitizeWriteHtml('<p ping="javascript:alert(1)">x</p>'), '<p>x</p>');
+		assert.deepEqual(sanitizeWriteHtml('<p values="javascript:alert(1)">x</p>'), '<p>x</p>');
+		assert.deepEqual(sanitizeWriteHtml('<p poster="javascript:alert(1)">x</p>'), '<p>x</p>');
+		// A custom data attribute is not a URL sink and is left alone.
+		assert.deepEqual(
+			sanitizeWriteHtml('<p data-x="javascript:alert(1)">y</p>'),
+			'<p data-x="javascript:alert(1)">y</p>'
+		);
+	});
+
+	it('drops an href whose reference the decoder cannot read', () => {
+		assert.deepEqual(sanitizeWriteHtml('<a href="java&Tab;script:alert(1)">x</a>'), '<a>x</a>');
+		assert.deepEqual(
+			sanitizeWriteHtml('<a href="&#00000000106;avascript:alert(1)">x</a>'),
+			'<a>x</a>'
+		);
+		assert.deepEqual(
+			sanitizeWriteHtml('<a href="&#x0000006A;avascript:alert(1)">x</a>'),
+			'<a>x</a>'
+		);
 	});
 
 	it('survives an href that hides behind a quoted angle bracket', () => {
