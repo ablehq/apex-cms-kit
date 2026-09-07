@@ -91,6 +91,20 @@ export async function handleUpdatePostArchetype(
 	 * uncaught framework 500 where a caller deserves a typed 400. No post schema on
 	 * any site declares an array-shaped field today; the next one that does would
 	 * find this out in production.
+	 *
+	 * ── PROVISIONAL: A CAPABILITY GATE ON THE BACKEND BUILD ──────────────────
+	 * "A post archetype has no child-list transport" is a fact about the backend
+	 * TODAY, not a property of posts. A post's fields are written through the SAME
+	 * `archetype_models` controller plan 08 widens, so when that fix is DEPLOYED and
+	 * VERIFIED the lists ride the atomic PATCH here exactly as they will on a
+	 * content-library record, and this refusal comes out with the rest of the gate —
+	 * the one reviewed kit change plan 07's **P3b** node inventories. Until then it
+	 * stays: on the backend production runs the value is answered 200 and stored as
+	 * `[]`, with nothing in the response to see.
+	 *
+	 * Note what does NOT come out with it: this surface still carries no unbacked
+	 * partial-write guard (plan 07's P3 log records that gap), and that one is about
+	 * a record's own shape rather than a backend version.
 	 */
 	const childListsOnPost = childListFieldNames(contract, params.schema).filter(
 		(name) => fields[name] !== undefined

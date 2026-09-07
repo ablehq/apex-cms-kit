@@ -274,6 +274,15 @@ export function readPrimitiveItemId(record: Record<string, unknown>, name: strin
  *
  * Conservative on purpose: an item whose `fields_data` does not carry the key is
  * NOT counted as covering it, because the rebuild would not carry it either.
+ *
+ * The other direction, which surprises people: a row holding `{field: []}` — minted
+ * by a bad flat save of a child list, which answers 200 and stores the empty array —
+ * DOES cover its key, and correctly. This guard asks one question, "what would a
+ * partial write destroy", and the answer there is nothing: the rebuild reproduces
+ * `[]`, and `primitives` already reads `[]` because that same bad save triggered the
+ * rebuild that emptied it. Refusing the save would block an edit while protecting
+ * nothing. The cost is that such a record reads as HEALTHY while its list is
+ * silently empty — noticing that is the backfill's job, not this function's.
  */
 export function unbackedPrimitiveKeys(record: Record<string, unknown>): string[] {
 	const covered = new Set<string>();

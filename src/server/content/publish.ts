@@ -254,9 +254,15 @@ export async function publishContent(options: PublishOptions): Promise<PublishRe
 	// A publish used to invalidate nothing, so the isolate that made it kept serving
 	// the PREVIOUS snapshot for up to a minute — the admin rail included, which is
 	// the one reader guaranteed to be looking. This removes the self-inflicted half
-	// of that delay. KV's own 60 s edge cache and every other isolate's memo are
-	// untouched, so a visitor elsewhere still waits; see `resetContentMemo`.
-	resetContentMemo();
+	// of that delay. Every OTHER isolate's memo is untouched, so a visitor elsewhere
+	// still waits; see `resetContentMemo`.
+	//
+	// The timestamp travels with the reset because KV's own 60 s edge cache can serve
+	// this isolate PRE-publish bytes on the very next read, and nothing about that
+	// read looks stale from the inside — it started after the reset, so the
+	// generation check waves it through. Passing what we just wrote makes it the memo
+	// floor, so those bytes are served once and never installed.
+	resetContentMemo(snapshot.publishedAt);
 	return { ok: true, version, counts, previous, warnings };
 }
 

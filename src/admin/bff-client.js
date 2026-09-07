@@ -78,10 +78,25 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 			body: body === undefined ? undefined : JSON.stringify(body)
 		});
 		const parsed = await readJson(response);
+		/**
+		 * THE HTTP STATUS WINS, and the order of these three lines is the whole point.
+		 *
+		 * Spreading the body LAST let a response key named `status` replace the real
+		 * one. That is not hypothetical: nine shipped BFF operations answer a 502 whose
+		 * body is `{error: 'upstream error', status: <the upstream 500>}` — the
+		 * upstream status, deliberately reported, in a key that then overwrote the
+		 * transport's. Every screen reading `result.status` to decide "was this
+		 * refused, or did the server break?" got the wrong number, silently, on exactly
+		 * the responses where it matters.
+		 *
+		 * Fixing it here rather than by renaming the body key fixes all of them at
+		 * once, and makes the next operation that reports an upstream status safe by
+		 * default. `ok` is pinned for the same reason.
+		 */
 		return {
+			...(parsed && typeof parsed === 'object' ? parsed : {}),
 			ok: response.ok,
-			status: response.status,
-			...(parsed && typeof parsed === 'object' ? parsed : {})
+			status: response.status
 		};
 	}
 

@@ -34,6 +34,27 @@ export interface ApexAdminClientOptions {
 	allowedPostSlugs?: readonly string[];
 }
 
+/**
+ * The fetch to Apex failed before any answer — DNS, TLS, a reset, a refused
+ * connection.
+ *
+ * It exists so a CALLER can tell that apart from every other throw this client can
+ * make, and the distinction is not cosmetic. `contentLibrarySlug`, `postSlug` and
+ * `assertUuid` all throw too, as does `assertNoArrayFields`; an operation that wraps
+ * a client call in `try/catch` and records "Apex never answered" for every one of
+ * them writes a fiction into the audit row that is the only record of a
+ * half-applied save. The runtime's own error is kept as `cause`.
+ *
+ * Only the signal-less path throws this: a call carrying an abort signal gets the
+ * typed `{status: 0, networkError: true}` response instead (see `call`).
+ */
+export class ApexTransportError extends Error {
+	constructor(cause: unknown) {
+		super('the Apex request failed before any answer', { cause });
+		this.name = 'ApexTransportError';
+	}
+}
+
 export interface ApexResponse {
 	status: number;
 	ok: boolean;
@@ -321,6 +342,34 @@ export interface ApexAdminClient {
 	 * separate parameter rather than a key in `fields` because `ContentLibraryFields`
 	 * forbids `null` — correctly, for primitives — and `null` on this column is the
 	 * legitimate "unset". `undefined` means "not part of this write".
+	 *
+	 * ── THIS METHOD DOES NOT CARRY THE PARTIAL-WRITE GUARD ───────────────────
+	 * A direct caller needs to know it, which is why this sits above the signature
+	 * rather than below it. `handleUpdateRecord` reads the record first and refuses a
+	 * partial field write to one whose `primitives` no `archetype_item` accounts for,
+	 * because on such a record the upstream rebuild deletes every unsent field. A
+	 * caller that reaches this method directly — GLC's `handleUpdateAuthor`,
+	 * `handleUpdateResource` and `handlePutIngestResource` all do — gets the ARRAY
+	 * refusal (`assertNoArrayFields`) but not that one.
+	 *
+	 * DELIBERATE, and now RULED rather than asserted: plan 07's **P3b** node, "GLC
+	 * exemption, ruled 2026-09-07". The bypass stands because GLC's records are
+	 * created through the API (`seed-content.js`) and so are item-backed from birth,
+	 * and because its operations do not send partial field sets to unbacked records;
+	 * the hazard needs a record whose `primitives` were written directly, which no
+	 * GLC path produces. `ingest-resource.ts` additionally documents a considered
+	 * "write first, never read" design — a failed read cannot tell "deleted" from
+	 * "Apex is down", and reading it as absent creates a duplicate.
+	 *
+	 * MEASURED, not assumed: one paginated GET per GLC content-library schema
+	 * against local Apex, counting records with `primitives` keys and no Primitive
+	 * item row — see the fix-pass-2 entry in plan 07 §10 for the numbers. The
+	 * PRODUCTION count joins the deferred census (plan 07 §0.1); until it is taken,
+	 * this exemption is a decision about a database nobody has looked at.
+	 *
+	 * A caller that DOES need the protection should route through
+	 * `handleUpdateRecord`, or call `unbackedPrimitiveKeys` (`archetype-record.ts`)
+	 * on its own pre-write read; it is exported for that.
 	 */
 	updateContentLibraryRecord(
 		slug: string,
@@ -329,24 +378,6 @@ export interface ApexAdminClient {
 		references?: Record<string, HasManyEntry[] | string | null>,
 		position?: number | null
 	): Promise<ApexResponse>;
-	//
-	// THIS METHOD DOES NOT CARRY THE PARTIAL-WRITE GUARD, and a direct caller needs
-	// to know it. `handleUpdateRecord` reads the record first and refuses a partial
-	// field write to one whose `primitives` no `archetype_item` accounts for,
-	// because on such a record the upstream rebuild deletes every unsent field. A
-	// caller that reaches this method directly — GLC's `update-author.ts:94`,
-	// `update-resource.ts:85` and `ingest-resource.ts:115` all do — gets the ARRAY
-	// refusal above but not that one.
-	//
-	// DELIBERATE, not an oversight (plan 07, P3 review finding 9). Those records are
-	// created through the API and so are item-backed from birth; the hazard needs a
-	// record whose `primitives` were written directly, which no GLC path produces.
-	// And `ingest-resource.ts` documents a considered "write first, never read"
-	// design — a failed read cannot tell "deleted" from "Apex is down", and reading
-	// it as absent creates a duplicate. A caller that DOES need the protection
-	// should route through `handleUpdateRecord`, or call `unbackedPrimitiveKeys`
-	// (`archetype-record.ts`) on its own pre-write read; it is exported for that.
-	//
 	deleteContentLibraryRecord(slug: string, id: string): Promise<ApexResponse>;
 	/**
 	 * Create the ONE `archetype_item` row that holds an array-shaped field's whole
@@ -595,12 +626,14 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			// connection reset — is a typed failure so the route answers its
 			// contracted 502 {"error":"upstream_error"} and writes its audit row,
 			// instead of leaking a framework 500 with neither. Callers that pass no
-			// signal (the admin) keep today's propagation, so their error handling
-			// is unchanged.
+			// signal (the admin) keep today's PROPAGATION — but the error is wrapped
+			// first, because "the fetch failed" and "this client refused the call" are
+			// different facts and only this frame can tell them apart. See
+			// `ApexTransportError`.
 			if (signal) {
 				return { status: 0, ok: false, body: null, networkError: true };
 			}
-			throw error;
+			throw new ApexTransportError(error);
 		}
 		// A 3xx from Apex is never followed — treat it as a failure rather than
 		// chase a redirect to who-knows-where.

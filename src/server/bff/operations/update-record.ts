@@ -13,6 +13,7 @@ import {
 import { splitChildListFields, writeChildLists } from './child-list';
 import { recordIdSchema } from './get-record';
 import { sanitizeFieldValue } from '../../../sanitize/write-boundary';
+import { ApexTransportError } from '../apex-admin-client';
 import type { ApexResponse, ContentLibraryFields, HasManyEntry } from '../apex-admin-client';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import type { BffContext } from '../context';
@@ -289,10 +290,18 @@ export async function handleUpdateRecord(
 	 * for any of it. The one record of a half-applied save would be missing exactly
 	 * when it is most needed.
 	 *
-	 * A thrown fault is therefore turned into the same typed failure an HTTP one
+	 * A TRANSPORT fault is therefore turned into the same typed failure an HTTP one
 	 * produces, so the audit below runs either way. The error itself is never
 	 * forwarded: it can carry a URL and upstream detail, and this response is read
 	 * by a browser.
+	 *
+	 * ONLY a transport fault. `catch {}` on its own relabels every throw this client
+	 * can make — the schema allowlist, `assertUuid`, `assertNoArrayFields` — as
+	 * "Apex never answered", which is false and lands in the audit row as fact. Those
+	 * are bugs in a caller, not upstream failures: nothing has been written when one
+	 * fires, so the row is written (best-effort, since nothing depends on it) saying
+	 * `thrown` and the error is RE-RAISED with its real reason intact rather than
+	 * flattened into a 502 about a request that was never made.
 	 */
 	const flatHasWork =
 		Object.keys(flat).length > 0 || Object.keys(references).length > 0 || position !== undefined;
@@ -311,8 +320,25 @@ export async function handleUpdateRecord(
 				references,
 				position
 			);
-		} catch {
-			apexResponse = { status: 0, ok: false, body: null };
+		} catch (error) {
+			if (!(error instanceof ApexTransportError)) {
+				try {
+					await auditOutcome(ctx, meta, guard.actor, {
+						outcome: 'apex_error',
+						detail: {
+							schema: params.schema,
+							recordId: idResult.data,
+							fields: Object.keys(fields),
+							thrown: true,
+							thrownReason: error instanceof Error ? error.message : String(error)
+						}
+					});
+				} catch {
+					// swallow — auditing must not replace the real error with its own
+				}
+				throw error;
+			}
+			apexResponse = { status: 0, ok: false, body: null, networkError: true };
 		}
 	}
 
@@ -341,7 +367,17 @@ export async function handleUpdateRecord(
 						childLists: childLists.map((entry) => entry.field),
 						childListsWritten: childResult?.written ?? [],
 						...(childResult && !childResult.ok
-							? { childListFailedOn: childResult.field, childListStatus: childResult.status }
+							? {
+									childListFailedOn: childResult.field,
+									childListStatus: childResult.status,
+									// `status: 0` on its own reads as "Apex never answered". It is
+									// only true for `'network'`; `'thrown'` means this client
+									// refused the call and Apex was never asked. Recorded apart so
+									// the one row describing a half-applied save says which.
+									...(childResult.fault
+										? { childListFault: childResult.fault, childListReason: childResult.reason }
+										: {})
+								}
 							: {})
 					}),
 			// A reorder changes what a visitor sees and touches no field, so without

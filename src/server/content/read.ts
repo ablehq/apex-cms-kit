@@ -48,7 +48,44 @@ let inflight: Promise<ContentSnapshot> | null = null;
  * whole `MEMO_TTL_MS` — undoing the invalidation the publish just paid for.
  */
 let generation = 0;
+/**
+ * THE PUBLISH-CLOCK FLOOR: the oldest `publishedAt` this isolate is still allowed
+ * to MEMOISE, as epoch milliseconds. `0` means "no floor" — a cold isolate.
+ *
+ * The generation counter above orders events INSIDE this isolate. It cannot order
+ * BYTES, and the bytes are where the remaining hazard is: `kv.get(…, {cacheTtl:
+ * 60})` reads KV's own edge cache, which is eventually consistent and NOT monotonic
+ * across tiers, so a read that starts after a publish can still be handed
+ * pre-publish bytes. Their `startedAt` equals the current generation, so nothing
+ * above stops them being installed — and once installed they are served for a whole
+ * `MEMO_TTL_MS`.
+ *
+ * Two things raise the floor, and between them they close both directions:
+ *
+ *   1. every snapshot this isolate installs, so KV handing back bytes OLDER than the
+ *      memo (the same eventual-consistency window, one TTL later) cannot replace it;
+ *   2. `resetContentMemo(publishedAt)` — the publish path KNOWS the timestamp it
+ *      just wrote, and passes it, so the very next read cannot install anything
+ *      older than the publish that invalidated the memo.
+ *
+ * Older bytes are still SERVED to the caller that fetched them (refusing to answer
+ * would be worse than answering with a snapshot that was current a second ago); they
+ * are simply not installed, so the next read goes back to KV instead of waiting out
+ * a minute on them.
+ *
+ * A snapshot whose `publishedAt` will not parse is treated as unknown and allowed
+ * through: refusing to ever memoise it would trade a bounded staleness window for an
+ * unbounded re-fetch on every request.
+ */
+let memoFloor = 0;
 const MEMO_TTL_MS = 60_000;
+
+/** `publishedAt` as epoch ms, or null when it is missing or unparseable. */
+function publishedAtMs(value: unknown): number | null {
+	if (typeof value !== 'string') return null;
+	const stamp = Date.parse(value);
+	return Number.isFinite(stamp) ? stamp : null;
+}
 
 const VERSION_PREFIX = /^\{"version":"([^"]+)"/u;
 
@@ -69,11 +106,35 @@ export async function readContent(kv: ContentStore | undefined): Promise<Content
 	if (!kv) throw new ContentUnavailableError('the CONTENT binding is not configured');
 	if (memo && Date.now() - memoCheckedAt < MEMO_TTL_MS) return memo;
 	if (!inflight) {
-		// Declared before it is assigned so the `finally` below can compare against
-		// the promise that is ACTUALLY in the slot. `inflight = mine.finally(…)` puts
-		// a DIFFERENT promise there, `inflight === mine` is then never true, and the
-		// slot is never cleared — every later read past the memo TTL would be handed
-		// a long-resolved promise forever. Caught by a test that deadlocked.
+		/**
+		 * WHAT GOES IN THE SLOT IS THE `finally`-CHAINED PROMISE, and that is the fix.
+		 *
+		 * The bug was `inflight = mine.finally(…)`: the callback then compared
+		 * `inflight` against the INNER promise, `inflight === mine` was never true, the
+		 * slot was never cleared, and every later read past the memo TTL was handed a
+		 * long-resolved promise forever. Caught by a test that deadlocked. The `let`
+		 * split below is only what lets the callback name the chained promise from
+		 * inside its own initializer — `const mine: Promise<ContentSnapshot> = (…)()
+		 * .finally(…)` would behave identically; the ORDER (`inflight = mine` after the
+		 * chain, on line below) is the part that matters.
+		 *
+		 * CLEAR THE SLOT ONLY IF IT IS STILL OURS.
+		 *
+		 * An unconditional `inflight = null` clears whatever is there, INCLUDING A
+		 * LATER READ'S PROMISE. That is how two reads end up running at once: a
+		 * pre-reset read settles, frees the post-reset read's slot, and a third read
+		 * starts against KV's 60-second edge cache — after which whichever lands last
+		 * wins, and a slower one holding older bytes can install them over a newer memo
+		 * for a full `MEMO_TTL_MS`.
+		 *
+		 * WHAT THE THREE DEFENCES DO AND DO NOT COVER. Slot ownership means at most one
+		 * read is installing per generation. The generation check refuses a read that
+		 * SPANS a reset. Neither can see the age of the BYTES, so KV's own edge cache —
+		 * which can answer a post-publish read with pre-publish content — is closed by
+		 * the third, `memoFloor`. What remains open is that such a caller is still
+		 * SERVED the older snapshot; it is simply never installed, so the staleness
+		 * lasts one request instead of one `MEMO_TTL_MS`.
+		 */
 		let mine: Promise<ContentSnapshot>;
 		mine = (async () => {
 			const startedAt = generation;
@@ -82,27 +143,18 @@ export async function readContent(kv: ContentStore | undefined): Promise<Content
 			const version = versionOf(raw);
 			const snapshot =
 				memo && version === memo.version ? memo : (JSON.parse(raw) as ContentSnapshot);
-			// A publish landed while this read was in flight: hand THIS caller what KV
-			// gave us, but do not memoise it — the next read re-fetches and sees the new
-			// value rather than waiting out a minute on bytes fetched before the write.
-			if (generation === startedAt) {
+			const stamp = publishedAtMs(snapshot.publishedAt);
+			// A publish landed while this read was in flight, or KV handed back bytes
+			// older than the publish clock this isolate has already seen: hand THIS
+			// caller what KV gave us, but do not memoise it — the next read re-fetches
+			// and sees the new value rather than waiting out a minute on old bytes.
+			const olderThanFloor = stamp !== null && memoFloor > 0 && stamp < memoFloor;
+			if (generation === startedAt && !olderThanFloor) {
 				memo = snapshot;
 				memoCheckedAt = Date.now();
+				if (stamp !== null && stamp > memoFloor) memoFloor = stamp;
 			}
 			return snapshot;
-			// CLEAR THE SLOT ONLY IF IT IS STILL OURS.
-			//
-			// An unconditional `inflight = null` clears whatever is there, INCLUDING A
-			// LATER READ'S PROMISE. That is how two reads end up running at once: a
-			// pre-reset read settles, frees the post-reset read's slot, and a third
-			// read starts against KV's 60-second edge cache — after which whichever
-			// lands last wins, and a slower one holding older bytes can install them
-			// over a newer memo for a full `MEMO_TTL_MS`.
-			//
-			// With the slot owned, at most one read is ever installing per generation,
-			// and a read that spans a reset is refused by the generation check above.
-			// Together those two are complete: there is no remaining path by which an
-			// older snapshot replaces a newer one.
 		})().finally(() => {
 			if (inflight === mine) inflight = null;
 		});
@@ -124,12 +176,20 @@ export function manifestOf(snapshot: ContentSnapshot): ContentManifest {
  * publish reaches the READER that made it no sooner than any other visitor, so the
  * admin rail and any SSR in that isolate keep serving the previous snapshot for up
  * to `MEMO_TTL_MS`. It removes the self-inflicted half of the delay. It does NOT
- * remove KV's own edge cache (`cacheTtl: 60` above) and it does not reach any other
- * isolate — a visitor on a different one still waits.
+ * remove KV's own edge cache (`cacheTtl: 60` in `readContent`) and it does not
+ * reach any other isolate — a visitor on a different one still waits.
+ *
+ * `publishedAt` is what a caller that just WROTE a snapshot passes: the timestamp of
+ * the bytes it put. It becomes the memo floor, so the next read cannot install
+ * anything older than the publish that invalidated the memo — the one hazard the
+ * edge cache leaves open (see `memoFloor`). Omitting it means "go cold, and trust
+ * whatever KV answers next", which is what a test wanting a clean reader wants and
+ * what a publish must never ask for.
  */
-export function resetContentMemo() {
+export function resetContentMemo(publishedAt?: string) {
 	memo = null;
 	memoCheckedAt = 0;
 	inflight = null;
 	generation += 1;
+	memoFloor = publishedAtMs(publishedAt) ?? 0;
 }

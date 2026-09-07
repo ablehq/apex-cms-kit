@@ -96,6 +96,16 @@ export async function handleCreateRecord(
 	 * Refused by NAME, not by value shape: `[]` on a child list is just as much a
 	 * caller that thinks this call writes lists, and the body schema has already
 	 * refused a non-array on one.
+	 *
+	 * ── PROVISIONAL: A CAPABILITY GATE ON THE BACKEND BUILD ──────────────────
+	 * "Not writable on create" is a fact about `archetype_models` TODAY, not a rule
+	 * about creates. Plan 08 makes that controller permit list-shaped fields the way
+	 * `entity_models_controller` already does, and then a create carries its lists
+	 * like any other field. When that is DEPLOYED and VERIFIED — not merely merged —
+	 * this refusal comes out with the rest of the gate, in the single reviewed kit
+	 * change plan 07's **P3b** node inventories (that node is the list; do not
+	 * rediscover it). Until then it stays: on the backend production runs the create
+	 * answers 201 and stores `[]`, and reports success over a list that never landed.
 	 */
 	const childListsOnCreate = childListFieldNames(contract, params.schema).filter(
 		(name) => (parsed.data.fields ?? {})[name] !== undefined

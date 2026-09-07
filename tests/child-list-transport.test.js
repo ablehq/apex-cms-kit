@@ -12,7 +12,7 @@ import { handleUpdateRecord } from '../src/server/bff/operations/update-record.t
 import { handleCreateRecord } from '../src/server/bff/operations/create-record.ts';
 import { handleUpdatePostArchetype } from '../src/server/bff/operations/update-post-archetype.ts';
 import { handleCreatePost } from '../src/server/bff/operations/create-post.ts';
-import { createApexAdminClient } from '../src/server/bff/apex-admin-client.ts';
+import { ApexTransportError, createApexAdminClient } from '../src/server/bff/apex-admin-client.ts';
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
 import { createMemorySessionStore } from './harness/session-store.ts';
@@ -104,6 +104,17 @@ const contract = {
  * relationship `Archetype#on_primitive_changed` has with `archetype_items`. So a
  * field with no item simply is not in `primitives`, and a field routed to the flat
  * surface as an array lands as `[]`, which is the silent loss.
+ *
+ * ── PROVISIONAL: THIS DOUBLE MODELS THE OLD FLAT SURFACE ─────────────────────
+ * "an array answers 200 and stores `[]`" in `updateContentLibraryRecord` below is a
+ * CAPABILITY of the backend production runs, not a permanent contract. Plan 08
+ * makes `archetype_models` permit list-shaped fields; when that is DEPLOYED and
+ * VERIFIED this double stops being a description of anything, and it is deleted
+ * with the transport it exists to test — the single reviewed kit change plan 07's
+ * **P3b** node inventories. The local backend this repo is developed against has
+ * ALREADY moved; `poovayya/tests/apex-array-capability-realapex.test.ts` is what
+ * records which build is actually running. Do not "fix" this double to match it:
+ * until the transition lands, the old behaviour is the one the kit must survive.
  */
 function fakeApex({ items = [], unbackedPrimitives = null, failItemWrite = null } = {}) {
 	const calls = [];
@@ -842,7 +853,7 @@ describe('the audit row says what actually happened', () => {
 		const db = await createMigratedDatabase();
 		const apex = fakeApex({ items: backedItems() });
 		apex.updateArchetypeItem = async () => {
-			throw new TypeError('fetch failed');
+			throw new ApexTransportError(new TypeError('fetch failed'));
 		};
 		const ctx = ctxWith(apex, db);
 		const response = await update(ctx, {
@@ -857,14 +868,19 @@ describe('the audit row says what actually happened', () => {
 		assert.equal(rows.length, 1);
 		assert.equal(rows[0].outcome, 'apex_error');
 		assert.equal(rows[0].detail.childListFailedOn, 'expertise_items');
+		assert.equal(
+			rows[0].detail.childListFault,
+			'network',
+			'Apex really was asked and never answered'
+		);
 		db.close();
 	});
 
-	it('a thrown FLAT write is audited too, rather than escaping as a 500', async () => {
+	it('a TRANSPORT fault on the FLAT write is audited too, rather than escaping as a 500', async () => {
 		const db = await createMigratedDatabase();
 		const apex = fakeApex({ items: backedItems() });
 		apex.updateContentLibraryRecord = async () => {
-			throw new TypeError('fetch failed');
+			throw new ApexTransportError(new TypeError('fetch failed'));
 		};
 		const ctx = ctxWith(apex, db);
 		const response = await update(ctx, { fields: { name: 'Asha Rao' } });
@@ -873,7 +889,87 @@ describe('the audit row says what actually happened', () => {
 		assert.equal(rows.length, 1);
 		assert.equal(rows[0].outcome, 'apex_error');
 		assert.equal(rows[0].detail.apexStatus, 0);
+		assert.equal(rows[0].detail.thrown, undefined, 'a network fault is not a thrown one');
 		db.close();
+	});
+
+	/**
+	 * ── NOT EVERY THROW IS A TRANSPORT FAULT ─────────────────────────────────
+	 *
+	 * `catch {}` recorded `apexStatus: 0` — "Apex never answered" — for every throw
+	 * the client can make, including its OWN refusals, on which Apex was never asked
+	 * anything. The audit row is the only record of a half-applied save; a fiction
+	 * there is worse than no row.
+	 */
+	it('a NON-transport throw on the flat write surfaces with its real reason, not as apexStatus 0', async () => {
+		const db = await createMigratedDatabase();
+		const apex = fakeApex({ items: backedItems() });
+		apex.updateContentLibraryRecord = async () => {
+			// Exactly what `contentLibrarySlug` / `assertUuid` / `assertNoArrayFields`
+			// do inside the real client.
+			throw new Error('not a content-library archetype schema: team_member');
+		};
+		const ctx = ctxWith(apex, db);
+		await assert.rejects(
+			() => update(ctx, { fields: { name: 'Asha Rao' } }),
+			/not a content-library archetype schema/u,
+			'the real reason reaches the frame that can log it'
+		);
+		const rows = await auditRows(db);
+		assert.equal(rows.length, 1, 'and the attempt is still recorded');
+		assert.equal(rows[0].outcome, 'apex_error');
+		assert.equal(rows[0].detail.thrown, true);
+		assert.match(rows[0].detail.thrownReason, /not a content-library archetype schema/u);
+		assert.equal(rows[0].detail.apexStatus, undefined, 'NOT relabelled as "no answer"');
+		db.close();
+	});
+
+	it('a NON-transport throw mid-list is audited as thrown, and the half-applied save is still reported', async () => {
+		// Here the flat write HAS committed, so rethrowing would tell the editor
+		// nothing about a save that is now half applied. The failure is reported as
+		// usual and the audit row carries which kind of failure it was.
+		const db = await createMigratedDatabase();
+		const apex = fakeApex({ items: backedItems() });
+		apex.updateArchetypeItem = async () => {
+			throw new Error('refusing off-origin Apex call');
+		};
+		const ctx = ctxWith(apex, db);
+		const response = await update(ctx, {
+			fields: { name: 'Asha Rao', expertise_items: [CHILD_B] }
+		});
+		assert.equal(response.status, 502);
+		assert.equal((await response.json()).error, 'child-list-write-failed');
+		const rows = await auditRows(db);
+		assert.equal(rows[0].detail.childListFault, 'thrown', 'Apex was never asked');
+		assert.match(rows[0].detail.childListReason, /off-origin/u);
+		db.close();
+	});
+
+	it('the REAL client’s allowlist refusal is a throw, not a transport fault', async () => {
+		// The narrowing rests on the real client actually distinguishing the two, so
+		// this asserts against `createApexAdminClient` rather than the double: an
+		// allowlist refusal is a plain `Error`, and only a failed fetch is wrapped.
+		const client = createApexAdminClient({
+			baseUrl: 'http://127.0.0.1:59999',
+			token: 't',
+			allowedSchemaSlugs: ['author']
+		});
+		await assert.rejects(
+			() => client.updateContentLibraryRecord('team_member', RECORD_ID, { name: 'x' }),
+			(error) => {
+				assert.equal(error instanceof ApexTransportError, false);
+				assert.match(error.message, /not a content-library archetype schema/u);
+				return true;
+			}
+		);
+		// And a fetch that genuinely fails IS wrapped — nothing listens on 59999.
+		await assert.rejects(
+			() => client.updateContentLibraryRecord('author', RECORD_ID, { name: 'x' }),
+			(error) => {
+				assert.ok(error instanceof ApexTransportError, `got ${error?.name}: ${error?.message}`);
+				return true;
+			}
+		);
 	});
 });
 

@@ -49,6 +49,13 @@ export function createPostBodySchema(contract: ContentContract, slug: string) {
 		// field on a post schema is not writable at all, and saying so is better than
 		// crashing. No post schema on any site declares one today; the next one that
 		// does must not find out in production.
+		//
+		// PROVISIONAL — a capability gate on the backend build, not a rule about
+		// posts. A post's fields ride the SAME `archetype_models` controller plan 08
+		// fixes, so once that fix is DEPLOYED and VERIFIED an array on a post field
+		// is writable and this refine comes out with the rest of the gate, in the one
+		// reviewed kit change plan 07's **P3b** node inventories. Until then it stays:
+		// on the backend production runs the value is answered 200 and stored as `[]`.
 		fieldsShape[def.field_name] = z
 			.unknown()
 			.refine((value) => !Array.isArray(value), 'a post field does not hold a list')

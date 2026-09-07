@@ -1,4 +1,5 @@
 import { readPrimitiveItemId } from '../archetype-record';
+import { ApexTransportError } from '../apex-admin-client';
 import type { ApexAdminClient, ContentLibraryFields } from '../apex-admin-client';
 import type { ContentContract } from '../content-contract';
 
@@ -75,10 +76,14 @@ export interface ChildListWrite {
  * Split a submitted field map into the part that goes flat and the part that goes
  * to the items endpoint.
  *
- * Keyed on the CONTRACT's validator kind, not on `Array.isArray(value)`: a
- * declared child list sent as `[]` must still be routed (that is the legitimate
- * "clear the list"), and a non-array on a declared child list is a caller bug the
- * body schema has already refused.
+ * Keyed on the CONTRACT's validator kind FIRST, and on `Array.isArray(value)` only
+ * as the second half of the same test. The contract is what decides: an array on a
+ * field the contract does not call a list stays flat, so a stray array cannot invent
+ * a child-list write on a scalar field. The `Array.isArray` half is a type narrowing
+ * for `ChildListWrite.value`, and it can only ever be true here — `recordBodySchema`
+ * (`record-shape.ts`) has already refused a non-array on a declared list with a named
+ * 400, so a declared list that reaches this function is an array, `[]` included.
+ * `[]` is the legitimate "clear the list" and must be routed like any other value.
  */
 export function splitChildListFields(
 	contract: ContentContract,
@@ -95,9 +100,24 @@ export function splitChildListFields(
 	return { flat, childLists };
 }
 
-/** What happened to the child lists: all of them, or the one that stopped it. */
+/**
+ * What happened to the child lists: all of them, or the one that stopped it.
+ *
+ * `fault` is present only when there was no HTTP answer at all, and it says WHY:
+ * `'network'` is the fetch itself failing, `'thrown'` is this client refusing the
+ * call (an allowlist, `assertUuid`, `assertNoArrayFields`) or a bug. `status: 0`
+ * alone cannot tell those apart, and the audit row is where the difference is read.
+ */
 export type ChildListWriteResult =
-	{ ok: true; written: string[] } | { ok: false; written: string[]; field: string; status: number };
+	| { ok: true; written: string[] }
+	| {
+			ok: false;
+			written: string[];
+			field: string;
+			status: number;
+			fault?: 'network' | 'thrown';
+			reason?: string;
+	  };
 
 /**
  * Write each list to its own `archetype_item`, against a record READ IN THIS
@@ -131,13 +151,28 @@ export async function writeChildLists(
 			response = itemId
 				? await apex.updateArchetypeItem(slug, recordId, field, itemId, fieldsData)
 				: await apex.createArchetypeItem(slug, recordId, field, fieldsData);
-		} catch {
+		} catch (error) {
 			// The client RETHROWS a network fault when no abort signal was passed, and
 			// the admin path passes none. Caught HERE rather than at the call site
 			// because this is the only frame that knows WHICH list was in flight —
 			// and after a committed flat write, "which one" is the whole report.
 			// `status: 0` is "never got an answer", distinct from any HTTP refusal.
-			return { ok: false, written, field, status: 0 };
+			//
+			// NOT every throw is a transport fault, and an unqualified catch that says
+			// it is puts a lie in the audit row. The client's own refusals — the schema
+			// allowlist, `assertUuid`, `assertNoArrayFields` — arrive here identically,
+			// and on those Apex was never asked anything. Rethrowing them instead is
+			// not an option once the flat write has committed: the editor would be told
+			// nothing about a save that is now half applied. So the fault is CLASSIFIED
+			// and both facts travel.
+			return {
+				ok: false,
+				written,
+				field,
+				status: 0,
+				fault: error instanceof ApexTransportError ? 'network' : 'thrown',
+				reason: error instanceof Error ? error.message : String(error)
+			};
 		}
 		if (!response.ok) return { ok: false, written, field, status: response.status };
 		written.push(field);

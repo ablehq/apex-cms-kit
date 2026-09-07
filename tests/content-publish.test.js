@@ -420,4 +420,149 @@ describe('readContent', () => {
 		await assert.rejects(readContent(empty), /nothing has been published/);
 		assert.equal(reads, 2, 'the settled read released the slot; this is a NEW read');
 	});
+
+	/**
+	 * ── THE STORE THAT GOES BACKWARDS ────────────────────────────────────────
+	 *
+	 * Every stub above is a `Map`: it always answers the newest bytes written to it,
+	 * so it can never test the one hazard slot ownership and the generation counter
+	 * cannot reach. Real KV is eventually consistent and NOT monotonic across tiers,
+	 * and `readContent` asks it for `{cacheTtl: 60}` — its own edge cache — so a read
+	 * that STARTS after a publish can be handed PRE-publish bytes. Their generation
+	 * matches, so nothing else refuses them, and once installed they are served for a
+	 * full `MEMO_TTL_MS`.
+	 *
+	 * `goingBackwards` is the double standing rule §6 asks for: a store that can be
+	 * told to answer an OLDER value than the one it holds. Both tests below fail with
+	 * the `memoFloor` comparison removed.
+	 */
+	function goingBackwards(kv) {
+		const state = { serve: null, reads: 0 };
+		return {
+			state,
+			async get(key, options) {
+				state.reads += 1;
+				if (state.serve !== null) return state.serve;
+				return kv.get(key, options);
+			},
+			put: kv.put.bind(kv)
+		};
+	}
+
+	it('does not memoise bytes older than the publish that just invalidated the memo', async () => {
+		// O4 / codex 1: the publish path KNOWS the timestamp it wrote, and passes it as
+		// the floor. Without it the very next read — which started AFTER the reset, so
+		// the generation check waves it through — installs whatever the edge cache
+		// happened to hold and serves it for a minute.
+		resetContentMemo();
+		const kv = memoryStore();
+		await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'e', now: 1000 });
+		const stale = kv.map.get(CONTENT_KEY);
+		const staleVersion = JSON.parse(stale).version;
+		await publishContent({
+			apex: stubApex(),
+			kv,
+			accountId: ACCOUNT,
+			publishedBy: 'e',
+			now: 60_000
+		});
+		const freshVersion = JSON.parse(kv.map.get(CONTENT_KEY)).version;
+		assert.notEqual(staleVersion, freshVersion);
+
+		const backwards = goingBackwards(kv);
+		backwards.state.serve = stale; // KV's edge cache answers pre-publish bytes
+		const served = await readContent(backwards);
+		assert.equal(served.version, staleVersion, 'the caller is still answered, not refused');
+
+		backwards.state.serve = null;
+		const next = await readContent(backwards);
+		assert.equal(
+			next.version,
+			freshVersion,
+			'the stale bytes were NOT installed: the next read went back to KV'
+		);
+		assert.equal(backwards.state.reads, 2, 'and it really did read again');
+	});
+
+	it('does not let KV replace a NEWER memo with older bytes once the memo window lapses', async () => {
+		/**
+		 * The other direction, and the guard codex's review had removed as unreachable:
+		 * it IS unreachable through the public API while the memo is fresh, because the
+		 * memo short-circuits every read. Past `MEMO_TTL_MS` it is not — the same
+		 * eventual-consistency window can answer the re-check with bytes older than
+		 * what this isolate is already serving.
+		 *
+		 * The clock is moved rather than waited on; `Date.now` is restored in `finally`
+		 * so a failure here cannot poison the rest of the file.
+		 */
+		resetContentMemo();
+		const kv = memoryStore();
+		await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'e', now: 1000 });
+		const stale = kv.map.get(CONTENT_KEY);
+		const staleVersion = JSON.parse(stale).version;
+		await publishContent({
+			apex: stubApex(),
+			kv,
+			accountId: ACCOUNT,
+			publishedBy: 'e',
+			now: 60_000
+		});
+		const freshVersion = JSON.parse(kv.map.get(CONTENT_KEY)).version;
+
+		const backwards = goingBackwards(kv);
+		assert.equal(
+			(await readContent(backwards)).version,
+			freshVersion,
+			'the memo holds the new one'
+		);
+
+		const realNow = Date.now;
+		try {
+			const later = realNow() + 120_000;
+			Date.now = () => later;
+			backwards.state.serve = stale;
+			assert.equal(
+				(await readContent(backwards)).version,
+				staleVersion,
+				'the lapsed memo re-checks, and KV goes backwards'
+			);
+			backwards.state.serve = null;
+			assert.equal(
+				(await readContent(backwards)).version,
+				freshVersion,
+				'the older snapshot never took the memo — a third read gets the newer one'
+			);
+		} finally {
+			Date.now = realNow;
+		}
+	});
+
+	it('a bare resetContentMemo drops the floor, so a cold reader trusts KV again', async () => {
+		// The floor is a defence against going BACKWARDS, not a permanent high-water
+		// mark: a caller that asks for a cold reader (every test harness does) must not
+		// inherit a floor from a snapshot this isolate has forgotten.
+		resetContentMemo();
+		const kv = memoryStore();
+		await publishContent({
+			apex: stubApex(),
+			kv,
+			accountId: ACCOUNT,
+			publishedBy: 'e',
+			now: 60_000
+		});
+		assert.ok((await readContent(kv)).version);
+
+		const old = memoryStore();
+		await publishContent({
+			apex: stubApex(),
+			kv: old,
+			accountId: ACCOUNT,
+			publishedBy: 'e',
+			now: 1000
+		});
+		resetContentMemo();
+		const readBack = await readContent(old);
+		assert.equal(readBack.version, JSON.parse(old.map.get(CONTENT_KEY)).version);
+		assert.equal(await readContent(old), readBack, 'and it memoised, rather than refusing');
+	});
 });
