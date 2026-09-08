@@ -259,10 +259,10 @@ export type SaveEntityResult =
 			stage?: string;
 			status?: number;
 			/**
-			 * The operation's own refusal code, when it has one — `unbacked-record`,
-			 * `child-list-write-failed`. Named rather than left to the index signature
-			 * so a screen that branches on it is type-checked, and so the two refusals
-			 * whose default message is a LIE are visible in the type.
+			 * The operation's own refusal code, when it has one — `unbacked-record`.
+			 * Named rather than left to the index signature so a screen that branches on
+			 * it is type-checked, and so the refusal whose default message is a LIE is
+			 * visible in the type.
 			 */
 			code?: string;
 			/**

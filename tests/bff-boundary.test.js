@@ -11,7 +11,6 @@ import {
 import {
 	ApexTransportError,
 	assertEntityTypeRef,
-	assertSchemaItemSlug,
 	createApexAdminClient
 } from '../src/server/bff/apex-admin-client.ts';
 
@@ -148,26 +147,22 @@ describe('the path-segment shape checks accept only what they say they accept', 
 	 * segment and Apex answers 404 — but a shape check that accepts what it says it
 	 * refuses is the wrong thing to leave in a security boundary.
 	 *
-	 * MUTATION: put the `i` flag back on either regex and the matching case here
-	 * stops throwing.
+	 * MUTATION: put the `i` flag back on the regex and the matching case here stops
+	 * throwing. (`assertSchemaItemSlug` carried the same rule and the same test until
+	 * the items endpoint it guarded was deleted with the child-list transport.)
 	 */
 	it('refuses the two characters unicode case folding smuggled into [a-z]', () => {
 		assert.throws(() => assertEntityTypeRef('\u212a'), /invalid entity type/u);
 		assert.throws(() => assertEntityTypeRef('quote-\u017fitem'), /invalid entity type/u);
-		assert.throws(() => assertSchemaItemSlug('\u212a'), /invalid schema item slug/u);
-		assert.throws(() => assertSchemaItemSlug('expertise_\u017f'), /invalid schema item slug/u);
 	});
 
 	it('refuses an UPPERCASE spelling, which Apex never mints', () => {
 		assert.throws(() => assertEntityTypeRef('Quote-Item'), /invalid entity type/u);
-		assert.throws(() => assertSchemaItemSlug('Biography'), /invalid schema item slug/u);
 	});
 
 	it('still accepts the slugs and uuids every site actually uses', () => {
 		assert.doesNotThrow(() => assertEntityTypeRef('quote-item'));
 		assert.doesNotThrow(() => assertEntityTypeRef('5c9f0a21-1b2c-4d3e-8f40-a1b2c3d4e5f6'));
-		assert.doesNotThrow(() => assertSchemaItemSlug('expertise_items'));
-		assert.doesNotThrow(() => assertSchemaItemSlug('biography'));
 	});
 });
 

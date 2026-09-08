@@ -231,33 +231,6 @@ export function readPrimitiveValue(record: Record<string, unknown>, name: string
 }
 
 /**
- * The id of the PRIMITIVE `archetype_item` row that holds one field, or null.
- *
- * This is the row a child-list write addresses. A Primitive schema item is forced
- * `has_one` upstream (`archetype_schema_item/primitive.rb` sets
- * `relationship_kind = "has_one"` in a `before_validation`), and
- * `ArchetypeItem#validate_schema_item` refuses a SECOND row for the same schema
- * item — measured: a second `POST …/schema_item/expertise_items/items` answers
- * **422**. So a list is ONE row holding the whole array, and writing one is
- * "PATCH the row if it exists, POST only when it does not".
- *
- * `relatable_type` is the discriminator, not the name: a primitive's row is backed
- * by a `PropertySet` and a reference's by a `Specification::Archetype`, and both
- * carry `fields_data` under the item's own name.
- */
-export function readPrimitiveItemId(record: Record<string, unknown>, name: string): string | null {
-	for (const item of readArchetypeItems(record)) {
-		if (item.relatable_type !== 'PropertySet') continue;
-		const schemaItem = isRecord(item.archetype_schema_item) ? item.archetype_schema_item : null;
-		if (!schemaItem) continue;
-		if (schemaItem.name !== name && schemaItem.slug !== name) continue;
-		const itemId = cleanString(item.id);
-		if (itemId) return itemId;
-	}
-	return null;
-}
-
-/**
  * Which keys of `primitives` NO Primitive `archetype_item` row accounts for — the
  * measurement the partial-write guard is built on.
  *
@@ -276,8 +249,8 @@ export function readPrimitiveItemId(record: Record<string, unknown>, name: strin
  * NOT counted as covering it, because the rebuild would not carry it either.
  *
  * The other direction, which surprises people: a row holding `{field: []}` — minted
- * by a bad flat save of a child list, which answers 200 and stores the empty array —
- * DOES cover its key, and correctly. This guard asks one question, "what would a
+ * by a flat save that sent an array to a field the permit does not cover, which
+ * answers 200 and stores the empty array — DOES cover its key, and correctly. This guard asks one question, "what would a
  * partial write destroy", and the answer there is nothing: the rebuild reproduces
  * `[]`, and `primitives` already reads `[]` because that same bad save triggered the
  * rebuild that emptied it. Refusing the save would block an edit while protecting

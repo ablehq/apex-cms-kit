@@ -11,7 +11,6 @@ import {
 import { cleanString, unwrapArchetypeRecord } from '../archetype-record';
 import { createdIdOutcome, judgeCreatedId, shapeFaultDetail } from './created-id';
 import { recordBodySchema, referenceFieldNames, summarizeRecord } from './record-shape';
-import { childListFieldNames } from './child-list';
 import { toApexFields } from './update-record';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import type { BffContext } from '../context';
@@ -104,38 +103,20 @@ export async function handleCreateRecord(
 		return rejectMutation(ctx, actorMeta, 400, 'position on create', 'position on create');
 	}
 	/**
-	 * NOR IS A CHILD LIST WRITABLE ON CREATE, and it too is refused rather than
-	 * dropped.
+	 * A LIST IS WRITABLE ON CREATE, and it did not used to be.
 	 *
-	 * An array-shaped field has to go to `/specification/archetypes/:id/schema_item/
-	 * :field/items`, which needs the archetype id this call is about to mint. Sent
-	 * flat on the create it would answer 201 and store `[]` — the same silent loss
-	 * `assertNoArrayFields` refuses on the update — so the create would report
-	 * success over a list that was never written. The editor sets them a moment
-	 * later, on the screen that opens against the real id, through the update path
-	 * that routes them properly.
+	 * An array-shaped field had to go to `/specification/archetypes/:id/schema_item/
+	 * :field/items`, which needs the archetype id this call is about to mint — so a
+	 * create carrying one was REFUSED rather than answering 201 over a list that was
+	 * never written. `ellipsis-backend` PR #1888 (`fix/archetype-model-array-fields`)
+	 * made `archetype_models` permit a list-shaped value, so the list now rides this
+	 * POST like every other field and the refusal is gone.
 	 *
-	 * Refused by NAME, not by value shape: `[]` on a child list is just as much a
-	 * caller that thinks this call writes lists, and the body schema has already
-	 * refused a non-array on one.
-	 *
-	 * ── PROVISIONAL: A CAPABILITY GATE ON THE BACKEND BUILD ──────────────────
-	 * "Not writable on create" is a fact about `archetype_models` TODAY, not a rule
-	 * about creates. Plan 08 makes that controller permit list-shaped fields the way
-	 * `entity_models_controller` already does, and then a create carries its lists
-	 * like any other field. When that is DEPLOYED and VERIFIED — not merely merged —
-	 * this refusal comes out with the rest of the gate, in the single reviewed kit
-	 * change plan 07's **P3b** node inventories (that node is the list; do not
-	 * rediscover it). Until then it stays: on the backend production runs the create
-	 * answers 201 and stores `[]`, and reports success over a list that never landed.
+	 * What is NOT gone is the refusal for a field the permit does not cover:
+	 * `recordBodySchema` rejects an array on anything but a single-field Primitive of
+	 * an array kind, because on everything else the flat surface still reduces it to
+	 * `[]`. See `writableArrayKind` in `record-shape.ts`.
 	 */
-	const childListsOnCreate = childListFieldNames(contract, params.schema).filter(
-		(name) => (parsed.data.fields ?? {})[name] !== undefined
-	);
-	if (childListsOnCreate.length > 0) {
-		return rejectMutation(ctx, actorMeta, 400, 'child list on create', 'child list on create');
-	}
-
 	const fields = toApexFields(parsed.data.fields ?? {});
 	const apexResponse = await guard.apex.createContentLibraryRecord(params.schema, fields);
 

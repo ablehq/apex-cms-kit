@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { ContentContract } from '../content-contract';
+import type { ContentContract, SchemaItem } from '../content-contract';
 import {
 	cleanString,
 	readPrimitiveValue,
@@ -96,51 +96,131 @@ export function readPosition(record: Record<string, unknown>): number | null {
 }
 
 /**
- * The body schema for a create or an update on one schema slug.
+ * The three validator kinds whose value is a LIST, named as the backend names them.
+ *
+ * The spelling is EXACT, and `array_ref` keeps its slash. The permit upstream is
+ * `kind == "text_array" || kind == "number_array" || kind.match?(%r{^array_ref/})`
+ * (`archetype_models_controller.rb#array_validator_kind?`), and `validator_kind` is
+ * free-form text — so `startsWith('array_ref')`, which is what the deleted
+ * child-list module used, also accepts `array_ref` bare, `array_reference` and
+ * `array_refx/foo`. Those are SCALAR fields as far as the permit is concerned: an
+ * array sent to one is reduced to `[]` and, when the kind is not a validator the
+ * backend recognises, stored — 200, no error, the value gone. A predicate looser
+ * than the permit is therefore a data-loss path, not a convenience.
+ */
+export type ArrayFieldKind = 'text_array' | 'number_array' | 'array_ref';
+
+export function arrayFieldKind(kind: string | null | undefined): ArrayFieldKind | null {
+	if (typeof kind !== 'string') return null;
+	if (kind === 'text_array') return 'text_array';
+	if (kind === 'number_array') return 'number_array';
+	return /^array_ref\//u.test(kind) ? 'array_ref' : null;
+}
+
+/**
+ * MAY A FLAT PATCH CARRY AN ARRAY FOR THIS FIELD? — the whole of the kind-aware
+ * refusal, in one place, and it FAILS CLOSED.
+ *
+ * `ellipsis-backend` PR #1888 (`fix/archetype-model-array-fields`) widened the
+ * `archetype_models` permit, but it widened it NARROWLY, and the narrowness is the
+ * point. `array_payload_schema_item?` admits a schema item only when it is a
+ * Primitive holding exactly ONE field def whose kind is an array kind. Everything
+ * else still reduces the array to `[]` on the way through strong parameters, and
+ * what happens next is not a refusal:
+ *
+ *   - a SCALAR field with a recognised validator generally answers 422, but one
+ *     whose `validator_kind` is null or unrecognised STORES the `[]` and answers
+ *     200 (measured on local Apex at `dfac456e`: `practice_area.tagline`,
+ *     `validator_kind: null`, re-read as `[]`);
+ *   - a MULTI-FIELD Primitive gets the `[]` assigned to whichever field is FIRST,
+ *     because `ArchetypeModelService#primitive_fields_data` routes a non-Hash entry
+ *     to `primitive_field_names(...).first`;
+ *   - an entity-type item is excluded outright.
+ *
+ * So this is what stands between an editor and a silent empty write, and it answers
+ * null — array refused — for every shape it is not certain about: a field no
+ * Primitive item holds, a field two items hold, an item holding more than one
+ * field, an entity-type item, a near-miss kind. Being unsure is a refusal.
+ */
+export function writableArrayKind(
+	contract: ContentContract,
+	slug: string,
+	fieldName: string
+): ArrayFieldKind | null {
+	const items = contract.schema(slug)?.items ?? [];
+	const holders = items.filter(
+		(item): item is Extract<SchemaItem, { kind: 'primitive' }> =>
+			item.kind === 'primitive' && item.field_defs.some((def) => def.field_name === fieldName)
+	);
+	// Not one item: either nothing declares the field (so the contract cannot say
+	// what it is) or two items do (so which one the backend would write to is a
+	// guess). Both refuse.
+	if (holders.length !== 1) return null;
+	const defs = holders[0].field_defs;
+	if (defs.length !== 1) return null;
+	return arrayFieldKind(defs[0].validator_kind);
+}
+
+/**
+ * The `fields` shape for one schema — SHARED by the record body and the post body,
+ * because they are the same question about the same controller.
  *
  * Built from the CONTRACT, so an unknown field name is a 400 here rather than a
  * silently ignored key upstream, and so adding a field to the schema is one
  * regenerated JSON file rather than four edited zod objects.
  *
- * `fields` values are `z.unknown()` because rich text is a legitimate object. What
- * they may NOT be is `null` — the destructive case — and that is enforced
- * separately by `containsNullPrimitive`, which can tell a null on a primitive from
- * a null on a reference. Doing it in zod would need the same distinction and would
- * report it as a shape failure rather than as what it is.
+ * Values are `z.unknown()` because rich text is a legitimate object. What they may
+ * NOT be is `null` — the destructive case — and that is enforced separately by
+ * `containsNullPrimitive`, which can tell a null on a primitive from a null on a
+ * reference. Doing it in zod would need the same distinction and would report it as
+ * a shape failure rather than as what it is.
  *
- * ARRAYS ARE DECIDED BY THE FIELD'S KIND, not left to `z.unknown()`:
+ * ARRAYS ARE DECIDED BY `writableArrayKind`, never by `z.unknown()`:
  *
- *   - an ARRAY-SHAPED field (`array_ref/…`, `text_array`, `number_array`) takes an
- *     array and only an array, checked down to its entries. It leaves the flat
- *     surface entirely — see `child-list.ts`;
- *   - EVERY OTHER field REFUSES an array. `z.unknown()` accepted one, and an array
- *     on a scalar field is stored as `[]` by the flat surface with a 200. The Apex
- *     client throws on the same input; this makes it a named 400 before the throw,
- *     so a caller gets told what was wrong with its body instead of a 500.
+ *   - a field the backend will store a list for takes an array and only an array,
+ *     checked down to its entries;
+ *   - EVERY OTHER field REFUSES an array, and that refusal is load-bearing rather
+ *     than tidy — see `writableArrayKind` for what the flat surface does with an
+ *     array it did not permit.
  */
-export function recordBodySchema(contract: ContentContract, slug: string) {
-	const fieldDefs = contract.primitiveFieldDefs(slug);
-	const references = contract.referenceItems(slug);
-
+export function primitiveFieldsShape(
+	contract: ContentContract,
+	slug: string
+): Record<string, z.ZodTypeAny> {
 	const fieldsShape: Record<string, z.ZodTypeAny> = {};
-	for (const def of fieldDefs) {
-		const kind = def.validator_kind ?? '';
-		if (kind.startsWith('array_ref')) {
-			// The entries are content-library ENTITY ids. A malformed one would reach
-			// the items endpoint and come back as a bare 500 (see `updateArchetypeItem`),
-			// so it is worth refusing here where the field can still be named.
-			fieldsShape[def.field_name] = z.array(z.string().uuid()).max(200).optional();
-		} else if (kind === 'text_array') {
-			fieldsShape[def.field_name] = z.array(z.string()).max(200).optional();
-		} else if (kind === 'number_array') {
-			fieldsShape[def.field_name] = z.array(z.number()).max(200).optional();
-		} else {
-			fieldsShape[def.field_name] = z
-				.unknown()
-				.refine((value) => !Array.isArray(value), 'this field does not hold a list')
-				.optional();
+	for (const def of contract.primitiveFieldDefs(slug)) {
+		switch (writableArrayKind(contract, slug, def.field_name)) {
+			case 'array_ref':
+				// The entries are content-library ENTITY ids. A malformed one comes back
+				// from Apex as a 422 naming the field, but refusing it here names the field
+				// too and costs no round trip.
+				fieldsShape[def.field_name] = z.array(z.string().uuid()).max(200).optional();
+				break;
+			case 'text_array':
+				fieldsShape[def.field_name] = z.array(z.string()).max(200).optional();
+				break;
+			case 'number_array':
+				fieldsShape[def.field_name] = z.array(z.number()).max(200).optional();
+				break;
+			default:
+				fieldsShape[def.field_name] = z
+					.unknown()
+					.refine((value) => !Array.isArray(value), 'this field does not hold a list')
+					.optional();
 		}
 	}
+	return fieldsShape;
+}
+
+/**
+ * The body schema for a create or an update on one schema slug.
+ *
+ * `fields` is `primitiveFieldsShape` above; everything here is what a RECORD adds
+ * to it — the reference relations and the ordering column.
+ */
+export function recordBodySchema(contract: ContentContract, slug: string) {
+	const references = contract.referenceItems(slug);
+	const fieldsShape = primitiveFieldsShape(contract, slug);
 
 	const referencesShape: Record<string, z.ZodTypeAny> = {};
 	for (const item of references) {

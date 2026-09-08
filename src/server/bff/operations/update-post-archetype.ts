@@ -16,7 +16,6 @@ import {
 	summarizeRecord
 } from './record-shape';
 import { toApexFields } from './update-record';
-import { childListFieldNames } from './child-list';
 import {
 	buildPostLoad,
 	loadPostView,
@@ -46,6 +45,28 @@ import type { BffContext } from '../context';
  * read taken in this request, as `update-record.ts` does and for the same reason:
  * `apply_has_many_value` upserts, so a removal must travel as `_destroy` against
  * the JOIN ROW id.
+ *
+ * A LIST IS WRITABLE ON A POST ARCHETYPE, and it did not used to be.
+ *
+ * There was no child-list transport here — the content-library path routed its
+ * lists to `…/schema_item/{field}/items` and this one had nowhere to send them —
+ * so an array-shaped field on a post schema was refused outright, in the currency
+ * a caller can act on, rather than reaching `updatePostArchetype` and throwing.
+ *
+ * A post's primitives go through the SAME `archetype_models` controller a record's
+ * do (`updatePostArchetype` PATCHes `archetype_schemas/:slug/archetype_models/:id`),
+ * so `ellipsis-backend` PR #1888 (`fix/archetype-model-array-fields`) widened both
+ * at once and the list rides this PATCH like every other field.
+ *
+ * The refusal that REMAINS is per-field, not per-surface: `recordBodySchema`
+ * rejects an array on anything but a single-field Primitive of an array kind,
+ * because on everything else the flat surface still reduces it to `[]`. No post
+ * schema on any site declares an array kind today, so the kit's hermetic tests
+ * are the evidence for both halves here.
+ *
+ * Unchanged either way: this surface still carries no unbacked partial-write
+ * guard (plan 07's P3 log records that gap), and that one is about a record's own
+ * shape rather than a backend version.
  */
 export async function handleUpdatePostArchetype(
 	request: Request,
@@ -95,39 +116,6 @@ export async function handleUpdatePostArchetype(
 	if (Object.keys(fields).length === 0 && Object.keys(wantedReferences).length === 0) {
 		return rejectMutation(ctx, actor, 400, 'empty patch', 'empty patch');
 	}
-	/**
-	 * A post archetype has NO child-list transport, and this is the refusal that
-	 * says so in the right currency.
-	 *
-	 * `recordBodySchema` accepts an array on an array-shaped field — it has to, for
-	 * the content-library path that routes them to the items endpoint — and
-	 * `toApexFields` passes it through. There is no such routing here, so the value
-	 * would reach `updatePostArchetype`, whose `assertNoArrayFields` THROWS: an
-	 * uncaught framework 500 where a caller deserves a typed 400. No post schema on
-	 * any site declares an array-shaped field today; the next one that does would
-	 * find this out in production.
-	 *
-	 * ── PROVISIONAL: A CAPABILITY GATE ON THE BACKEND BUILD ──────────────────
-	 * "A post archetype has no child-list transport" is a fact about the backend
-	 * TODAY, not a property of posts. A post's fields are written through the SAME
-	 * `archetype_models` controller plan 08 widens, so when that fix is DEPLOYED and
-	 * VERIFIED the lists ride the atomic PATCH here exactly as they will on a
-	 * content-library record, and this refusal comes out with the rest of the gate —
-	 * the one reviewed kit change plan 07's **P3b** node inventories. Until then it
-	 * stays: on the backend production runs the value is answered 200 and stored as
-	 * `[]`, with nothing in the response to see.
-	 *
-	 * Note what does NOT come out with it: this surface still carries no unbacked
-	 * partial-write guard (plan 07's P3 log records that gap), and that one is about
-	 * a record's own shape rather than a backend version.
-	 */
-	const childListsOnPost = childListFieldNames(contract, params.schema).filter(
-		(name) => fields[name] !== undefined
-	);
-	if (childListsOnPost.length > 0) {
-		return rejectMutation(ctx, actor, 400, 'child list on post', 'child list on post');
-	}
-
 	const view = await loadPostView(guard.apex, params.schema, idResult.data);
 	if (!view) return rejectMutation(ctx, actor, 404, 'not found', 'not found');
 	const ids = readPostIds(view);

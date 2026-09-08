@@ -13,6 +13,7 @@ import { cleanString, unwrapArchetypeRecord } from '../archetype-record';
 import { createdIdOutcome, judgeCreatedId, shapeFaultDetail } from './created-id';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import { toApexFields } from './update-record';
+import { primitiveFieldsShape } from './record-shape';
 import { buildPostLoad, postRouteMeta, postSchemaOf, rejectedWriteResponse } from './post-shape';
 import type { ContentContract } from '../content-contract';
 import type { BffContext } from '../context';
@@ -39,28 +40,15 @@ import type { BffContext } from '../context';
  * errors otherwise.
  */
 export function createPostBodySchema(contract: ContentContract, slug: string) {
-	const fieldsShape: Record<string, z.ZodTypeAny> = {};
-	for (const def of contract.primitiveFieldDefs(slug)) {
-		// AN ARRAY IS REFUSED HERE, in the currency a caller can act on.
-		//
-		// `z.unknown()` accepted one, `toApexFields` passed it through, and
-		// `createPost` → `assertNoArrayFields` then THREW — a framework 500 where a
-		// 400 belongs. There is no child-list transport for a post: an array-shaped
-		// field on a post schema is not writable at all, and saying so is better than
-		// crashing. No post schema on any site declares one today; the next one that
-		// does must not find out in production.
-		//
-		// PROVISIONAL — a capability gate on the backend build, not a rule about
-		// posts. A post's fields ride the SAME `archetype_models` controller plan 08
-		// fixes, so once that fix is DEPLOYED and VERIFIED an array on a post field
-		// is writable and this refine comes out with the rest of the gate, in the one
-		// reviewed kit change plan 07's **P3b** node inventories. Until then it stays:
-		// on the backend production runs the value is answered 200 and stored as `[]`.
-		fieldsShape[def.field_name] = z
-			.unknown()
-			.refine((value) => !Array.isArray(value), 'a post field does not hold a list')
-			.optional();
-	}
+	// THE SAME `fields` SHAPE A RECORD GETS, from the same builder, because a post's
+	// primitives are written through the same `archetype_models` controller
+	// (`createPost` POSTs to `archetype_schemas/:slug/archetype_models`). So the
+	// question "may this field carry an array" has one answer per field, not one per
+	// operation, and `primitiveFieldsShape` is where it is asked — for the array
+	// kinds the backend stores and, for everything else, the refusal that keeps an
+	// array off a field the flat surface would empty. Spelling it twice is how the
+	// two drift.
+	const fieldsShape = primitiveFieldsShape(contract, slug);
 	return z
 		.object({
 			title: z.string().min(1).max(300),

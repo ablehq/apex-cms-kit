@@ -8,15 +8,17 @@
 // record. GLC's `saveEntity` also reconciles a resource's tags, and its
 // `saveArticle` sequences three endpoints; neither applies here.
 //
-// IT IS NO LONGER ONE PATCH, and "a partially-saved record is not a state this
-// screen can reach" — which this comment used to claim — is no longer true. An
-// array-shaped field cannot ride the flat surface (it answers 200 and stores `[]`),
-// so the operation writes the scalars flat and then each list to its own
-// `archetype_item`. A failure after the flat write leaves the record MIXED, and the
-// operation says so: `child-list-write-failed` names the field that failed and the
-// lists that had already landed. `fieldsMessage` below is where that reaches a
-// human, and it is why the default "Nothing was changed" sentence is not safe to
-// use for every refusal.
+// IT IS ONE PATCH AGAIN. It briefly was not: an array-shaped field could not ride
+// the flat surface (it answered 200 and stored `[]`), so the operation wrote the
+// scalars flat and then each list to its own `archetype_item`, and a failure after
+// the flat write left the record MIXED — which is what `child-list-write-failed`
+// existed to say. `ellipsis-backend` PR #1888 (`fix/archetype-model-array-fields`)
+// makes `archetype_models` permit a list, so the whole record travels in one write
+// and that refusal is gone with the transport that produced it.
+//
+// `fieldsMessage` below still exists, because `unbacked-record` remains: its
+// default "Nothing was changed — Save again to retry" promises something that
+// refusal cannot deliver.
 //
 // The reference DIFF is not computed here. The browser sends the set the editor
 // selected and the BFF diffs it against a read taken in the same request
@@ -35,28 +37,18 @@ export const STALE_MESSAGE =
  * What the editor is told when the record write is refused.
  *
  * The default sentence promises TWO things — nothing changed, and a retry will
- * work — and the operation has two refusals for which each promise is FALSE.
- * Saying "nothing was changed" over a committed write is worse than saying
- * nothing: it tells someone to stop looking.
+ * work — and `unbacked-record` breaks the second one outright: the refusal is a
+ * property of the record, so "Save again" is a loop with no exit.
  *
- * The BFF client's `mutate` spreads the response body onto its result, so `code`,
- * `field`, `written` and `unbackedFields` are already here; this only has to read
- * them. Every site that uses this helper — Godrej renders it verbatim in
- * `RecordEditor.svelte` — inherits the wording from one place.
+ * The BFF client's `mutate` spreads the response body onto its result, so `code`
+ * and `unbackedFields` are already here; this only has to read them. Every site that
+ * uses this helper — Godrej renders it verbatim in `RecordEditor.svelte` — inherits
+ * the wording from one place.
  *
  * @param {number|undefined} status
- * @param {{code?: string, field?: string, written?: string[], unbackedFields?: string[]}} [result]
+ * @param {{code?: string, unbackedFields?: string[]}} [result]
  */
 function fieldsMessage(status, result = {}) {
-	if (result.code === 'child-list-write-failed') {
-		// The flat write IS committed and the lists in `written` ARE saved; only the
-		// named list failed. A retry is right — every leg re-sends the whole desired
-		// array, so it converges — but "nothing was changed" is simply untrue.
-		return (
-			`The list “${result.field ?? 'unknown'}” could not be saved. The rest of the ` +
-			'record was saved. An item in it may have been deleted — remove it and Save again.'
-		);
-	}
 	if (result.code === 'unbacked-record') {
 		// Retrying can NEVER work: the refusal is a property of the record, not of
 		// this request. Telling someone to Save again would loop them forever.

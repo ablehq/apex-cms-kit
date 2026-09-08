@@ -15,7 +15,6 @@ import {
 	referenceFieldNames,
 	summarizeRecord
 } from './record-shape';
-import { splitChildListFields, writeChildLists } from './child-list';
 import { recordIdSchema } from './get-record';
 import { sanitizeFieldValue } from '../../../sanitize/write-boundary';
 import { ApexTransportError } from '../apex-admin-client';
@@ -52,16 +51,24 @@ import type { BffContext } from '../context';
  * there is nothing left to overwrite with and the deleted text is what the public
  * page renders, indefinitely, while the admin shows the field as empty.
  *
- * ── TWO THINGS THIS OPERATION DOES THAT NOTHING ABOUT A PATCH SUGGESTS ────────
+ * ── THE ONE THING THIS OPERATION DOES THAT NOTHING ABOUT A PATCH SUGGESTS ─────
+ * IT REFUSES A PARTIAL WRITE TO AN UNBACKED RECORD. See THE PARTIAL-WRITE GUARD
+ * below; the short version is that on such a record a partial write silently
+ * deletes every field it does not carry.
  *
- * 1. IT REFUSES A PARTIAL WRITE TO AN UNBACKED RECORD. See THE PARTIAL-WRITE GUARD
- *    below; the short version is that on such a record a partial write silently
- *    deletes every field it does not carry.
+ * ── IT IS ONE APEX WRITE AGAIN ────────────────────────────────────────────────
+ * It used to be several. An array-shaped field could not ride the flat surface —
+ * it answered 200 and stored `[]` — so the lists were split out and each written to
+ * its own `archetype_item`, which made a save non-atomic, made "half of it landed"
+ * a state the editor had to be told about, and needed the pre-read for its item
+ * ids. `ellipsis-backend` PR #1888 (`fix/archetype-model-array-fields`) makes
+ * `archetype_models` permit a list-shaped value, so every field — lists included —
+ * travels in the single PATCH below, and the split, its partial-failure reporting
+ * and the `child-list-write-failed` response are gone.
  *
- * 2. IT SENDS ARRAY-SHAPED FIELDS SOMEWHERE ELSE. A child list on the flat surface
- *    is stored as `[]`, with a 200. They go to the items endpoint instead — see
- *    `child-list.ts` — which means one write can be several Apex requests and can
- *    fail after the first has landed. That is reported rather than hidden.
+ * The permit is NARROW, and `recordBodySchema` is where that is enforced: only a
+ * single-field Primitive of an array kind may carry an array. Everything else still
+ * has its array reduced to `[]` upstream, so it is refused before the write.
  */
 export async function handleUpdateRecord(
 	request: Request,
@@ -137,9 +144,10 @@ export async function handleUpdateRecord(
 	}
 
 	/**
-	 * THE PRE-WRITE READ, taken once and used for three things: the partial-write
-	 * guard, the reference diff, and the `archetype_item` ids a child list is
-	 * written through.
+	 * THE PRE-WRITE READ, taken once and used for two things: the partial-write
+	 * guard and the reference diff. (It had a third job — supplying the
+	 * `archetype_item` ids a child list was written through — until the lists joined
+	 * the flat PATCH.)
 	 *
 	 * Taken whenever anything but `position` is being written. A `position`-only
 	 * patch skips it deliberately and is safe to skip: `position` is a column on the
@@ -273,71 +281,45 @@ export async function handleUpdateRecord(
 	}
 
 	/**
-	 * The two payloads. `flat` is everything `archetype_models` can hold; the child
-	 * lists leave that surface entirely, because it answers 200 and stores `[]`.
+	 * ONE PAYLOAD, ONE WRITE. Array-shaped fields are in `fields` with everything
+	 * else — `recordBodySchema` has already refused an array on any field the flat
+	 * surface would empty, so what is left is exactly what `archetype_models`
+	 * permits.
 	 *
-	 * Split AFTER `toApexFields`, so the sanitiser stays the single funnel every
-	 * content-library write passes through — child values included.
-	 */
-	const { flat, childLists } = splitChildListFields(contract, params.schema, fields);
-
-	/**
-	 * The invariant the child-list write rests on, asserted rather than assumed: a
-	 * child list is a FIELD, every field write takes the pre-read, so `current` is
-	 * non-null whenever there is a list to write. Written as `&& current` in the
-	 * expression below it would be a SILENT SKIP — the lists quietly unwritten and
-	 * the save reported as clean, which is the exact class of failure this whole
-	 * phase is about. So it refuses instead, before anything is written.
-	 */
-	if (childLists.length > 0 && !current) return bffError(502, 'unexpected upstream shape');
-
-	/**
-	 * THE FLAT WRITE FIRST, and the order is deliberate.
+	 * IS THERE ANYTHING LEFT TO SEND? — and this test is not redundant with the
+	 * "empty patch" refusal above it. That one asks what the CALLER sent; this one
+	 * asks what SURVIVED the reference diff. A save that changes only a `has_many`
+	 * selection and then turns out to select exactly what is already stored leaves
+	 * `references` empty, and without this it would send Apex a PATCH with no keys —
+	 * a round trip that can only fail, on a record nothing asked to change.
 	 *
-	 * Neither ordering is atomic — Apex has no transaction across these endpoints —
-	 * so the question is which failure leaves less behind. The flat PATCH is
-	 * validated against the WHOLE record and refuses with a 4xx having written
-	 * nothing, so putting it first means an ordinary validation refusal costs no
-	 * child-list write at all. Going the other way round would have the common
-	 * refusal arrive after the lists had already changed.
-	 */
-	/**
-	 * BOTH WRITES ARE WRAPPED, and the reason is the second one.
-	 *
-	 * `call` in the Apex client RETHROWS a network fault unless the caller passed an
-	 * abort signal, and the admin path passes none. So a connection reset on the
-	 * second of three lists would escape this operation as a framework 500 — after
-	 * the flat write and the first list had already committed — with NO audit row
-	 * for any of it. The one record of a half-applied save would be missing exactly
-	 * when it is most needed.
-	 *
-	 * A TRANSPORT fault is therefore turned into the same typed failure an HTTP one
-	 * produces, so the audit below runs either way. The error itself is never
-	 * forwarded: it can carry a URL and upstream detail, and this response is read
-	 * by a browser.
+	 * THE WRITE IS WRAPPED because `call` in the Apex client RETHROWS a network fault
+	 * unless the caller passed an abort signal, and the admin path passes none. So a
+	 * connection reset would escape this operation as a framework 500 with NO audit
+	 * row. A TRANSPORT fault is turned into the same typed failure an HTTP one
+	 * produces, so the audit below runs either way; the error itself is never
+	 * forwarded, because it can carry a URL and upstream detail and this response is
+	 * read by a browser.
 	 *
 	 * ONLY a transport fault. `catch {}` on its own relabels every throw this client
-	 * can make — the schema allowlist, `assertUuid`, `assertNoArrayFields` — as
-	 * "Apex never answered", which is false and lands in the audit row as fact. Those
-	 * are bugs in a caller, not upstream failures: nothing has been written when one
-	 * fires, so the row is written (best-effort, since nothing depends on it) saying
-	 * `thrown` and the error is RE-RAISED with its real reason intact rather than
-	 * flattened into a 502 about a request that was never made.
+	 * can make — the schema allowlist, `assertUuid` — as "Apex never answered", which
+	 * is false and lands in the audit row as fact. Those are bugs in a caller, not
+	 * upstream failures: nothing has been written when one fires, so the row is
+	 * written (best-effort, since nothing depends on it) saying `thrown` and the
+	 * error is RE-RAISED with its real reason intact rather than flattened into a 502
+	 * about a request that was never made.
 	 */
-	const flatHasWork =
-		Object.keys(flat).length > 0 || Object.keys(references).length > 0 || position !== undefined;
+	const patchHasWork =
+		Object.keys(fields).length > 0 || Object.keys(references).length > 0 || position !== undefined;
 	let apexResponse: ApexResponse;
-	if (!flatHasWork) {
-		// A LIST-ONLY save has nothing for the flat surface, and sending it an empty
-		// body is a round trip that can only fail. Treated as an accepted no-op so the
-		// child-list writes below run exactly as they would after a real flat write.
+	if (!patchHasWork) {
 		apexResponse = { status: 200, ok: true, body: null };
 	} else {
 		try {
 			apexResponse = await guard.apex.updateContentLibraryRecord(
 				params.schema,
 				idResult.data,
-				flat,
+				fields,
 				references,
 				position
 			);
@@ -346,9 +328,9 @@ export async function handleUpdateRecord(
 				try {
 					await auditOutcome(ctx, meta, guard.actor, {
 						// NOT `apex_error`. Apex was never asked: the client threw on the way
-						// in — an array on a flat field, a malformed id — so the bucket that
-						// says "upstream failed" would be a lie in the one table that has to
-						// stay honest about who broke what. `thrown: true` still marks it as
+						// in — a malformed id, a schema outside the allowlist — so the bucket
+						// that says "upstream failed" would be a lie in the one table that has
+						// to stay honest about who broke what. `thrown: true` still marks it as
 						// a throw rather than a validated refusal.
 						outcome: 'rejected',
 						detail: {
@@ -368,44 +350,12 @@ export async function handleUpdateRecord(
 		}
 	}
 
-	/**
-	 * The child lists, once the flat write has been accepted. `writeChildLists`
-	 * catches a thrown transport fault itself — it is the frame that knows which
-	 * list was in flight — so nothing escapes past here unaudited.
-	 */
-	const childResult =
-		apexResponse.ok && childLists.length > 0
-			? await writeChildLists(guard.apex, params.schema, idResult.data, current!, childLists)
-			: null;
-
 	await auditOutcome(ctx, meta, guard.actor, {
-		outcome: apexResponse.ok && childResult?.ok !== false ? 'accepted' : 'apex_error',
+		outcome: apexResponse.ok ? 'accepted' : 'apex_error',
 		detail: {
 			schema: params.schema,
 			recordId: idResult.data,
 			fields: Object.keys(fields),
-			// Which lists travelled on the OTHER surface, and how far they got. A
-			// child-list write can fail after the flat write landed, and an audit row
-			// that did not say so would read as a clean save.
-			...(childLists.length === 0
-				? {}
-				: {
-						childLists: childLists.map((entry) => entry.field),
-						childListsWritten: childResult?.written ?? [],
-						...(childResult && !childResult.ok
-							? {
-									childListFailedOn: childResult.field,
-									childListStatus: childResult.status,
-									// `status: 0` on its own reads as "Apex never answered". It is
-									// only true for `'network'`; `'thrown'` means this client
-									// refused the call and Apex was never asked. Recorded apart so
-									// the one row describing a half-applied save says which.
-									...(childResult.fault
-										? { childListFault: childResult.fault, childListReason: childResult.reason }
-										: {})
-								}
-							: {})
-					}),
 			// A reorder changes what a visitor sees and touches no field, so without
 			// this an audit row for one would be indistinguishable from a no-op.
 			...(position === undefined ? {} : { position }),
@@ -427,44 +377,6 @@ export async function handleUpdateRecord(
 		const status =
 			apexResponse.status >= 400 && apexResponse.status < 500 ? apexResponse.status : 502;
 		return noStoreJson({ error: 'upstream error', status: apexResponse.status }, status);
-	}
-
-	if (childResult && !childResult.ok) {
-		/**
-		 * A CHILD-LIST FAILURE IS NOT "upstream error", and flattening it to one is
-		 * what hides the commonest cause.
-		 *
-		 * The items endpoint's UPDATE leg answers a bare **500**, with no body, when
-		 * a list names an id that is not an entity of the field's type — because
-		 * `ArchetypeItemDataModel#validate_update_for_primitive_schema_item` merges
-		 * the property-set errors on SUCCESS instead of on failure, so a rejected
-		 * value falls through to `property_set_attributes` returning nil and raising.
-		 * The CREATE leg validates correctly and answers a 422 naming the field. So
-		 * "forward 4xx, flatten 5xx" turns the single most likely editor mistake —
-		 * a child that has since been deleted — into "the server is broken".
-		 *
-		 * What travels back instead: the CODE, the FIELD, the upstream status, and
-		 * which lists had already landed, because the flat write is committed by now
-		 * and there is no way to take it back. The screen phrases it; the kit's job
-		 * is to make the fact expressible (kit boundary, §5).
-		 */
-		// The audit row is already written above — it carries `childListFailedOn`,
-		// `childListStatus` and `childListsWritten` and its outcome is `apex_error`.
-		// A second row here would double-count one failed save.
-		return noStoreJson(
-			{
-				error: 'child-list-write-failed',
-				code: 'child-list-write-failed',
-				field: childResult.field,
-				// NOT `status`. `bff-client.js`'s `mutate` writes the HTTP status onto
-				// its result and then spreads the body over it, so a body key called
-				// `status` REPLACES the real one — a 502 silently reported as the 500
-				// that caused it. `0` here means "no answer at all" (a transport fault).
-				upstreamStatus: childResult.status,
-				written: childResult.written
-			},
-			childResult.status >= 400 && childResult.status < 500 ? childResult.status : 502
-		);
 	}
 
 	// Proved by an independent re-read rather than by the PATCH echo — two Apex

@@ -57,10 +57,9 @@ export interface ApexAdminClientOptions {
  *
  * It exists so a CALLER can tell that apart from every other throw this client can
  * make, and the distinction is not cosmetic. `contentLibrarySlug`, `postSlug` and
- * `assertUuid` all throw too, as does `assertNoArrayFields`; an operation that wraps
- * a client call in `try/catch` and records "Apex never answered" for every one of
- * them writes a fiction into the audit row that is the only record of a
- * half-applied save. The runtime's own error is kept as `cause`.
+ * `assertUuid` all throw too; an operation that wraps a client call in `try/catch`
+ * and records "Apex never answered" for every one of them writes a fiction into the
+ * audit row. The runtime's own error is kept as `cause`.
  *
  * Only the signal-less path throws this: a call carrying an abort signal gets the
  * typed `{status: 0, networkError: true}` response instead (see `call`).
@@ -203,70 +202,6 @@ export interface GalleryItemFields {
 }
 
 /**
- * REFUSE an array value on the flat `archetype_models` surface. Outright, in the
- * client, not in a screen.
- *
- * `PATCH /archetype_schemas/:slug/archetype_models/:id` with `{field: [id, id]}`
- * answers **200** and stores **`[]`** — measured 2026-09-07 and re-measured on
- * `origin/master`. It also MINTS the item row holding that `[]`, so the loss is
- * durable and the read-back looks like an empty list the editor cleared.
- *
- * The cause is `archetype_models_controller.rb`'s `schema_item_field_names`
- * (`:300-318`): every non-`rich_text` field is mapped to a SCALAR permit symbol, so
- * an array reaches strong parameters as `permit(:field, {field: [...item keys...]})`
- * and Rails drops it. `entity_models_controller.rb:197-222` classifies `array_ref/`
- * as `permit_kind: :array` and emits `{key => []}`; the archetype controller does
- * not. That one missing line is the upstream ask.
- *
- * A caller CANNOT detect this: 200, no error, no warning, and the value it re-reads
- * is a legal empty list. So the refusal has to be here — the surface's own client —
- * or the path stays open for the next caller. Array-shaped fields go through
- * `createArchetypeItem` / `updateArchetypeItem` instead.
- *
- * ── PROVISIONAL, NOT PERMANENT ───────────────────────────────────────────────
- * This is a CAPABILITY GATE on the backend build, and it comes OUT at plan 08's
- * transition — in the same reviewed kit change that stops splitting lists out of
- * the flat payload, because once `archetype_models` permits list-shaped fields the
- * lists ride the atomic PATCH with everything else and a refusal here would block
- * the very write that replaces this one. Until that fix is DEPLOYED and VERIFIED
- * (not merely merged), it stays on: production still destroys the list silently.
- *
- * Do not confuse it with the partial-write guard in `handleUpdateRecord`, which is
- * permanent — that one is about a record's own shape, not about a backend version.
- *
- * Keyed on the VALUE being an array rather than on the validator kind, because
- * `text_array` and `number_array` are emptied identically and this file has no
- * contract to read kinds from. Reference values are arrays too — they are a
- * separate parameter and never travel through here.
- */
-function assertNoArrayFields(fields: ContentLibraryFields): void {
-	for (const [name, value] of Object.entries(fields)) {
-		if (Array.isArray(value)) {
-			throw new Error(
-				`refusing an array on the flat archetype_models surface: ${name} — ` +
-					'it answers 200 and stores []; use the schema_item items endpoint'
-			);
-		}
-	}
-}
-
-/**
- * A schema-item slug, checked before it is interpolated into an items-endpoint URL.
- * `encodeURIComponent` already makes a separator unspellable; this refuses the
- * whole shape so a caller cannot address an item route with something that is not
- * a field name at all.
- */
-export function assertSchemaItemSlug(name: string): void {
-	// NO `i` FLAG. Under `iu`, unicode case folding puts U+212A (KELVIN SIGN) and
-	// U+017F (LATIN SMALL LETTER LONG S) inside `[a-z]`, so two characters that are
-	// not ASCII at all satisfied a check whose whole job is "ASCII slug alphabet".
-	// Harmless in practice — the value is `encodeURIComponent`'d into one path
-	// segment and Apex 404s it — but a shape check that accepts what it says it
-	// refuses is the wrong thing to leave behind (P4 review, finding 4).
-	if (!/^[a-z0-9_-]{1,128}$/u.test(name)) throw new Error('invalid schema item slug');
-}
-
-/**
  * An entity TYPE, which Apex addresses by uuid OR by slug.
  *
  * `content_library/entities_controller.rb:10-11` resolves `:entity_type_id` with
@@ -283,8 +218,13 @@ export function assertSchemaItemSlug(name: string): void {
 /**
  * THE one entity-type-ref shape, exported so the ROUTES parse with it too.
  *
- * NO `i` FLAG, for the reason on `assertSchemaItemSlug`. Both a slug and a uuid are
- * lower case everywhere Apex mints them, so nothing legitimate needed it.
+ * NO `i` FLAG, and the reason is not style. Under `iu`, unicode case folding puts
+ * U+212A (KELVIN SIGN) and U+017F (LATIN SMALL LETTER LONG S) inside `[a-z]`, so two
+ * characters that are not ASCII at all satisfy a check whose whole job is "ASCII slug
+ * alphabet". Both a slug and a uuid are lower case everywhere Apex mints them, so
+ * nothing legitimate needed the flag, and a shape check that accepts what it says it
+ * refuses is the wrong thing to leave behind (P4 review, finding 4 — recorded on
+ * `assertSchemaItemSlug` until the items endpoint it guarded was deleted).
  *
  * It is exported because the two operations that take an entity type had SPELLED
  * THEIR OWN, with the `i` — so `entity_types/K` (KELVIN SIGN, which unicode case
@@ -445,8 +385,13 @@ export interface ApexAdminClient {
 	 * partial field write to one whose `primitives` no `archetype_item` accounts for,
 	 * because on such a record the upstream rebuild deletes every unsent field. A
 	 * caller that reaches this method directly — GLC's `handleUpdateAuthor`,
-	 * `handleUpdateResource` and `handlePutIngestResource` all do — gets the ARRAY
-	 * refusal (`assertNoArrayFields`) but not that one.
+	 * `handleUpdateResource` and `handlePutIngestResource` all do — does not get it.
+	 * Nor does such a caller get the KIND-AWARE ARRAY REFUSAL, which lives in
+	 * `recordBodySchema` and needs a contract this method has no access to: the flat
+	 * surface stores a list only for a single-field Primitive of an array kind and
+	 * reduces every other array to `[]`. The three GLC operations above send
+	 * `z.string()` bodies and cannot express an array at all, so nothing reaches this
+	 * method that the refusal would have caught.
 	 *
 	 * DELIBERATE, and now RULED rather than asserted: plan 07's **P3b** node, "GLC
 	 * exemption, ruled 2026-09-07". The bypass stands because GLC's records are
@@ -475,60 +420,6 @@ export interface ApexAdminClient {
 		position?: number | null
 	): Promise<ApexResponse>;
 	deleteContentLibraryRecord(slug: string, id: string): Promise<ApexResponse>;
-	/**
-	 * Create the ONE `archetype_item` row that holds an array-shaped field's whole
-	 * list. See `updateArchetypeItem` for the endpoint and why there is one row per
-	 * LIST rather than one per child. POST only when the record carries no row for
-	 * the field: a second POST for the same field answers 422.
-	 */
-	createArchetypeItem(
-		slug: string,
-		archetypeId: string,
-		fieldName: string,
-		fieldsData: Record<string, unknown>,
-		position?: number
-	): Promise<ApexResponse>;
-	/**
-	 * Rewrite that row.
-	 *
-	 * `PATCH /specification/archetypes/:archetypeId/schema_item/:slug/items/:itemId`,
-	 * body `{fields_data: {<field>: [...]}}`. This is the ONLY surface that persists
-	 * an array on a record. The flat `archetype_models` PATCH answers 200 and stores
-	 * `[]` — see `assertNoArrayFields`.
-	 *
-	 * `slug` is the ARCHETYPE SCHEMA slug and does NOT appear in the URL; it is here
-	 * so the allowlist still applies. The route is addressed by archetype id, so
-	 * without it a content-library client could write items on a post archetype.
-	 *
-	 * MEASURED, 2026-09-07, local Apex, re-read raw after each call:
-	 *   - PATCH with `[a, b]` → 200, `primitives.<field>` reads back `[a, b]` in
-	 *     order, and every sibling field is untouched;
-	 *   - PATCH with a SHORTER array removes — child order is the array index, not a
-	 *     column, so a reorder is simply re-sending the array;
-	 *   - PATCH naming an id that is not an entity of the field's type answers
-	 *     **500**, not 422, because `ArchetypeItemDataModel#validate_update_for_primitive_schema_item`
-	 *     merges the property-set errors on SUCCESS instead of on failure, so a
-	 *     failed validation falls through to `property_set_attributes` returning nil.
-	 *     The CREATE leg validates correctly and answers a 422 naming the field. That
-	 *     asymmetry is why `handleUpdateRecord` reports a child-list failure under its
-	 *     own code instead of flattening it to "upstream error".
-	 */
-	updateArchetypeItem(
-		slug: string,
-		archetypeId: string,
-		fieldName: string,
-		itemId: string,
-		fieldsData: Record<string, unknown>,
-		position?: number
-	): Promise<ApexResponse>;
-	//
-	// There is deliberately NO `deleteArchetypeItem`, although the route exists.
-	// Destroying a Primitive item is the §3.8.1 wipe by hand: `after_destroy_commit`
-	// rebuilds `primitives` from the SURVIVING items, so the field's stored value is
-	// gone and cannot be recovered from the record. Emptying a list is a PATCH with
-	// `[]`, which keeps the row; nothing this kit does needs the row destroyed, and
-	// an unused method here would be a loaded gun with no test behind it.
-	//
 	getDocument(documentId: string): Promise<ApexResponse>;
 	updateDocumentBlocks(documentId: string, blocks: unknown[]): Promise<ApexResponse>;
 	changePostStatus(postId: string, statusEvent: PostStatusEvent): Promise<ApexResponse>;
@@ -947,7 +838,6 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			);
 		},
 		async createContentLibraryRecord(slug, fields, references = {}) {
-			assertNoArrayFields(fields);
 			return call(`${ARCHETYPE_SCHEMAS_BASE}/${contentLibrarySlug(slug)}/archetype_models`, {
 				method: 'POST',
 				body: JSON.stringify({ ...fields, ...references })
@@ -955,7 +845,6 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 		},
 		async updateContentLibraryRecord(slug, id, fields, references = {}, position) {
 			assertUuid(id);
-			assertNoArrayFields(fields);
 			// FLAT keys on `archetype_models` — the one write of the five that persists
 			// (probes W1–W5). The other four are documented on `updateSermonTranscript`
 			// above; two of them answer 200 and drop the payload on the floor.
@@ -971,43 +860,6 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 					body: JSON.stringify({
 						...fields,
 						...references,
-						...(position === undefined ? {} : { position })
-					})
-				}
-			);
-		},
-		async createArchetypeItem(slug, archetypeId, fieldName, fieldsData, position) {
-			// The allowlist, on a route that does NOT carry the schema slug — see the
-			// interface. Discarding the return is the point: only the refusal is wanted.
-			contentLibrarySlug(slug);
-			assertUuid(archetypeId);
-			assertSchemaItemSlug(fieldName);
-			return call(
-				`${ARCHETYPES_BASE}/${encodeURIComponent(archetypeId)}/schema_item/${encodeURIComponent(fieldName)}/items`,
-				{
-					method: 'POST',
-					body: JSON.stringify({
-						fields_data: fieldsData,
-						...(position === undefined ? {} : { position })
-					})
-				}
-			);
-		},
-		async updateArchetypeItem(slug, archetypeId, fieldName, itemId, fieldsData, position) {
-			contentLibrarySlug(slug);
-			assertUuid(archetypeId);
-			assertUuid(itemId);
-			assertSchemaItemSlug(fieldName);
-			// `fields_data` MUST be non-empty on this leg. The controller branches on
-			// `permitted_params[:fields_data].blank?` and, when it is blank, updates the
-			// item's own columns (`position`) instead — so an empty map here would be a
-			// silent no-op on the list rather than an error.
-			return call(
-				`${ARCHETYPES_BASE}/${encodeURIComponent(archetypeId)}/schema_item/${encodeURIComponent(fieldName)}/items/${encodeURIComponent(itemId)}`,
-				{
-					method: 'PATCH',
-					body: JSON.stringify({
-						fields_data: fieldsData,
 						...(position === undefined ? {} : { position })
 					})
 				}
@@ -1099,9 +951,6 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			);
 		},
 		async createPost(slug, targetModelAttributes, fields = {}, references = {}) {
-			// The SAME flat surface, so the same refusal: a post archetype's primitive
-			// that happened to be array-shaped would be silently stored as `[]`.
-			assertNoArrayFields(fields);
 			return call(`${ARCHETYPE_SCHEMAS_BASE}/${postSlug(slug)}/archetype_models`, {
 				method: 'POST',
 				body: JSON.stringify({
@@ -1113,7 +962,6 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 		},
 		async updatePostArchetype(slug, archetypeId, fields, references = {}) {
 			assertUuid(archetypeId);
-			assertNoArrayFields(fields);
 			// FLAT keys on `archetype_models` — the one write that persists (the same
 			// pairing `updateContentLibraryRecord` documents). A has_one is a bare id
 			// or `null`; a has_many is the all-hash diff on `HasManyEntry`.
