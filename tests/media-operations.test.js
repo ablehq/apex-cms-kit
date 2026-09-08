@@ -187,9 +187,79 @@ describe('sign — it creates nothing, and that is the guarantee', () => {
 		// The old design answered a `galleryItemId` here. Nothing is created now, so
 		// there is none — and a caller that still reads one gets `undefined`, loudly.
 		assert.equal(body.galleryItemId, undefined);
+		// `readCmsConfig` FIRST: the destination is resolved before the bytes are
+		// invited. It is a read; nothing is created on this leg either way.
 		assert.deepEqual(
 			calls.map((c) => c[0]),
-			['createSignedUploadUrl']
+			['readCmsConfig', 'createSignedUploadUrl']
+		);
+	});
+
+	/**
+	 * NO DESTINATION, NO SIGNED URL — the refusal that used to arrive a whole upload
+	 * too late.
+	 *
+	 * `readGalleryId` ran only in finalize, so an account without the gallery (or one
+	 * whose `cms_config` would not read) got a signed URL, an unattached
+	 * ActiveStorage blob and a complete upload of the file, and the FIRST thing that
+	 * failed was the finalize after all of it (codex's P5 fix review, 2026-09-08).
+	 *
+	 * MUTATION: move the `readGalleryId` refusal back below `createSignedUploadUrl`.
+	 * Both cases still answer 502 — which is exactly why neither asserts on the
+	 * status alone; both fail on `calls`, because the signed URL was minted first.
+	 */
+	it('refuses BEFORE signing when the account has no such gallery', async () => {
+		// `cms_config` reads, and names no gallery by this name. The assertion is on
+		// `calls`, not on the status: a 502 that arrives AFTER the signed URL has been
+		// handed out is the defect, and it answers 502 too.
+		const calls = [];
+		const emptyConfig = {
+			async readCmsConfig() {
+				calls.push(['readCmsConfig']);
+				return { ok: true, status: 200, body: { data: { asset_library: [] } } };
+			},
+			async createSignedUploadUrl() {
+				calls.push(['createSignedUploadUrl']);
+				return {
+					ok: true,
+					status: 200,
+					body: { data: { url: 'https://storage.test/put/abc', signed_id: 'signed-abc' } }
+				};
+			}
+		};
+		const db = await createMigratedDatabase();
+		const ctx = { ...ctxWith([], undefined, db), createApexClient: () => emptyConfig };
+		const response = await handleSignMediaUpload(
+			req(await signIn(ctx), '/api/admin/media/uploads', { gallery: 'images', file: goodFile }),
+			ctx
+		);
+		assert.equal(response.status, 502);
+		assert.match((await response.json()).error, /no “images” library/u);
+		assert.deepEqual(
+			calls.map((c) => c[0]),
+			['readCmsConfig'],
+			'no signed URL was minted, so no bytes were ever invited'
+		);
+		// And no claim was written, so nothing can be finalized against this attempt.
+		assert.equal(
+			db.sqlite.prepare('SELECT COUNT(*) AS n FROM bff_media_upload_claim').get().n,
+			0,
+			'a refused sign mints no claim'
+		);
+		db.close();
+	});
+
+	it('refuses BEFORE signing when `cms_config` will not read', async () => {
+		const calls = [];
+		const { response } = await sign(
+			{ gallery: 'images', file: goodFile },
+			{ calls, fail: { cmsConfig: true } }
+		);
+		assert.equal(response.status, 502);
+		assert.deepEqual(
+			calls.map((c) => c[0]),
+			['readCmsConfig'],
+			'the signing leg was never reached'
 		);
 	});
 

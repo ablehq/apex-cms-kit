@@ -245,6 +245,42 @@ export async function handleSignMediaUpload(request: Request, ctx: BffContext): 
 		return noStoreJson({ error: 'Uploads are not available on this deployment.' }, 500);
 	}
 
+	/**
+	 * THE DESTINATION IS RESOLVED BEFORE THE BYTES ARE INVITED, not after they land.
+	 *
+	 * `readGalleryId` used to run only in FINALIZE. So an account with no such
+	 * gallery — or one whose `cms_config` could not be read — got a signed URL, an
+	 * ActiveStorage blob with nothing attached to it, and a full upload of the file
+	 * over the wire, and the first thing that failed was the finalize AFTER all of
+	 * that. On a 25 MB video that is a minute of an editor's time spent to be told
+	 * there was never anywhere to put it, and an unattached blob left in storage
+	 * that nothing here can name or sweep (codex's P5 fix review, 2026-09-08).
+	 *
+	 * One extra read per sign, on a leg that already makes an Apex call. The picker's
+	 * `uploadEnabled` is the same fact learned in the browser; this is the one that
+	 * holds, and the browser check may be `null` — "not asked" — on any site.
+	 */
+	const destination = await readGalleryId(guard.apex, parsed.data.gallery).catch(() => null);
+	if (!destination) {
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: {
+				gallery: parsed.data.gallery,
+				filename: parsed.data.file.filename,
+				reason: 'no-such-gallery-on-this-account'
+			}
+		});
+		// A 502, not a 400: the request is well-formed and the fault is this account's
+		// configuration or an unreadable `cms_config` — the same reasoning finalize
+		// already applied to the same read.
+		return noStoreJson(
+			{
+				error: `There is no “${parsed.data.gallery}” library on this workspace to upload to.`
+			},
+			502
+		);
+	}
+
 	const signed = await guard.apex.createSignedUploadUrl(parsed.data.file).catch(() => null);
 	if (signed === null) {
 		// A rethrown transport fault. Nothing upstream was created that could need

@@ -16,8 +16,12 @@
 
 	`uploadEnabled` is how a caller that DID look says what it found, without the id
 	coming back into the browser. Three states, and the default is the permissive one,
-	because the bug above was caused by treating "I have not asked" as "it is absent".
-	Poovayya's record editor is the only caller that passes it today.
+	because the bug above was caused by treating "I have NOT ASKED" as "it is absent".
+	What it does NOT excuse is treating "I asked and got no answer" as "I have not
+	asked": those are different facts, and only the first is a reason to offer an
+	upload on trust (codex's P5 fix review, 2026-09-08). So `null` is for a caller
+	that never probes — GLC's page editor — and a caller that ATTEMPTED the read says
+	`false` on either outcome it got, with a reason that names which.
 
 	── NOT IMAGE-ONLY ANY MORE ───────────────────────────────────────────────────
 	`accept`, `hasAlt` and the labels come from the gallery's entry in
@@ -45,17 +49,21 @@
 	/**
 	 * Whether this ACCOUNT actually has the gallery, when the caller has read it.
 	 *
-	 *   `null` (default) — NOT KNOWN. Upload is offered. This is the state every site
-	 *     that does not list its gallery is in, and it must stay permissive: see the
-	 *     docblock above, where requiring evidence is the bug GLC shipped.
-	 *   `true`  — the site listed the gallery and it is there.
-	 *   `false` — the site listed the gallery and it is NOT there. Upload is refused
-	 *     HERE, with a reason, rather than accepted and failed at finalize after the
-	 *     bytes have already been pushed to storage.
+	 *   `null` (default) — NEVER ASKED. Upload is offered. This is the state of a
+	 *     caller that does not list its gallery at all, and it must stay permissive:
+	 *     see the docblock above, where requiring evidence is the bug GLC shipped.
+	 *   `true`  — the caller listed the gallery and it is there.
+	 *   `false` — the caller ASKED and cannot say there is a destination: the gallery
+	 *     is not on this account, or the read itself failed. Upload is refused HERE,
+	 *     with a reason, rather than accepted and failed after the bytes have already
+	 *     been pushed to storage.
 	 *
-	 * A failed READ is `null`, not `false`: "I could not ask" is not "it is absent",
-	 * and an upload resolves its own destination server-side from the gallery NAME
-	 * without needing this list at all.
+	 * A FAILED READ IS `false`, not `null`, and this is the half that was wrong. "I
+	 * could not ask" is indeed not "it is absent" — but it is not "I have not asked"
+	 * either, and mapping it to the permissive state made an attempted probe
+	 * indistinguishable from no probe. `uploadDisabledReason` is what carries the
+	 * difference to the editor, and a transient read failure says so and asks for a
+	 * reload rather than claiming the library does not exist.
 	 * @type {boolean | null}
 	 */
 	export let uploadEnabled = null;
