@@ -91,8 +91,27 @@
 	 * @param {string} name
 	 * @returns {unknown}
 	 */
-	function valueOf(name) {
-		return fieldsData ? fieldsData[name] : undefined;
+	/**
+	 * ONE FIELD'S CURRENT VALUE — and it takes the BAG AS AN ARGUMENT, deliberately.
+	 *
+	 * It used to close over `fieldsData` and take only the name. Svelte's legacy
+	 * compiler works out a template expression's dependencies from the identifiers IN
+	 * THE EXPRESSION, so `{valueOf(def.field_name)}` depended on `def` and on nothing
+	 * else: a `fieldsData` that CHANGED never re-rendered anything here. The typed-in
+	 * case hid it — the DOM already holds what was typed — but the case where the
+	 * value changes from OUTSIDE the control did not:
+	 *
+	 *   MEASURED IN REAL CHROME (Fable FF2, 2026-09-08): pick an image in the media
+	 *   dialog and the frame still reads "No image yet" until the page is reloaded,
+	 *   while Save persists the id perfectly. It looks like the picker did nothing.
+	 *
+	 * Passing `fieldsData` at every call site puts it in the expression, which is what
+	 * makes the template depend on it. Same for `mediaIdOf`.
+	 * @param {Record<string, unknown>} data
+	 * @param {string} name
+	 */
+	function valueOf(data, name) {
+		return data ? data[name] : undefined;
 	}
 
 	/**
@@ -100,11 +119,12 @@
 	 * in the draft as the delete marker until the save round-trips, and that marker
 	 * is a protocol token, not an id — so the frame reads it as empty and offers
 	 * Upload again rather than printing `__delete__` where the filename goes.
+	 * @param {Record<string, unknown>} data
 	 * @param {string} name
 	 * @returns {string}
 	 */
-	function mediaIdOf(name) {
-		const value = valueOf(name);
+	function mediaIdOf(data, name) {
+		const value = valueOf(data, name);
 		return typeof value === 'string' && value !== DELETE_MARKER ? value : '';
 	}
 
@@ -145,7 +165,7 @@
 					<label class="bool">
 						<input
 							type="checkbox"
-							checked={Boolean(valueOf(def.field_name))}
+							checked={Boolean(valueOf(fieldsData, def.field_name))}
 							on:change={(event) => onChange(def.field_name, event.currentTarget.checked)}
 						/>
 						{def.display_name}
@@ -157,7 +177,7 @@
 						<select
 							class="inp"
 							aria-labelledby="lbl-{def.field_name}"
-							value={valueOf(def.field_name) ?? ''}
+							value={valueOf(fieldsData, def.field_name) ?? ''}
 							on:change={(event) => onChange(def.field_name, event.currentTarget.value)}
 						>
 							{#each def.text_inclusion as option (option)}
@@ -166,7 +186,7 @@
 						</select>
 					{:else if def.validator_kind === 'rich_text'}
 						<RichTextField
-							value={valueOf(def.field_name)}
+							value={valueOf(fieldsData, def.field_name)}
 							ariaLabel={def.display_name}
 							{defaultEditor}
 							onChange={(next) => onChange(def.field_name, next)}
@@ -176,7 +196,7 @@
 							class="inp mono"
 							type="text"
 							aria-labelledby="lbl-{def.field_name}"
-							value={textArrayToString(valueOf(def.field_name))}
+							value={textArrayToString(valueOf(fieldsData, def.field_name))}
 							on:input={(event) =>
 								onChange(def.field_name, stringToTextArray(event.currentTarget.value))}
 						/>
@@ -191,7 +211,7 @@
 							class="inp"
 							rows="3"
 							aria-labelledby="lbl-{def.field_name}"
-							value={`${valueOf(def.field_name) ?? ''}`}
+							value={`${valueOf(fieldsData, def.field_name) ?? ''}`}
 							on:input={(event) => onChange(def.field_name, event.currentTarget.value)}
 						></textarea>
 					{:else if def.validator_kind === 'ref/model/Cms::GalleryItem'}
@@ -203,10 +223,10 @@
 							and goes through the BFF.
 						-->
 						<div class="media">
-							{#if mediaIdOf(def.field_name) && mediaUrl(mediaIdOf(def.field_name))}
+							{#if mediaIdOf(fieldsData, def.field_name) && mediaUrl(mediaIdOf(fieldsData, def.field_name))}
 								<img
 									class="thumb"
-									src={mediaUrl(mediaIdOf(def.field_name))}
+									src={mediaUrl(mediaIdOf(fieldsData, def.field_name))}
 									alt=""
 									aria-hidden="true"
 								/>
@@ -220,7 +240,7 @@
 								</span>
 							{/if}
 							<div>
-								<div class="tpl">{mediaIdOf(def.field_name) || 'No image yet'}</div>
+								<div class="tpl">{mediaIdOf(fieldsData, def.field_name) || 'No image yet'}</div>
 								<div style="display:flex;gap:.35rem;margin-top:.4rem">
 									<button
 										class="btn btn-sm"
@@ -228,12 +248,12 @@
 										on:click={() => onPickMedia && onPickMedia(def.field_name)}
 										disabled={disabled || !onPickMedia}
 									>
-										{mediaIdOf(def.field_name) ? 'Replace' : 'Upload'}
+										{mediaIdOf(fieldsData, def.field_name) ? 'Replace' : 'Upload'}
 									</button>
 									<button
 										class="btn btn-sm btn-quiet danger"
 										type="button"
-										disabled={disabled || !mediaIdOf(def.field_name)}
+										disabled={disabled || !mediaIdOf(fieldsData, def.field_name)}
 										on:click={() => onChange(def.field_name, emptyValue)}
 									>
 										Remove
@@ -247,7 +267,7 @@
 							type="text"
 							aria-labelledby="lbl-{def.field_name}"
 							spellcheck={!isMachine(def.field_name)}
-							value={valueOf(def.field_name) ?? ''}
+							value={valueOf(fieldsData, def.field_name) ?? ''}
 							on:input={(event) => onChange(def.field_name, event.currentTarget.value)}
 						/>
 					{/if}
