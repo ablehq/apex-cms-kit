@@ -274,6 +274,53 @@ describe('the create-entity operation', () => {
 		assert.doesNotMatch(JSON.stringify(apex.stored.created), /script|onerror/iu);
 	});
 
+	/**
+	 * THE TWO HALVES OF A RICH-TEXT VALUE, ON THE CREATE PATH (codex P5 fix 5, item 1).
+	 *
+	 * Poovayya is the site that mounts this operation, and a child block it creates
+	 * carries a delta from the first save rather than from a later edit — so the
+	 * create path is where a delta first reaches Apex, and it gets the same two
+	 * assertions the patch path does.
+	 */
+	it('stores the delta text VERBATIM when it merely looks like a tag', async () => {
+		const apex = recordingApex();
+		await create(ctxWith(apex), {
+			body: {
+				editor: 'quilljs',
+				html: '<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>',
+				content: { ops: [{ insert: '<script>alert(1)</script>\n' }] }
+			}
+		});
+		assert.deepEqual(apex.stored.created.fieldsData, {
+			body: {
+				editor: 'quilljs',
+				html: '<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>',
+				content: { ops: [{ insert: '<script>alert(1)</script>\n' }] }
+			}
+		});
+	});
+
+	it('drops a javascript: link INSIDE the delta, the verdict the html half reaches', async () => {
+		const apex = recordingApex();
+		await create(ctxWith(apex), {
+			body: {
+				editor: 'quilljs',
+				html: '<p><a href="javascript:alert(1)">click</a></p>',
+				content: {
+					ops: [{ insert: 'click', attributes: { link: 'javascript:alert(1)' } }, { insert: '\n' }]
+				}
+			}
+		});
+		assert.deepEqual(apex.stored.created.fieldsData, {
+			body: {
+				editor: 'quilljs',
+				html: '<p><a>click</a></p>',
+				content: { ops: [{ insert: 'click', attributes: {} }, { insert: '\n' }] }
+			}
+		});
+		assert.doesNotMatch(JSON.stringify(apex.stored.created), /javascript:/iu);
+	});
+
 	it('carries the per-field ceiling and the unreadable-URL refusal', async () => {
 		const apex = recordingApex();
 		const tooLarge = await create(ctxWith(apex), {

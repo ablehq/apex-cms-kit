@@ -104,9 +104,23 @@
 // Both are closed the same way: this module runs `sanitizeWriteHtml` over its
 // input FIRST and parses the result, and uses `isSafeUrlValue` — the write
 // boundary's strict predicate — for `<a href>`. The delta is then a reading of
-// exactly the html that reaches Apex, not of what was typed. Note the direction
-// this errs in if a write path ever forgets to sanitize: the delta is the
-// STRICTER of the two, never the looser one.
+// exactly the html that reaches Apex, not of what was typed.
+//
+// WHAT THAT DOES AND DOES NOT PROMISE. It is true of a delta THIS MODULE builds:
+// it reads sanitized html, so it can carry nothing the html beside it does not.
+// The sentence that used to sit here went further — "if a write path ever forgets
+// to sanitize, the delta is the STRICTER of the two, never the looser one" — and
+// that was FALSE IN BOTH DIRECTIONS, because a delta does not have to come from
+// here. The BFF accepts `{html, content}` as authored, and `sanitizeFieldValue`
+// was running the MARKUP sanitizer over `content` as well: text that merely
+// looked like a tag was deleted from the delta while the html kept it escaped
+// (stricter, and a data loss), and a `javascript:` scheme spelled
+// `attributes.link` has no `<` in it, so it rode through beside an `<a>` whose
+// href had just been stripped (looser). Neither direction was this module's to
+// fix and neither is closed here: the write boundary now judges a rich-text
+// value part by part — html as markup, the delta's text as text, both halves'
+// URLs by `isSafeUrlValue` — and `sanitizeFormattingRecord` in
+// `sanitize/write-boundary.ts` is where that lives.
 
 import { decodeReferences } from '../sanitize/html.js';
 import { isSafeUrlValue, sanitizeWriteHtml } from '../sanitize/write-boundary';
@@ -148,13 +162,31 @@ const BLOCK_ATTRIBUTE = new Map([
  * paragraphs run together into one word, which is text corruption rather than a lost
  * format. Neither producer emits any of them, but a paste can.
  *
- * DELIBERATELY ABSENT, each measured under the same Quill build, which does NOT end
- * a line on them: `table`, `tbody`, `thead`, `tr`, `td`, `th`, `caption`, `details`,
- * `summary`, `hgroup`, `legend`, `aside`. `<table><tr><td>cell</td></tr></table>`
- * being one line is what the existing corpus case asserts, and it agrees. And `pre`
- * stays out for the reason the header gives: Quill's serializer has already emptied
- * a code block by the time this module sees it, so giving `<pre>` a line of its own
- * would add a blank line and nothing else.
+ * THE THIRD GROUP is `table`, `tr` and `td`, and the sentence that used to stand
+ * here said the opposite — "deliberately absent, each measured … which does NOT end
+ * a line on them" — which was WRONG, and wrong in the direction that runs two cells'
+ * text together (Opus review of fix pass 4, finding 3). Quill 2.0.3's `isLine` list
+ * is `[address, article, blockquote, canvas, dd, div, dl, dt, fieldset, figcaption,
+ * figure, footer, form, h1…h6, header, iframe, li, main, nav, ol, output, p, pre,
+ * section, table, td, tr, ul, video]` — `table`, `td` and `tr` are IN it. The two
+ * corpus cases that appeared to confirm the old claim could not see the defect: one
+ * was a single cell, and the other wrote `<td>a</td><td>b</td>` with no `<table>`
+ * around it, which the browser deletes before Quill is handed it. Measured directly
+ * against that build:
+ *
+ *   <table><tr><td>a</td><td>b</td></tr></table>   quill "a\nb"   kit was "ab"
+ *
+ * STILL ABSENT, and each of these genuinely measured NOT to end a line under the
+ * same build: `tbody`, `thead`, `th`, `caption`, `details`, `summary`, `hgroup`,
+ * `legend`, `aside` — note `th` and `tbody`, which are the two the review's summary
+ * named alongside the real three and which the list above does not contain
+ * (`<thead><tr><th>h1</th><th>h2</th></tr></thead>` is `"h1h2"`, one line). And
+ * `pre` stays out for the reason the header gives: Quill's serializer has already
+ * emptied a code block by the time this module sees it, so giving `<pre>` a line of
+ * its own would add a blank line and nothing else.
+ *
+ * Unreachable on the three sites today: 0 of 97 stored rich-text values contains a
+ * table tag. A paste is how one arrives.
  */
 const LEAF_BLOCK = new Set([
 	'p',
@@ -179,7 +211,10 @@ const LEAF_BLOCK = new Set([
 	'header',
 	'main',
 	'nav',
-	'section'
+	'section',
+	'table',
+	'tr',
+	'td'
 ]);
 
 /** List containers, and the `list` value each gives the `<li>`s inside it. */
@@ -256,6 +291,15 @@ function clampIndent(level) {
  * and `<div>\n  <b>x</b>\n</div>`.
  */
 const LAYOUT_RUN = /[ \t\f]*[\n\r][ \t\n\r\f]*/u;
+
+/**
+ * A text node made of nothing but the whitespace a browser COLLAPSES.
+ *
+ * `String.prototype.trim` is not this test: it treats U+00A0 as whitespace, and
+ * U+00A0 is content — `<p>&nbsp;</p>` is a deliberate blank line and Quill keeps
+ * it. Every other unicode space is left out for the same reason.
+ */
+const LAYOUT_WHITESPACE = /^[ \t\n\r\f\v]*$/u;
 
 /**
  * The same depth cap `sanitize/html.js` uses, for the same reason: pathological
@@ -613,6 +657,35 @@ export function htmlToDelta(input) {
 	let pendingLayout = false;
 	/** @type {Record<string, unknown> | null} the inline attributes it was seen with. */
 	let pendingLayoutAttributes = null;
+	/** The text it spends. One space for a newline-bearing run; the run itself for a
+	 * spaces-and-tabs one, which this module keeps rather than collapses. */
+	let pendingLayoutText = ' ';
+	/**
+	 * Is the waiting separator CONTENT rather than source formatting?
+	 *
+	 * Quill strips a whitespace run only where it TOUCHES A LINE ELEMENT — its
+	 * `matchText` removes the leading run when the previous sibling is one and the
+	 * trailing run when the next sibling is one, and leaves it alone otherwise. A
+	 * `<br>` is not a line element, so the space in `<b>a</b><br> <i>b</i>` is
+	 * content and Quill reads `"a\n b"`; this module read `"a\nb"`, because its
+	 * drop rule is "line start at the document root" and a `<br>` starts a line
+	 * exactly like a block boundary does (Opus review of fix pass 4, finding 5 —
+	 * the line-start twin of the root-run bug fix pass 4 closed).
+	 *
+	 * A content separator is therefore held rather than dropped, and spent when
+	 * something follows it on the same line — which is also how the OTHER half of
+	 * Quill's rule falls out: if a block opens next, the run touches a line element
+	 * after all and `clearLayout` discards it.
+	 */
+	let pendingLayoutIsContent = false;
+	/**
+	 * Was the line in progress started by a `<br>` rather than by a block boundary?
+	 *
+	 * The one bit of context the streaming walk needs to answer "is the previous
+	 * sibling a line element". Cleared at every line close and whenever a block or
+	 * list container opens.
+	 */
+	let lineStartedByBreak = false;
 	/** @type {Array<{name: string, attributes: Record<string, string>, inline: [string, unknown] | null,
 	 *   leaf: boolean, inherited: Record<string, unknown> | null, listKind: string | null,
 	 *   listDepth: number, emitted: boolean}>} */
@@ -664,13 +737,31 @@ export function htmlToDelta(input) {
 		return depth;
 	}
 
+	/** Forget a waiting separator without spending it. */
+	function clearLayout() {
+		pendingLayout = false;
+		pendingLayoutText = ' ';
+		pendingLayoutIsContent = false;
+	}
+
 	/** Close the current line, stamping the newline with `attributes`. */
 	function closeLine(attributes) {
+		// A CONTENT separator is the line's whole content when nothing else was
+		// written on it: `a<br> <br> b` is three lines to Quill and the middle one
+		// holds the space. An ordinary separator is dropped here instead — it had
+		// nothing follow it, so it was the trailing indentation of a pretty-printed
+		// block.
+		if (pendingLayoutIsContent && line.length === 0) {
+			line.push(
+				pendingLayoutAttributes
+					? { insert: pendingLayoutText, attributes: pendingLayoutAttributes }
+					: { insert: pendingLayoutText }
+			);
+		}
 		for (const op of line) pushOp(op);
 		line = [];
-		// The separator that was waiting had nothing follow it on this line, so it
-		// was the trailing indentation of a pretty-printed block. It is spent here.
-		pendingLayout = false;
+		clearLayout();
+		lineStartedByBreak = false;
 		pushOp(attributes ? { insert: '\n', attributes } : { insert: '\n' });
 	}
 
@@ -725,11 +816,31 @@ export function htmlToDelta(input) {
 	 * emitted since the last newline, so LEADING and BETWEEN-BLOCK whitespace is
 	 * still dropped — `<ul>  <li>` and `<p>a</p> <p>b</p>` are unchanged.
 	 *
+	 * THE OTHER HALF OF THE CONDITION USED TO BE `currentBlock() === null` TOO, and
+	 * that was the same mistake one level down: it made the rule "at the document
+	 * root" rather than "at the start of a line", so a whitespace-only node at the
+	 * head of a block was kept where Quill strips it (`<p>   </p>` came back holding
+	 * three spaces, `<table><tr><td>a</td> <td>b</td></tr>` gained a whole line
+	 * holding one). Quill's rule is positional, not depth-based: a run is stripped
+	 * where it touches a LINE element on either side, which at line start is always.
+	 *
+	 * `LAYOUT_WHITESPACE` rather than `trim()`, because `''.trim()` treats U+00A0 as
+	 * whitespace and it is not: `<p>&nbsp;</p>` is a blank line an editor typed on
+	 * purpose, Quill keeps it, and trimming it away would delete content. The class
+	 * is exactly the characters a browser collapses.
+	 *
 	 * @param {string} text
 	 */
 	function pushText(text) {
 		if (text === '') return;
-		if (line.length === 0 && currentBlock() === null && text.trim() === '') return;
+		if (line.length === 0 && LAYOUT_WHITESPACE.test(text)) {
+			// …EXCEPT when a `<br>` started this line. See `pendingLayoutIsContent`:
+			// Quill strips a run that touches a LINE element, and `<br>` is not one,
+			// so this whitespace is content. Held rather than pushed, so that a block
+			// opening next still discards it — that block IS a line element.
+			if (lineStartedByBreak) markLayout(text, true);
+			return;
+		}
 		const attributes = inlineAttributes();
 		line.push(attributes ? { insert: text, attributes } : { insert: text });
 	}
@@ -743,22 +854,23 @@ export function htmlToDelta(input) {
 	 * spend time instead would put the space inside the `<em>` and serialize back as
 	 * `<em> b</em>` — the same text, in a place Quill does not put it.
 	 */
-	function markLayout() {
+	function markLayout(text = ' ', isContent = false) {
 		if (pendingLayout) return;
 		pendingLayout = true;
+		pendingLayoutText = text;
+		pendingLayoutIsContent = isContent;
 		pendingLayoutAttributes = inlineAttributes();
 	}
 
-	/** Spend a waiting layout separator: one space, but only mid-line. */
+	/** Spend a waiting layout separator: mid-line, or anywhere if it is content. */
 	function spendLayout() {
 		if (!pendingLayout) return;
-		pendingLayout = false;
-		if (line.length === 0) return;
-		line.push(
-			pendingLayoutAttributes
-				? { insert: ' ', attributes: pendingLayoutAttributes }
-				: { insert: ' ' }
-		);
+		const text = pendingLayoutText;
+		const attributes = pendingLayoutAttributes;
+		const isContent = pendingLayoutIsContent;
+		clearLayout();
+		if (line.length === 0 && !isContent) return;
+		line.push(attributes ? { insert: text, attributes } : { insert: text });
 	}
 
 	/** @param {string} raw */
@@ -802,12 +914,22 @@ export function htmlToDelta(input) {
 		cursor = token.end;
 		if (name === 'br') {
 			breakLine();
+			// `breakLine` cleared it; this line was started by a `<br>`, and that is
+			// the one line start whose leading whitespace Quill keeps.
+			lineStartedByBreak = true;
 			continue;
 		}
 
 		const leaf = LEAF_BLOCK.has(name);
 		const container = LIST_CONTAINER.has(name);
-		if ((leaf || container) && line.length > 0) breakLine();
+		if (leaf || container) {
+			if (line.length > 0) breakLine();
+			// Nothing on this line for a waiting separator to separate, and the thing
+			// that follows it is a LINE element — the other half of Quill's rule, and
+			// the reason `<b>a</b><br> <p>b</p>` keeps no space.
+			else clearLayout();
+			lineStartedByBreak = false;
+		}
 		if (token.selfClosing || VOID_ELEMENTS.has(name) || stack.length >= MAX_DEPTH) continue;
 
 		const enclosing = leaf ? currentBlock() : null;
@@ -827,7 +949,10 @@ export function htmlToDelta(input) {
 	}
 
 	while (stack.length > 0) popTo(stack[stack.length - 1].name);
-	if (line.length > 0) closeLine(null);
+	// A CONTENT separator still waiting at the end of the document is the last
+	// line's content — `a<br> ` is `"a\n "` to Quill — so it closes a line of its
+	// own. An ordinary one is trailing indentation and closes nothing.
+	if (line.length > 0 || pendingLayoutIsContent) closeLine(null);
 
 	return { ops };
 }

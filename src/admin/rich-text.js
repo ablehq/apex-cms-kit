@@ -10,8 +10,15 @@
 //      (all twelve `team_member` records);
 //   2. `{editor: 'quilljs', html, content: {ops: [...]}}` — Poovayya's page-block
 //      entities and Godrej's post bodies, where `content` is a QUILL DELTA;
-//   3. `{editor: 'tiptap', html, content: {}}` — GLC's page fields
-//      (`cms/scripts/page-authoring.js:64`), where `content` is a ProseMirror doc;
+//   3. `{editor: 'tiptap', html, content: {}}` — ONE value on GLC, where `content`
+//      would be a ProseMirror doc. Measured against live Apex across every
+//      archetype schema and every content-library entity type on that tenant, GLC
+//      holds 19 `quilljs` values to this 1 — so "GLC is the tiptap site"
+//      (`cms/scripts/page-authoring.js:64` is where that reading came from) is
+//      false, and it is the sentence that produced the defect below. All 19
+//      quilljs values carry `content: {}` too, so an empty `content` is the
+//      flattening defect's footprint on everything rather than a mark of a
+//      dialect: the 19:1 count is what settles it, not the emptiness;
 //   4. `{editor: 'quilljs', content_html: '…'}` with NO `html` and NO `content` —
 //      GLC's article document blocks (`save-body-article.ts:80`,
 //      `cms/scripts/seed-content.js:414`);
@@ -34,8 +41,10 @@
 //      one field reshapes every other rich-text field on the row.
 //   B. A NON-EMPTY STORED `editor` SURVIVES. A quilljs field stays a quilljs field.
 //      Only a null/absent one takes the site's default, which is a PROP rather than
-//      a constant, because the right default differs per site (GLC: tiptap; Godrej
-//      and Poovayya: quilljs).
+//      a constant, because the right default is a SITE's fact and not this module's
+//      to assert. All three sites pass `quilljs` today — this used to read "GLC:
+//      tiptap; Godrej and Poovayya: quilljs", and GLC's own tenant is 19 `quilljs`
+//      to 1 `tiptap`.
 //   C. REGENERATED `content` BRANCHES ON THE EDITOR. A Quill delta for `quilljs`,
 //      `{}` for `tiptap`. Emitting `{ops: […]}` into a tiptap field would write a
 //      Quill document where a ProseMirror one belongs — the mirror image of the bug
@@ -157,10 +166,15 @@ export function richTextHtml(value) {
  *   nobody edited. Identity cannot apply to shape 5: a bare string always comes back
  *   as an object, because that is what the field has to store.
  * @param {{defaultEditor?: string}} [options] the editor name written when the
- *   stored value names none. Per SITE, not per kit: GLC's fields are tiptap and
- *   Poovayya's and Godrej's are quilljs, and a constant here would be wrong for two
- *   of the three. Defaults to `'tiptap'`, which is what this module did before the
- *   option existed, so a site that passes nothing is unchanged.
+ *   stored value names none. Per SITE, not per kit — but NOT because the sites
+ *   disagree. THIS IS THE SENTENCE THAT PRODUCED THE DEFECT ABOVE: it used to say
+ *   "GLC's fields are tiptap and Poovayya's and Godrej's are quilljs", which was
+ *   never measured and is not true — GLC's tenant holds 19 `quilljs` values to 1
+ *   `tiptap`, and all three sites now pass `quilljs`. It stays a prop because a
+ *   stored dialect is a fact about a SITE's data that this kit must not assert on
+ *   its behalf, which is the same reason the wrong assertion did so much damage.
+ *   Defaults to `'tiptap'`, which is what this module did before the option
+ *   existed, so a site that passes nothing is unchanged.
  * @returns {import('./types').RichTextValue}
  */
 export function plainToRichText(text, previous, options = {}) {

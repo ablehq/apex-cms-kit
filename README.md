@@ -49,8 +49,14 @@ Cookies are `apex_admin_session` and `apex_bff_csrf` on every site.
 ## Develop
 
     npm install
-    npm test        # node --test over tests/
+    npm test        # node --import tsx --test tests/*.test.js
     npm run check   # tsc
+    npm run lint    # prettier --check .
+
+`--import tsx` is not decoration. The suites import `src/**/*.ts` directly and some
+`.js` modules import a `.ts` sibling, so plain `node --test` cannot load them — this
+line used to read `node --test over tests/`, which never worked. There is no
+plain-`node` entry point anywhere in the kit or the three sites.
 
 ## The export map is a wildcard, and that is the decision
 

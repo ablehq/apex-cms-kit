@@ -51,9 +51,15 @@
 	 * The editor name written into a value that HAS NONE — a Poovayya archetype
 	 * primitive is stored `editor: null`. A stored non-empty name always wins.
 	 *
-	 * Per SITE: GLC's page fields are tiptap, Godrej's and Poovayya's values are
-	 * quilljs with populated deltas. `'tiptap'` is what this component did before the
-	 * prop existed, so a site that passes nothing is unchanged.
+	 * Per SITE, and ALL THREE SITES PASS `quilljs`. This used to say "GLC's page
+	 * fields are tiptap"; live Apex says otherwise — 19 `quilljs` values to 1
+	 * `tiptap` across every GLC archetype schema and entity type, and all 19 carry
+	 * `content: {}` as well, so an empty `content` is the flattening defect's
+	 * footprint on every value rather than a mark of a dialect. The 19:1 count is
+	 * what carries it (Opus review of fix pass 3, finding 2; re-measured in the
+	 * review of fix pass 4). `'tiptap'` is what this component did before the prop
+	 * existed, so a site that passes nothing is unchanged — but no site here should
+	 * be taking the default.
 	 * @type {string}
 	 */
 	export let defaultEditor = 'tiptap';

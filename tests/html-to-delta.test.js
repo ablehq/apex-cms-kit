@@ -366,6 +366,28 @@ describe('htmlToDelta: the document structure a contenteditable produces', () =>
 			{ insert: 'two' },
 			{ insert: '\n', attributes: { list: 'bullet' } }
 		]);
+		/**
+		 * AT THE START OF A LINE the drop applies at every depth, not only at the
+		 * document root — Quill strips a run wherever it touches a line element, and
+		 * the head of a block always does. `<p>   </p>` used to come back holding
+		 * three spaces.
+		 *
+		 * MUTATION: put `currentBlock() === null` back into `pushText`'s guard and the
+		 * first two fail.
+		 */
+		assert.deepEqual(htmlToDelta('<p>   </p>'), { ops: [{ insert: '\n' }] });
+		assert.deepEqual(htmlToDelta('<ul><li>   </li></ul>').ops, [
+			{ insert: '\n', attributes: { list: 'bullet' } }
+		]);
+		/**
+		 * …but U+00A0 IS CONTENT, and `''.trim()` would have called it whitespace.
+		 * `<p>&nbsp;</p>` is a blank line an editor typed on purpose and Quill keeps
+		 * it — the reason the guard tests `LAYOUT_WHITESPACE` rather than trimming.
+		 *
+		 * MUTATION: change `LAYOUT_WHITESPACE.test(text)` back to `text.trim() === ''`
+		 * and this one fails.
+		 */
+		assert.deepEqual(htmlToDelta('<p>&nbsp;</p>'), { ops: [{ insert: '\u00a0\n' }] });
 	});
 
 	it('THE SPACE BETWEEN TWO FORMATTED RUNS AT THE DOCUMENT ROOT SURVIVES', () => {
@@ -426,6 +448,44 @@ describe('htmlToDelta: the document structure a contenteditable produces', () =>
 			{ insert: 'b' },
 			{ insert: '\n', attributes: { list: 'bullet' } }
 		]);
+	});
+
+	it('THE LINE-START TWIN: a `<br>` does not make the space after it layout', () => {
+		/**
+		 * Opus review of fix pass 4, finding 5 — the same rule one position over.
+		 * The fix above keeps a whitespace node MID-LINE at the document root; this
+		 * one is at LINE START, and the drop rule could not tell a line a `<br>`
+		 * began from a line a block boundary began.
+		 *
+		 * Quill's `matchText` is the oracle and it does not have that ambiguity: it
+		 * strips a whitespace run only where the run TOUCHES A LINE ELEMENT — the
+		 * previous sibling for the leading strip, the next sibling for the trailing
+		 * one. `<br>` is not in its `isLine` list, so the space is kept; `<p>` is,
+		 * so it is not. Every expectation below is that build's own answer.
+		 *
+		 * MUTATION: drop the `lineStartedByBreak` branch from `pushText` and the
+		 * first two fail; drop the `else clearLayout()` beside it and the third
+		 * gains a space Quill does not have.
+		 */
+		// Quill: [{insert:'a',bold},{insert:'\n '},{insert:'b',italic}] — op for op,
+		// plus the trailing newline this module always closes a document with.
+		assert.deepEqual(htmlToDelta('<b>a</b><br> <i>b</i>').ops, [
+			{ insert: 'a', attributes: { bold: true } },
+			{ insert: '\n ' },
+			{ insert: 'b', attributes: { italic: true } },
+			{ insert: '\n' }
+		]);
+		// A space that is a whole line of its own, because a `<br>` closes it too.
+		assert.deepEqual(htmlToDelta('a<br> <br> b'), { ops: [{ insert: 'a\n \n b\n' }] });
+		// …and the other half of the same rule: a BLOCK opening next is a line
+		// element, so the run touches one after all and goes.
+		assert.deepEqual(htmlToDelta('<b>a</b><br> <p>b</p>').ops, [
+			{ insert: 'a', attributes: { bold: true } },
+			{ insert: '\nb\n' }
+		]);
+		// At the END of the document the space is still content — Quill reads
+		// `a<br> ` as `"a\n "` — so it gets a line rather than being discarded.
+		assert.deepEqual(htmlToDelta('a<br> '), { ops: [{ insert: 'a\n \n' }] });
 	});
 
 	it('a LINE BREAK in the source is layout — it never becomes a line in the delta', () => {
@@ -680,10 +740,41 @@ describe('htmlToDelta: the document structure a contenteditable produces', () =>
 				name
 			);
 		}
-		// The table internals are NOT lines — measured against the same Quill build,
-		// and the stored-corpus case above (`<table><tr><td>cell</td></tr></table>`)
-		// agrees with it.
-		assert.deepEqual(htmlToDelta('<td>a</td><td>b</td>'), { ops: [{ insert: 'ab\n' }] });
+		/**
+		 * TABLE INTERNALS, AND THE CLAIM THAT USED TO BE HERE.
+		 *
+		 * This comment said "the table internals are NOT lines — measured against the
+		 * same Quill build", and that was FALSE (Opus review of fix pass 4, finding
+		 * 3). Quill 2.0.3's `isLine` list contains `table`, `td` and `tr`, and
+		 * `<table><tr><td>a</td><td>b</td></tr></table>` reads as `"a\nb"` there while
+		 * this module produced `"ab"` — two cells run together into one word, which is
+		 * text corruption rather than a lost format.
+		 *
+		 * Neither assertion that stood here could see it. `<td>a</td><td>b</td>` with
+		 * no `<table>` around it is not a measurement of Quill's rule at all: the
+		 * browser's parser DELETES those tags before the clipboard sees them, so the
+		 * "agreement" was between this module and a document Quill never received. The
+		 * other case was a single cell, where a line break has nothing to separate.
+		 *
+		 * MUTATION: remove `table`/`tr`/`td` from `LEAF_BLOCK` and the first two below
+		 * fail.
+		 */
+		assert.deepEqual(htmlToDelta('<table><tr><td>a</td><td>b</td></tr></table>'), {
+			ops: [{ insert: 'a\nb\n' }]
+		});
+		assert.deepEqual(
+			htmlToDelta('<table><tbody><tr><td>a</td><td>b</td></tr><tr><td>c</td></tr></tbody></table>'),
+			{ ops: [{ insert: 'a\nb\nc\n' }] }
+		);
+		// `th`, `tbody`, `thead` and `caption` are genuinely absent from Quill's list
+		// — the two cells of a header row are ONE line — so the row break comes from
+		// the `<tr>` around them and nothing else.
+		assert.deepEqual(
+			htmlToDelta(
+				'<table><thead><tr><th>h1</th><th>h2</th></tr></thead><tbody><tr><td>a</td></tr></tbody></table>'
+			),
+			{ ops: [{ insert: 'h1h2\na\n' }] }
+		);
 		assert.deepEqual(htmlToDelta('<table><tr><td>cell</td></tr></table>'), {
 			ops: [{ insert: 'cell\n' }]
 		});

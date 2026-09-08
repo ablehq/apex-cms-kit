@@ -19,7 +19,9 @@ import { plainToRichText, richTextHtml } from '../src/admin/rich-text.js';
  *
  *   1. `{editor: null, html, content}` — every Poovayya archetype primitive;
  *   2. `{editor: 'quilljs', html, content: {ops}}` — Poovayya page blocks, Godrej;
- *   3. `{editor: 'tiptap', html, content: {}}` — GLC page fields;
+ *   3. `{editor: 'tiptap', html, content: {}}` — ONE value on GLC. Not "GLC's page
+ *      fields": measured across every archetype schema and entity type on that
+ *      tenant, GLC is 19 `quilljs` to this 1, and all 19 carry `content: {}` too;
  *   4. `{editor: 'quilljs', content_html}` — GLC article document blocks;
  *   5. a bare HTML string — both siblings' article editors pass one as `value`.
  */

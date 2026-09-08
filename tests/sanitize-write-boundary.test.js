@@ -9,6 +9,7 @@ import {
 	fieldValueChars,
 	isSafeUrlValue,
 	oversizedFieldNames,
+	residualReferenceFieldNames,
 	sanitizeFieldValue,
 	sanitizeWriteHtml
 } from '../src/sanitize/write-boundary.ts';
@@ -295,6 +296,171 @@ describe('sanitizeFieldValue', () => {
 		assert.deepEqual(sanitizeFieldValue('Ravi & Co'), 'Ravi & Co');
 		assert.deepEqual(sanitizeFieldValue('member'), 'member');
 		assert.deepEqual(sanitizeFieldValue(42), 42);
+	});
+});
+
+/**
+ * ONE VALUE, ONE VERDICT — the two halves of a rich-text field, judged by what they
+ * ARE (codex P5 fix 5, item 1).
+ *
+ * `html` is markup and keeps `sanitizeWriteHtml`. A `content` that is a Quill delta
+ * or a ProseMirror document is a FORMATTING RECORD: its `insert`/`text` strings are
+ * the document's literal text, and its `link`/`href`/`src` are URLs. Running the
+ * markup sanitizer over the whole thing got BOTH of those backwards, in opposite
+ * directions, and each direction below is the reproduction that named the defect.
+ */
+describe('sanitizeFieldValue judges a rich-text value part by part', () => {
+	it('DIRECTION 1 — text that merely looks like a tag survives in the delta', () => {
+		// Was: html kept the words escaped, and the delta came back `{"ops":[{"insert":"\n"}]}`
+		// — the one copy Apex's own CMS UI loads its editor from, emptied. Its next
+		// save would have written that loss into `html` too.
+		const value = {
+			editor: 'quilljs',
+			html: '<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>',
+			content: { ops: [{ insert: '<script>alert(1)</script>\n' }] }
+		};
+		assert.deepEqual(sanitizeFieldValue(value), {
+			editor: 'quilljs',
+			html: '<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>',
+			content: { ops: [{ insert: '<script>alert(1)</script>\n' }] }
+		});
+		// Nothing needed doing to it, so the identity contract holds here too.
+		assert.equal(sanitizeFieldValue(value), value);
+	});
+
+	it('DIRECTION 2 — a javascript: link in the delta is dropped, as it is in the html', () => {
+		// Was: the href was stripped out of `html` and the SAME scheme was stored
+		// verbatim in `attributes.link`, because it has no `<` in it and the walk
+		// only ever looked for markup.
+		const value = {
+			editor: 'quilljs',
+			html: '<p><a href="javascript:alert(1)">click</a></p>',
+			content: {
+				ops: [{ insert: 'click', attributes: { link: 'javascript:alert(1)' } }, { insert: '\n' }]
+			}
+		};
+		assert.deepEqual(sanitizeFieldValue(value), {
+			editor: 'quilljs',
+			html: '<p><a>click</a></p>',
+			content: { ops: [{ insert: 'click', attributes: {} }, { insert: '\n' }] }
+		});
+	});
+
+	it('keeps a SAFE link, and keeps the formatting beside a dropped one', () => {
+		assert.deepEqual(
+			sanitizeFieldValue({
+				editor: 'quilljs',
+				html: '<p><a href="/areas">a</a></p>',
+				content: {
+					ops: [
+						{ insert: 'a', attributes: { link: '/areas', bold: true } },
+						{ insert: 'b', attributes: { link: 'javascript:alert(1)', bold: true } },
+						{ insert: '\n' }
+					]
+				}
+			}),
+			{
+				editor: 'quilljs',
+				html: '<p><a href="/areas">a</a></p>',
+				content: {
+					ops: [
+						{ insert: 'a', attributes: { link: '/areas', bold: true } },
+						{ insert: 'b', attributes: { bold: true } },
+						{ insert: '\n' }
+					]
+				}
+			}
+		);
+	});
+
+	it('judges a Quill image EMBED by the same predicate the html half uses', () => {
+		// `{insert: {image: '…'}}` is a URL where the whole insert is the value. The
+		// key goes and the op stays, the way `<img src="javascript:…">` comes back
+		// as a src-less `<img>`.
+		assert.deepEqual(sanitizeFieldValue({ ops: [{ insert: { image: 'javascript:alert(1)' } }] }), {
+			ops: [{ insert: {} }]
+		});
+		const safe = { ops: [{ insert: { image: '/uploads/a.png' } }] };
+		assert.equal(sanitizeFieldValue(safe), safe);
+	});
+
+	it('does the same for a tiptap document — text passes, marks[].attrs.href is judged', () => {
+		assert.deepEqual(
+			sanitizeFieldValue({
+				editor: 'tiptap',
+				html: '<p><a href="javascript:alert(1)">click</a></p>',
+				content: {
+					type: 'doc',
+					content: [
+						{
+							type: 'paragraph',
+							content: [
+								{
+									type: 'text',
+									text: 'click',
+									marks: [{ type: 'link', attrs: { href: 'javascript:alert(1)' } }]
+								},
+								{ type: 'text', text: ' <script>alert(1)</script>' }
+							]
+						}
+					]
+				}
+			}),
+			{
+				editor: 'tiptap',
+				html: '<p><a>click</a></p>',
+				content: {
+					type: 'doc',
+					content: [
+						{
+							type: 'paragraph',
+							content: [
+								{ type: 'text', text: 'click', marks: [{ type: 'link', attrs: {} }] },
+								{ type: 'text', text: ' <script>alert(1)</script>' }
+							]
+						}
+					]
+				}
+			}
+		);
+	});
+
+	it('leaves the structural walk in place for a `content` that is NOT a delta', () => {
+		// `{blocks: [{html}]}` is markup living under `content`, and it stays markup.
+		// The exemption is for the two formatting dialects, not for the key name.
+		assert.deepEqual(
+			sanitizeFieldValue({
+				editor: 'quilljs',
+				html: '<p>ok</p>',
+				content: { blocks: [{ html: '<script>alert(1)</script>' }] }
+			}),
+			{ editor: 'quilljs', html: '<p>ok</p>', content: { blocks: [{ html: '' }] } }
+		);
+	});
+
+	it('names the field when the delta carries a URL the judge cannot READ', () => {
+		// The refusal that keeps the two halves from being judged at different
+		// VOLUMES: a residual reference in `html` refuses the write by name, so the
+		// same one in `attributes.link` must too, rather than vanishing in silence
+		// from a value that may be perfectly safe.
+		assert.deepEqual(
+			residualReferenceFieldNames({
+				body: {
+					editor: 'quilljs',
+					html: '<p>x</p>',
+					content: { ops: [{ insert: 'x', attributes: { link: '&#00000000106;avascript:x' } }] }
+				},
+				fine: { editor: 'quilljs', html: '<p>y</p>', content: { ops: [{ insert: 'y\n' }] } }
+			}),
+			['body']
+		);
+		// And plain text that spells a reference is TEXT, not a URL: no refusal.
+		assert.deepEqual(
+			residualReferenceFieldNames({
+				body: { editor: 'quilljs', html: '<p>x</p>', content: { ops: [{ insert: '&#106;x\n' }] } }
+			}),
+			[]
+		);
 	});
 });
 

@@ -225,6 +225,103 @@ export function sanitizeWriteHtml(html: string): string {
 }
 
 /**
+ * Where a URL hides inside a rich-text `content` record — the delta's `URL_ATTRIBUTE`.
+ *
+ * A formatting record is JSON, not markup, so `URL_ATTRIBUTE` (which reads
+ * `name="value"` out of a tag) cannot see into it. These are the same sinks spelled
+ * as object keys: `link` is Quill's link attribute
+ * (`{insert:'x',attributes:{link:'…'}}`), `href` and `src` are what a ProseMirror
+ * mark and node carry (`marks:[{type:'link',attrs:{href:'…'}}]`,
+ * `attrs:{src:'…'}`), and `image`/`video` are the two Quill EMBED inserts
+ * (`{insert:{image:'…'}}`), where the URL is the whole value.
+ *
+ * Deliberately short. Every entry is a sink one of the two editors actually writes;
+ * `URL_ATTRIBUTE`'s wider list (`values`, `to`, `from`, `data`, `action`) is there
+ * for SVG and form markup that cannot occur in a delta, and `to`/`from` in
+ * particular are ProseMirror RANGE names — judging those as URLs would refuse
+ * positions.
+ */
+const CONTENT_URL_KEYS = new Set(['link', 'href', 'src', 'image', 'video']);
+
+/** A Quill delta — `{ops: [{insert, attributes?}, …]}`. */
+function isQuillDelta(value: unknown): boolean {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+	return Array.isArray((value as { ops?: unknown }).ops);
+}
+
+/**
+ * A ProseMirror/tiptap document — `{type: 'doc', content: […]}`.
+ *
+ * Recognised by the DOCUMENT's own shape, not by a bare node's. `{type: 'video',
+ * src: '…'}` in some future block field is not a formatting record, and reading it
+ * as one would stop sanitizing markup inside it; the doc node is the one shape that
+ * cannot mean anything else, and every node below it is reached by walking from
+ * there.
+ */
+function isTiptapDoc(value: unknown): boolean {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+	const node = value as { type?: unknown; content?: unknown };
+	return node.type === 'doc' && (node.content === undefined || Array.isArray(node.content));
+}
+
+/**
+ * One rich-text `content` record — a Quill delta or a ProseMirror document.
+ *
+ * THE HALF `sanitizeFieldValue` USED TO JUDGE AS MARKUP, AND MUST NOT. Nothing in a
+ * formatting record is markup: `ops[].insert` and a tiptap `text` node are the
+ * document's LITERAL TEXT, and `sanitizeWriteHtml` over literal text deletes any of
+ * it that happens to look like a tag. That is not a strip, it is data loss on the
+ * one copy of the value Apex's own CMS UI loads its editor from
+ * (`RichTextArchetypeSchemaItem.svelte:47-48`, `quill.setContents(parsedValue.content)`),
+ * and that UI's next save writes the loss into `html` too:
+ *
+ *   in    {html: '<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>',
+ *          content: {ops: [{insert: '<script>alert(1)</script>\n'}]}}
+ *   was   html  kept the words, escaped; delta came back as {"ops":[{"insert":"\n"}]}
+ *
+ * The mirror image was true of URLs. A scheme in the html is judged by
+ * `URL_ATTRIBUTE`; the same scheme spelled `attributes.link` has no `<` in it, so
+ * the walk never looked at it and it rode through verbatim beside an `<a>` whose
+ * href had just been stripped. Both halves are ONE VALUE shown by two editors, so
+ * they get ONE verdict: text is text, and a URL is judged by `isSafeUrlValue` —
+ * the same predicate, reached the same way.
+ *
+ * The KEY goes, not the node, exactly as `sanitizeWriteHtml` drops the attribute and
+ * leaves the element: a link mark with no href is inert, which is what `<a>x</a>` is.
+ */
+function sanitizeFormattingRecord(value: unknown): unknown {
+	// A string inside a formatting record is TEXT. It is never parsed as markup by
+	// anything downstream, so nothing here may rewrite it.
+	if (typeof value === 'string') return value;
+	if (Array.isArray(value)) {
+		let moved = false;
+		const walked = value.map((entry) => {
+			const next = sanitizeFormattingRecord(entry);
+			if (next !== entry) moved = true;
+			return next;
+		});
+		return moved ? walked : value;
+	}
+	if (!value || typeof value !== 'object') return value;
+	let moved = false;
+	const walked: Record<string, unknown> = {};
+	for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+		if (CONTENT_URL_KEYS.has(key) && typeof nested === 'string') {
+			if (isSafeUrlValue(nested)) {
+				walked[key] = nested;
+				continue;
+			}
+			moved = true;
+			continue;
+		}
+		const next = sanitizeFormattingRecord(nested);
+		if (next !== nested) moved = true;
+		walked[key] = next;
+	}
+	return moved ? walked : value;
+}
+
+/**
  * One field value on its way to Apex.
  *
  * Rich text arrives as `{editor, html, content}` and its `html` is the part the
@@ -246,12 +343,15 @@ export function sanitizeWriteHtml(html: string): string {
  * nobody has written yet — so the walk is structural rather than keyed on one
  * property name, and the `{editor, html, content}` case falls out of it.
  *
+ * THE ONE PLACE THE WALK IS NOT STRUCTURAL is a formatting record — a Quill delta or
+ * a ProseMirror document — because there the structure says what the strings ARE.
+ * `sanitizeFormattingRecord` above has the reasoning and the two reproductions.
+ * Everything else inside a `content` keeps the structural walk: `content: {blocks:
+ * [{html: '…'}]}` is neither a delta nor a doc, and its `html` is still markup.
+ *
  * The identity contract is unchanged: a value nothing needed doing to comes back as
  * the SAME object, so a caller can still tell "sanitized" from "untouched" by
- * reference. One accepted cost of the walk: a tiptap `content` node whose `text`
- * literally spells an executable tag has that text stripped, the way Poovayya has
- * always behaved. Storing it verbatim next to the `html` the site renders is the
- * worse of the two.
+ * reference.
  */
 export function sanitizeFieldValue(value: unknown): unknown {
 	if (typeof value === 'string') {
@@ -267,6 +367,7 @@ export function sanitizeFieldValue(value: unknown): unknown {
 		return moved ? walked : value;
 	}
 	if (!value || typeof value !== 'object') return value;
+	if (isQuillDelta(value) || isTiptapDoc(value)) return sanitizeFormattingRecord(value);
 	let moved = false;
 	const walked: Record<string, unknown> = {};
 	for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
@@ -335,11 +436,36 @@ function hasResidualReferenceUrl(value: string): boolean {
 	return false;
 }
 
+/**
+ * The same question asked of a formatting record, where a URL is a KEY, not a tag.
+ *
+ * Without this the two halves of one rich-text value still reach different verdicts:
+ * `<a href="&#00000000106;avascript:x">` in the `html` refuses the write BY NAME,
+ * while the identical scheme spelled `attributes.link` would be dropped silently by
+ * `sanitizeFormattingRecord` — and the value may be perfectly safe (`?a=1&#2024`),
+ * which is precisely the silent strip `residualReferenceFieldNames` exists to stop.
+ * Same predicate, same key list, so the delta cannot be judged more quietly than the
+ * markup beside it.
+ */
+function residualReferenceInFormattingRecord(value: unknown): boolean {
+	if (Array.isArray(value)) return value.some(residualReferenceInFormattingRecord);
+	if (!value || typeof value !== 'object') return false;
+	return Object.entries(value as Record<string, unknown>).some(([key, nested]) => {
+		if (CONTENT_URL_KEYS.has(key) && typeof nested === 'string') {
+			return nested !== '' && RESIDUAL_REFERENCE.test(decodeReferences(nested));
+		}
+		return residualReferenceInFormattingRecord(nested);
+	});
+}
+
 /** Walk one field value the way `sanitizeFieldValue` does, looking for the above. */
 function residualReferenceInValue(value: unknown): boolean {
 	if (typeof value === 'string') return hasResidualReferenceUrl(value);
 	if (Array.isArray(value)) return value.some(residualReferenceInValue);
 	if (!value || typeof value !== 'object') return false;
+	if (isQuillDelta(value) || isTiptapDoc(value)) {
+		return residualReferenceInFormattingRecord(value);
+	}
 	return Object.values(value as Record<string, unknown>).some(residualReferenceInValue);
 }
 

@@ -372,6 +372,56 @@ describe('patch-entity-fields sanitizes what it stores', () => {
 		});
 	});
 
+	/**
+	 * THE DELTA HALF, AT THE ENDPOINT (codex P5 fix 5, item 1).
+	 *
+	 * `sanitize-write-boundary.test.js` proves the judge treats the two halves of a
+	 * rich-text value by what they are. These two prove the value APEX RECEIVES has
+	 * been through that judge — the same distinction this file exists for, on the
+	 * operation all three sites mount.
+	 */
+	it('stores the delta text VERBATIM when it merely looks like a tag', async () => {
+		const apex = recordingApex();
+		const ctx = ctxWith(apex);
+		const response = await patchEntity(ctx, {
+			body: {
+				editor: 'quilljs',
+				html: '<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>',
+				content: { ops: [{ insert: '<script>alert(1)</script>\n' }] }
+			}
+		});
+		assert.equal(response.status, 200);
+		assert.deepEqual(apex.stored.entityFields.fieldsData, {
+			body: {
+				editor: 'quilljs',
+				html: '<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>',
+				content: { ops: [{ insert: '<script>alert(1)</script>\n' }] }
+			}
+		});
+	});
+
+	it('drops a javascript: link INSIDE the delta, the verdict the html half reaches', async () => {
+		const apex = recordingApex();
+		const ctx = ctxWith(apex);
+		await patchEntity(ctx, {
+			body: {
+				editor: 'quilljs',
+				html: '<p><a href="javascript:alert(1)">click</a></p>',
+				content: {
+					ops: [{ insert: 'click', attributes: { link: 'javascript:alert(1)' } }, { insert: '\n' }]
+				}
+			}
+		});
+		assert.deepEqual(apex.stored.entityFields.fieldsData, {
+			body: {
+				editor: 'quilljs',
+				html: '<p><a>click</a></p>',
+				content: { ops: [{ insert: 'click', attributes: {} }, { insert: '\n' }] }
+			}
+		});
+		assert.doesNotMatch(JSON.stringify(apex.stored.entityFields), /javascript:/iu);
+	});
+
 	it('walks an array of objects', async () => {
 		const apex = recordingApex();
 		const ctx = ctxWith(apex);
