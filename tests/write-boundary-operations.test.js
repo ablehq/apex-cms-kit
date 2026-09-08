@@ -425,6 +425,38 @@ describe('patch-entity-fields sanitizes what it stores', () => {
 		assert.equal(refused.stored.entityFields, null);
 	});
 
+	/**
+	 * THE ROUTE AND THE CLIENT AGREE ABOUT WHAT AN ENTITY TYPE IS.
+	 *
+	 * This route spelled its own `/^[0-9a-z][0-9a-z-]*$/iu` while
+	 * `assertEntityTypeRef` uses `/u`. Under `iu` unicode case folding puts U+212A
+	 * (KELVIN SIGN) and U+017F (LATIN SMALL LETTER LONG S) inside `[a-z]`, and `i`
+	 * admits plain uppercase — so all three passed route validation and were then
+	 * refused by a THROW inside the client. A throw out of an operation is a framework
+	 * 500 with no audit row, in place of this route's own audited 400 (codex's P5 fix
+	 * review, 2026-09-08).
+	 *
+	 * MUTATION: put the `i` back on `entityTypeRef` in `patch-entity-fields.ts` — the
+	 * three cases below stop being 400s.
+	 */
+	it('refuses a case-folded or uppercase entity type HERE, not by throwing in the client', async () => {
+		const apex = recordingApex();
+		const ctx = ctxWith(apex);
+		// Escapes, not literals: U+212A and U+017F are invisible in a diff.
+		for (const bad of ['\u212a', 'quote-\u017fitem', 'Quote-Item']) {
+			const response = await handlePatchEntityFields(
+				signedRequest(await signIn(ctx), `/api/admin/entities/x/${ENTITY_ID}`, {
+					fields_data: { quote: 'x' }
+				}),
+				ctx,
+				{ entityTypeId: bad, entityId: ENTITY_ID }
+			);
+			assert.equal(response.status, 400, JSON.stringify(bad));
+			assert.equal((await response.json()).error, 'invalid id');
+		}
+		assert.equal(apex.stored.entityFields, null, 'and nothing was sent upstream');
+	});
+
 	it('stores none of the EIGHT payloads the P4 review proved reached Apex verbatim', async () => {
 		/**
 		 * Every one of these was sent through this operation against the recording

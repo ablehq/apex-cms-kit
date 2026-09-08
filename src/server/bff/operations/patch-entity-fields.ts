@@ -10,6 +10,7 @@ import {
 	rejectMutation
 } from '../reject';
 import { sanitizeFieldValue } from '../../../sanitize/write-boundary';
+import { ENTITY_TYPE_REF } from '../apex-admin-client';
 import type { BffContext } from '../context';
 
 /**
@@ -39,11 +40,16 @@ import type { BffContext } from '../context';
  */
 const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu);
 
-/** A uuid OR a slug — `entity_types/:id_or_slug`. Nothing that could carry a path. */
-const entityTypeRef = z
-	.string()
-	.regex(/^[0-9a-z][0-9a-z-]*$/iu)
-	.max(120);
+/**
+ * A uuid OR a slug — `entity_types/:id_or_slug`. Nothing that could carry a path.
+ *
+ * THE CLIENT'S OWN REGEX, not a second spelling of it: this used to be `/iu`, which
+ * accepts uppercase and — through unicode case folding — U+212A and U+017F, all of
+ * which `assertEntityTypeRef` then refused by THROWING. A request that passes route
+ * validation and dies in the client is a framework 500 with no audit row, in place of
+ * the audited 400 this route already knows how to answer.
+ */
+const entityTypeRef = z.string().regex(ENTITY_TYPE_REF);
 
 const fieldNameSchema = z.string().regex(/^[a-z][a-z0-9_]*$/u);
 

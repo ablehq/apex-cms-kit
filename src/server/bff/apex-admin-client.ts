@@ -280,10 +280,24 @@ export function assertSchemaItemSlug(name: string): void {
  * spelled in, so nothing carrying a path separator, a dot segment or a
  * percent-encoding reaches the URL.
  */
+/**
+ * THE one entity-type-ref shape, exported so the ROUTES parse with it too.
+ *
+ * NO `i` FLAG, for the reason on `assertSchemaItemSlug`. Both a slug and a uuid are
+ * lower case everywhere Apex mints them, so nothing legitimate needed it.
+ *
+ * It is exported because the two operations that take an entity type had SPELLED
+ * THEIR OWN, with the `i` — so `entity_types/K` (KELVIN SIGN, which unicode case
+ * folding puts inside `[a-z]`) and `Quote-Item` passed route validation and were then
+ * REFUSED BY THIS CLIENT with a thrown `Error`. A throw out of an operation is a
+ * framework 500 with no audit row, where the route's own refusal would have been an
+ * audited 400. The route and the client disagreeing about what is valid is not a
+ * thing to fix twice (codex's P5 fix review, 2026-09-08).
+ */
+export const ENTITY_TYPE_REF = /^[0-9a-z][0-9a-z-]{0,119}$/u;
+
 export function assertEntityTypeRef(ref: string): void {
-	// NO `i` FLAG, for the reason on `assertSchemaItemSlug`. Both a slug and a uuid
-	// are lower case everywhere Apex mints them, so nothing legitimate needed it.
-	if (!/^[0-9a-z][0-9a-z-]{0,119}$/u.test(ref)) throw new Error('invalid entity type');
+	if (!ENTITY_TYPE_REF.test(ref)) throw new Error('invalid entity type');
 }
 
 export function assertUuid(id: string): void {
