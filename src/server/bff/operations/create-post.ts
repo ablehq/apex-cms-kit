@@ -10,15 +10,10 @@ import {
 	rejectMutation
 } from '../reject';
 import { cleanString, unwrapArchetypeRecord } from '../archetype-record';
+import { createdIdOutcome, judgeCreatedId, shapeFaultDetail } from './created-id';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import { toApexFields } from './update-record';
-import {
-	buildPostLoad,
-	postIdSchema,
-	postRouteMeta,
-	postSchemaOf,
-	rejectedWriteResponse
-} from './post-shape';
+import { buildPostLoad, postRouteMeta, postSchemaOf, rejectedWriteResponse } from './post-shape';
 import type { ContentContract } from '../content-contract';
 import type { BffContext } from '../context';
 
@@ -143,11 +138,25 @@ export async function handleCreatePost(
 		fields
 	);
 
+	// Apex answers with the ARCHETYPE; the admin addresses a post by its POST id,
+	// which is the archetype's `target_model_id`. THE VERDICT ON IT IS TAKEN BEFORE
+	// THE AUDIT IS WRITTEN — the rule and the reasoning are in `created-id.ts`. This
+	// handler used to audit `accepted` on any 2xx and then answer 502 when the id was
+	// missing or unusable (codex's P5 fix review, 2026-09-08).
+	const record = unwrapArchetypeRecord(apexResponse.body);
+	const verdict = judgeCreatedId(
+		apexResponse.ok,
+		record ? cleanString(record.target_model_id) : null,
+		'post'
+	);
+
 	await auditOutcome(ctx, meta, guard.actor, {
-		outcome: apexResponse.ok ? 'accepted' : 'apex_error',
+		outcome: createdIdOutcome(apexResponse.ok, verdict),
 		detail: {
 			schema: params.schema,
 			slug: parsed.data.slug,
+			postId: verdict.id,
+			...shapeFaultDetail(verdict),
 			fields: Object.keys(fields),
 			apexStatus: apexResponse.status
 		}
@@ -157,15 +166,22 @@ export async function handleCreatePost(
 	// it refused, otherwise `422 invalid` with the field errors.
 	if (apexResponse.status === 422) return rejectedWriteResponse(apexResponse.body);
 	if (!apexResponse.ok) return bffError(502, 'upstream error');
+	const postId = verdict.id;
+	if (postId === null) return bffError(502, 'unexpected upstream shape');
 
-	// Apex answers with the ARCHETYPE; the admin addresses a post by its POST id,
-	// which is the archetype's `target_model_id`. Re-read through the one surface
-	// an editor's token can use, so what comes back is what the editor loads.
-	const record = unwrapArchetypeRecord(apexResponse.body);
-	const postId = record ? cleanString(record.target_model_id) : '';
-	if (!postIdSchema.safeParse(postId).success) return bffError(502, 'unexpected upstream shape');
-
+	// Re-read through the one surface an editor's token can use, so what comes back
+	// is what the editor loads.
 	const loaded = await buildPostLoad(contract, guard.apex, params.schema, postId);
-	if (!loaded) return bffError(502, 'unexpected upstream shape');
+	if (!loaded) {
+		// The post EXISTS and this operation can name it, so the `accepted` row above
+		// is true and stays. What must not happen is that the failure of the read that
+		// follows leaves no trace: without this row the log says a create succeeded and
+		// is silent about the 502 the editor was actually sent.
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: { schema: params.schema, postId, reason: 'post-create-read-failed' }
+		});
+		return bffError(502, 'unexpected upstream shape');
+	}
 	return noStoreJson({ ok: true, ...loaded }, 201);
 }

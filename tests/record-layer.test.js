@@ -533,6 +533,86 @@ describe('DELETE /records/:schema/:id — the in-use refusal', () => {
 			assert.equal(row.detail.strippedReferences, 2);
 			acceptedDb.close();
 		});
+
+		/**
+		 * P5 fix 3, item 5. `claimDetail`'s docblock says it is on EVERY audit row this
+		 * request can write. It was not: the uncountable-referrer rejection omitted it,
+		 * and the reference-count failure — which goes through `rejectMutation` and so
+		 * carries only whatever `meta.detail` holds — omitted it AND the target schema
+		 * and id. That last one is the rejection an operator would actually come back
+		 * to, because it is the one where the record still exists and nobody knows how
+		 * many things point at it.
+		 *
+		 * MUTATIONS: drop `...claimDetail` from the uncountable rejection — the first
+		 * case fails; pass bare `actorMeta` to `rejectMutation` again — the second
+		 * fails.
+		 */
+		it('the two REFUSAL rows carry the claim too, and the second names its target', async () => {
+			async function auditRows(db) {
+				return db.sqlite
+					.prepare('SELECT outcome, detail FROM bff_audit_log ORDER BY occurred_at, rowid')
+					.all()
+					.map((row) => ({ ...row, detail: JSON.parse(row.detail) }));
+			}
+
+			// Uncountable referrer. The default contract has `story` uncounted.
+			const uncountableDb = await createMigratedDatabase();
+			const uncountable = ctxWith(
+				{
+					async listContentLibrary() {
+						throw new Error('must not read');
+					},
+					async deleteContentLibraryRecord() {
+						throw new Error('must not delete');
+					}
+				},
+				uncountableDb
+			);
+			const refused = await handleDeleteRecord(
+				req(await signIn(uncountable), { confirm: true, confirmReferenceCount: 2 }),
+				uncountable,
+				params
+			);
+			assert.equal(refused.status, 409);
+			const [uncountableRow] = await auditRows(uncountableDb);
+			assert.equal(uncountableRow.outcome, 'rejected');
+			assert.equal(uncountableRow.detail.reason, 'uncountable-references');
+			assert.equal(uncountableRow.detail.confirmationAttempted, true);
+			assert.equal(uncountableRow.detail.confirmedReferenceCount, 2);
+			assert.equal(uncountableRow.detail.confirmedCountMalformed, false);
+			uncountableDb.close();
+
+			// The count read itself failed: fail closed, and say what could not be counted.
+			const unreadableDb = await createMigratedDatabase();
+			const unreadable = {
+				...ctxWith(
+					{
+						async listContentLibrary() {
+							return { status: 500, ok: false, body: {} };
+						},
+						async deleteContentLibraryRecord() {
+							throw new Error('must not delete');
+						}
+					},
+					unreadableDb
+				),
+				contract: countableOnly
+			};
+			const failed = await handleDeleteRecord(
+				req(await signIn(unreadable), { confirm: true, confirmReferenceCount: 2 }),
+				unreadable,
+				params
+			);
+			assert.equal(failed.status, 502);
+			const [unreadableRow] = await auditRows(unreadableDb);
+			assert.equal(unreadableRow.outcome, 'rejected');
+			assert.equal(unreadableRow.detail.reason, 'reference-check-failed');
+			assert.equal(unreadableRow.detail.schema, params.schema, 'the target, which was missing');
+			assert.equal(unreadableRow.detail.recordId, params.recordId, 'and its id');
+			assert.equal(unreadableRow.detail.confirmationAttempted, true);
+			assert.equal(unreadableRow.detail.confirmedReferenceCount, 2);
+			unreadableDb.close();
+		});
 	});
 });
 
@@ -579,13 +659,19 @@ describe('allowedSchemaSlugs — a post archetype is unreachable, not merely dis
 });
 
 describe('the write path refuses what must never reach Apex', () => {
-	function apexRecording() {
+	// `new-1` used to stand in for a created id here. Apex mints uuids — measured on
+	// local Apex across pages, archetype models and content-library entities — and
+	// since P5 fix 3 the create handler REFUSES anything else rather than putting it
+	// in the re-read URL, so the stub has to answer what Apex answers.
+	const NEW_RECORD = 'c0ffee00-1111-4222-8333-444444444444';
+	function apexRecording({ createdId = NEW_RECORD, rereadStatus = 200 } = {}) {
 		const writes = [];
 		return {
 			writes,
 			async createContentLibraryRecord(slug, fields) {
 				writes.push({ slug, fields });
-				return { status: 201, ok: true, body: { data: { id: 'new-1', updated_at: 'now' } } };
+				if (createdId === null) return { status: 201, ok: true, body: { data: {} } };
+				return { status: 201, ok: true, body: { data: { id: createdId, updated_at: 'now' } } };
 			},
 			async listContentLibrary() {
 				return {
@@ -595,7 +681,8 @@ describe('the write path refuses what must never reach Apex', () => {
 				};
 			},
 			async getContentLibraryRecord() {
-				return { status: 200, ok: true, body: { data: { id: 'new-1', updated_at: 'now' } } };
+				if (rereadStatus !== 200) return { status: rereadStatus, ok: false, body: {} };
+				return { status: 200, ok: true, body: { data: { id: NEW_RECORD, updated_at: 'now' } } };
 			}
 		};
 	}
@@ -617,8 +704,9 @@ describe('the write path refuses what must never reach Apex', () => {
 				: [],
 		referenceItems: () => []
 	};
-	function ctxWith(apex) {
+	function ctxWith(apex, db) {
 		return {
+			...(db ? { db } : {}),
 			allowedOrigins: parseAllowedOrigins(ORIGIN),
 			sessions: createMemorySessionStore(),
 			auth: {
@@ -694,6 +782,74 @@ describe('the write path refuses what must never reach Apex', () => {
 		assert.equal(response.status, 201);
 		assert.equal(apex.writes.length, 1);
 		assert.doesNotMatch(String(apex.writes[0].fields.title), /javascript:/);
+	});
+
+	/**
+	 * P5 fix 3, item 2 — the same rule `handleCreateEntity` got, applied here.
+	 *
+	 * `createRecord` wrote `accepted` before it knew the 2xx carried a usable id, and
+	 * could then answer 502 while the log said the operation had been accepted. The
+	 * id check was "nonempty string", so a non-uuid would have been interpolated
+	 * straight into the re-read URL below. And the post-create RE-READ could fail
+	 * with no trace at all: the write really did land, so `accepted` is true and
+	 * stays — but the 502 the editor was sent has to be in the log too.
+	 *
+	 * MUTATIONS: audit `apexResponse.ok ? 'accepted' : 'apex_error'` again — the
+	 * first two cases fail; drop the second `auditOutcome` in the re-read branch —
+	 * the third fails.
+	 */
+	it('a 2xx it cannot NAME is `upstream_shape_error`, and a failed re-read is logged', async () => {
+		async function rows(db) {
+			return db.sqlite
+				.prepare('SELECT outcome, detail FROM bff_audit_log ORDER BY occurred_at, rowid')
+				.all()
+				.map((row) => ({ ...row, detail: JSON.parse(row.detail) }));
+		}
+		async function create(options) {
+			const db = await createMigratedDatabase();
+			const ctx = ctxWith(apexRecording(options), db);
+			const response = await handleCreateRecord(
+				post(await signIn(ctx), { fields: { title: 'x' } }),
+				ctx,
+				{ schema: 'focus_area' }
+			);
+			const audit = await rows(db);
+			db.close();
+			return { response, audit };
+		}
+
+		const missing = await create({ createdId: null });
+		assert.equal(missing.response.status, 502);
+		assert.equal(missing.audit.length, 1);
+		assert.equal(missing.audit[0].outcome, 'upstream_shape_error');
+		assert.equal(missing.audit[0].detail.reason, 'missing-record-id');
+		assert.equal(missing.audit[0].detail.recordId, null);
+
+		const junk = await create({ createdId: 'new-1' });
+		assert.equal(junk.response.status, 502);
+		assert.equal(junk.audit[0].outcome, 'upstream_shape_error');
+		assert.equal(junk.audit[0].detail.reason, 'malformed-record-id');
+		assert.equal(junk.audit[0].detail.returnedId, 'new-1');
+
+		// The re-read failure: TWO rows. The create is genuinely accepted — the record
+		// exists and is named — and the second row is the only trace of the 502.
+		const unread = await create({ rereadStatus: 500 });
+		assert.equal(unread.response.status, 502);
+		assert.equal(unread.audit.length, 2);
+		assert.equal(unread.audit[0].outcome, 'accepted');
+		assert.equal(unread.audit[0].detail.recordId, NEW_RECORD);
+		assert.equal(unread.audit[1].outcome, 'apex_error');
+		assert.equal(unread.audit[1].detail.reason, 'post-create-read-failed');
+		assert.equal(unread.audit[1].detail.recordId, NEW_RECORD);
+		assert.equal(unread.audit[1].detail.apexStatus, 500);
+
+		// The control: one row, accepted, and the record named in it.
+		const good = await create();
+		assert.equal(good.response.status, 201);
+		assert.equal(good.audit.length, 1);
+		assert.equal(good.audit[0].outcome, 'accepted');
+		assert.equal(good.audit[0].detail.recordId, NEW_RECORD);
+		assert.ok(!('reason' in good.audit[0].detail));
 	});
 
 	it('answers a JSON 500 — not a framework error page — when no contract is configured', async () => {

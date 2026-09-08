@@ -45,6 +45,24 @@
 // Shape 4 gets a rule of its own: `richTextHtml` REFUSES it rather than reading
 // `''` off a missing `html` key. Returning `''` would make an edit look like a
 // deletion, and a write-back would wipe a GLC article body.
+//
+// ── THE SECOND DEFECT, FIXED THE SAME WAY ──────────────────────────────────
+// Regenerating `content` for a `quilljs` field used to build the delta from
+// `richTextPlainText()` — MARKUP STRIPPED — so the whole document became ONE
+// UNATTRIBUTED INSERT. That is not cosmetic, because Apex's own CMS UI LOADS ITS
+// EDITOR FROM `content`, NOT FROM `html`
+// (`apex-cms-template/.../RichTextArchetypeSchemaItem.svelte:47-48`,
+// `quill.setContents(parsedValue.content)`), and writes both back at `:59-62`. So
+// a heading or a bold run entered here vanished the moment the record was opened
+// in the CMS, and that UI's next save wrote the loss into `html` too.
+//
+// `htmlToDelta` (`./html-to-delta.js`) is the repair: a real HTML→Delta
+// conversion over the union of what BOTH toolbars can produce, measured against
+// the Quill version the CMS pins. Rule C below is unchanged — the dialect still
+// branches on the editor name; what changed is that the quilljs branch now
+// produces a faithful delta instead of a flattened one.
+
+import { htmlToDelta } from './html-to-delta.js';
 
 const HTML_TAG = /<\/?[a-z][^>]*>/iu;
 
@@ -107,11 +125,15 @@ export function richTextHtml(value) {
 /**
  * Editable plain text from a stored rich-text value (or a bare string).
  *
- * This is what builds the Quill delta below, which is why it is exported under a
- * name of its own rather than inlined. NOT called `richTextToPlainText`: that name
- * was renamed away in `sanitize/html.js` to `plainTextForAttribute`, which carries a
- * "SAFE SINK ONLY — must NEVER feed `{@html}`" warning, and reusing it here for a
- * different contract is how two functions end up confused for one.
+ * It USED to be what built the Quill delta below, which is why it is exported
+ * under a name of its own rather than inlined — and why that delta carried no
+ * formatting. `htmlToDelta` took that job; this is now the plain-text READING of a
+ * stored value, kept exported because the package's export map is a total wildcard
+ * over `src/`, so removing it is a breaking change for a function nothing is
+ * broken by. NOT called `richTextToPlainText`: that name was renamed away in
+ * `sanitize/html.js` to `plainTextForAttribute`, which carries a "SAFE SINK ONLY —
+ * must NEVER feed `{@html}`" warning, and reusing it here for a different contract
+ * is how two functions end up confused for one.
  *
  * @param {unknown} value
  * @returns {string}
@@ -181,10 +203,11 @@ export function plainToRichText(text, previous, options = {}) {
 	// editor name declares. A Quill delta into a tiptap field would be a ProseMirror
 	// document's slot holding a Quill one — the same class of error as the rewrite
 	// this module exists to stop, pointing the other way.
-	let content = {};
-	if (editor === 'quilljs') {
-		const plain = richTextPlainText(html);
-		content = { ops: plain ? [{ insert: `${plain}\n` }] : [] };
-	}
+	//
+	// The delta is built from the MARKUP, not from the flattened text. It is the
+	// only copy of the value Apex's CMS UI reads, so a plain-text delta beside a
+	// formatted `html` is a silent one-way loss the moment anyone opens the record
+	// there.
+	const content = editor === 'quilljs' ? htmlToDelta(html) : {};
 	return { editor, html, content };
 }

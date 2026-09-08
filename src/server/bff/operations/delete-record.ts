@@ -159,6 +159,13 @@ export async function handleDeleteRecord(
 				schema: params.schema,
 				recordId: idResult.data,
 				reason: 'uncountable-references',
+				// The claim, on this row too. `claimDetail`'s docblock promises it is on
+				// EVERY row this request can write, and it was missing from this one and
+				// from the reference-count failure below — so the log could not tell a
+				// caller that sent `confirm=1&confirmReferenceCount=2` and was refused for
+				// an uncountable referrer from one that never confirmed anything
+				// (codex's P5 fix review, 2026-09-08).
+				...claimDetail,
 				uncountedReferrers: uncounted
 			}
 		});
@@ -177,7 +184,29 @@ export async function handleDeleteRecord(
 		// Fail CLOSED. An unknown count is not zero: if a referring collection cannot
 		// be read, the one thing we cannot do is proceed as though nothing pointed at
 		// this record. The editor is told to try again; nothing is deleted.
-		return rejectMutation(ctx, actorMeta, 502, 'reference check failed', 'reference check failed');
+		//
+		// The row names the TARGET and the CLAIM. `rejectMutation` writes whatever
+		// `meta.detail` holds, and `actorMeta` holds none — so this row used to say
+		// only that a delete was rejected, not which record, in which collection, or
+		// what the caller had agreed to. That is the one rejection an operator would
+		// come back to, because it is the one where the record still exists and
+		// nobody knows how many things point at it.
+		return rejectMutation(
+			ctx,
+			{
+				...actorMeta,
+				detail: {
+					schema: params.schema,
+					recordId: idResult.data,
+					reason: 'reference-check-failed',
+					...claimDetail,
+					uncountedReferrers: uncounted
+				}
+			},
+			502,
+			'reference check failed',
+			'reference check failed'
+		);
 	}
 	const referenceCount = counted.count;
 

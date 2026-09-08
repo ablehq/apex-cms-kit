@@ -24,6 +24,7 @@ import {
 } from '../src/server/bff/operations/update-post.ts';
 import { handleGetPost } from '../src/server/bff/operations/get-post.ts';
 import { handleCreatePost } from '../src/server/bff/operations/create-post.ts';
+import { createMigratedDatabase } from './harness/d1.ts';
 import { handleDeletePost } from '../src/server/bff/operations/delete-post.ts';
 import {
 	handlePatchPostStatus,
@@ -546,7 +547,13 @@ function apexStub(calls, options = {}) {
 					}
 				};
 			}
-			return { ok: true, status: 200, body: { data: { id: ARCH, target_model_id: POST } } };
+			if (options.createdPostId === null)
+				return { ok: true, status: 200, body: { data: { id: ARCH } } };
+			return {
+				ok: true,
+				status: 200,
+				body: { data: { id: ARCH, target_model_id: options.createdPostId ?? POST } }
+			};
 		},
 		async updatePostFields(id, fields) {
 			calls.push(['updatePostFields', id, fields]);
@@ -567,8 +574,9 @@ function apexStub(calls, options = {}) {
 	};
 }
 
-function ctxWith(calls, options) {
+function ctxWith(calls, options, db) {
 	return {
+		...(db ? { db } : {}),
 		allowedOrigins: parseAllowedOrigins(ORIGIN),
 		reviewOnlyFields: [],
 		sessions: createMemorySessionStore(),
@@ -1002,5 +1010,84 @@ describe('the status route does not put a post status in a key called `status`',
 			calls.filter((call) => call[0] === 'changePostStatus'),
 			[['changePostStatus', POST, 'publish']]
 		);
+	});
+});
+
+describe('create — the audit row may not contradict the response', () => {
+	/**
+	 * P5 fix 3, item 2 — the same rule `handleCreateEntity` got, applied here.
+	 *
+	 * `createPost` wrote `accepted` before it knew the 2xx carried a usable post id,
+	 * and could then answer 502 while the log said the operation had been accepted.
+	 * The post id is the archetype's `target_model_id`, so an idless or malformed
+	 * archetype echo is the case that matters. And the post-create RE-READ could fail
+	 * with no trace: the post really does exist and is named, so `accepted` is true
+	 * and stays — but the 502 the editor was sent has to be in the log too.
+	 *
+	 * MUTATIONS: audit `apexResponse.ok ? 'accepted' : 'apex_error'` again — the
+	 * first two cases fail; drop the second `auditOutcome` in the `!loaded` branch —
+	 * the third fails.
+	 */
+	const OTHER_POST = 'bbbbbbbb-1111-2222-3333-444444444444';
+
+	async function rows(db) {
+		return db.sqlite
+			.prepare('SELECT outcome, detail FROM bff_audit_log ORDER BY occurred_at, rowid')
+			.all()
+			.map((row) => ({ ...row, detail: JSON.parse(row.detail) }));
+	}
+
+	async function create(options) {
+		const db = await createMigratedDatabase();
+		const ctx = ctxWith([], options, db);
+		const session = await signIn(ctx);
+		const res = await handleCreatePost(
+			request('/api/admin/posts/story', 'POST', { title: 'T', slug: 'a-story' }, session),
+			ctx,
+			{ schema: 'story' }
+		);
+		const audit = await rows(db);
+		db.close();
+		return { res, audit };
+	}
+
+	it('an archetype echo with NO target_model_id is `upstream_shape_error`', async () => {
+		const { res, audit } = await create({ createdPostId: null });
+		assert.equal(res.status, 502);
+		assert.equal(audit.length, 1);
+		assert.equal(audit[0].outcome, 'upstream_shape_error');
+		assert.equal(audit[0].detail.reason, 'missing-post-id');
+		assert.equal(audit[0].detail.postId, null);
+	});
+
+	it('a NON-UUID target_model_id is `malformed-post-id`, and keeps the raw value', async () => {
+		const { res, audit } = await create({ createdPostId: 'yes' });
+		assert.equal(res.status, 502);
+		assert.equal(audit[0].outcome, 'upstream_shape_error');
+		assert.equal(audit[0].detail.reason, 'malformed-post-id');
+		assert.equal(audit[0].detail.returnedId, 'yes');
+	});
+
+	it('a failed post-create RE-READ stays accepted AND records the read failure', async () => {
+		// The post exists and this operation can name it, so the acceptance is true.
+		// Without the second row the log would say a create succeeded and be silent
+		// about the 502 the editor was actually sent.
+		const { res, audit } = await create({ createdPostId: OTHER_POST });
+		assert.equal(res.status, 502);
+		assert.equal(audit.length, 2);
+		assert.equal(audit[0].outcome, 'accepted');
+		assert.equal(audit[0].detail.postId, OTHER_POST);
+		assert.equal(audit[1].outcome, 'apex_error');
+		assert.equal(audit[1].detail.reason, 'post-create-read-failed');
+		assert.equal(audit[1].detail.postId, OTHER_POST);
+	});
+
+	it('the control: a real uuid is accepted, ONE row, and the post named in it', async () => {
+		const { res, audit } = await create({});
+		assert.equal(res.status, 201);
+		assert.equal(audit.length, 1);
+		assert.equal(audit[0].outcome, 'accepted');
+		assert.equal(audit[0].detail.postId, POST);
+		assert.ok(!('reason' in audit[0].detail));
 	});
 });

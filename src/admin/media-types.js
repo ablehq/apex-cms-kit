@@ -47,25 +47,42 @@
  * tenants — lives upstream.
  *
  * ── THE SIZE LIMIT IS THIS KIT'S POLICY, NOT APEX'S CAP ───────────────────────
- * The two backends disagree with each other, on the number AND on where it is
- * enforced: the branch this was measured against validates `less_than: 25.megabytes`
- * at FINALIZE (after the bytes are already stored), while `origin/master` validates
- * `less_than_or_equal_to: 30.megabytes` at SIGN. The kit therefore sets its own limit,
- * chosen to hold under BOTH, and refusing in the browser means an oversized file costs
- * no upload at all rather than a 25 MiB round trip that ends in a 422 — and, worse, an
- * orphaned 25 MiB blob nothing sweeps. Apex's own refusal is still surfaced verbatim if
- * it ever fires.
+ * This block used to say the two backends disagreed — `less_than: 25.megabytes` at
+ * FINALIZE on one, `less_than_or_equal_to: 30.megabytes` at SIGN on the other. THEY
+ * DO NOT. Re-read 2026-09-08 across both refs of the Apex checkout:
  *
- * The comparison is STRICTLY LESS THAN, and the boundary byte is not a detail: Rails'
- * `less_than: 25.megabytes` refuses a file of exactly 26,214,400 bytes, measured — sign
- * 200, PUT 204, finalize 422 "File file size must be less than 25 MB". An inclusive
- * limit would pass that exact size through this gate and into the failure the gate
- * exists to prevent. One byte under is the largest size proved to land.
+ *   origin/master:app/models/medium.rb:11             size: {less_than_or_equal_to: 30.megabytes}
+ *   origin/master:app/models/medium/blob_input.rb:11        less_than_or_equal_to: 30.megabytes
+ *
+ * — and the local checkout, which is a DESCENDANT of `origin/master`, carries both
+ * files unchanged. BOTH legs, on BOTH refs, are the same inclusive 30 MB. The
+ * `less_than: 25.megabytes` this block attributed to the media path belongs to
+ * `app/models/bulk_upload.rb:10`, a different model that this upload path never
+ * touches. (Plan 07 §3.7.4 carried the same wrong reading; corrected by the
+ * orchestrator. Found by the P8 brief's measurement, codex's P5 fix review,
+ * 2026-09-08.)
+ *
+ * What survives the correction is the CONCLUSION, unchanged: the kit sets its OWN
+ * limit rather than mirroring Apex's. 25 MB sits a clear margin under the 30 MB both
+ * legs enforce, so this gate cannot become the thing that lets a file through into a
+ * 422 — and refusing in the browser means an oversized file costs no upload at all,
+ * rather than a full round trip that ends in a rejection and, worse, an orphaned blob
+ * nothing sweeps. Apex's own refusal is still surfaced verbatim if it ever fires.
+ *
+ * The comparison is STRICTLY LESS THAN. Against a 30 MB inclusive backend the
+ * boundary byte at 25 MB is not the difference between landing and failing — nothing
+ * upstream refuses 26,214,400 bytes today — so this is a limit chosen to be quotable
+ * as a round "25 MB" to an editor, not an upstream boundary being tracked. Do not
+ * "fix" it to `<=` on the strength of that: `MAX_UPLOAD_LABEL` says 25 MB, and a
+ * 26,214,400-byte file is 25 MB exactly, so an inclusive test would let through a
+ * file the message says it will not.
  */
 
 /**
- * The size limit, in bytes. A file must be strictly SMALLER than this — 26,214,399
- * bytes is the largest that uploads, and is proved to.
+ * The size limit, in bytes. A file must be strictly SMALLER than this: 26,214,399
+ * bytes is the largest this gate admits. It is the KIT's limit — Apex's own is the
+ * inclusive 30 MB on both legs (see above) — so the largest file that actually
+ * uploads is bounded by this, not by the backend.
  */
 export const UPLOAD_LIMIT_BYTES = 25 * 1024 * 1024;
 

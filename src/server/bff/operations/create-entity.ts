@@ -11,6 +11,7 @@ import {
 } from '../reject';
 import { sanitizeFieldValue } from '../../../sanitize/write-boundary';
 import { ENTITY_TYPE_REF } from '../apex-admin-client';
+import { createdIdOutcome, judgeCreatedId, shapeFaultDetail } from './created-id';
 import type { BffContext } from '../context';
 
 /**
@@ -103,14 +104,6 @@ function returnedEntityId(body: unknown): string | null {
 	return typeof data.id === 'string' ? data.id : null;
 }
 
-/**
- * Apex mints entity ids as uuids. Anything else is a shape this operation does not
- * understand, and "nonempty string" is not the same check: a caller that puts the
- * returned value straight into a parent's `array_ref` array would be sending Apex's
- * validator something it will refuse — after the child already exists.
- */
-const ENTITY_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
-
 export async function handleCreateEntity(
 	request: Request,
 	ctx: BffContext,
@@ -175,39 +168,24 @@ export async function handleCreateEntity(
 	}
 
 	const apexResponse = await guard.apex.createEntity(entityType.data, fieldsData);
-	const returnedId = returnedEntityId(apexResponse.body);
-	/**
-	 * THE VERDICT, TAKEN BEFORE THE AUDIT IS WRITTEN.
-	 *
-	 * The audit used to be written first, `accepted` on any 2xx, and only then was an
-	 * idless body rejected with a 502 — so the log said this operation had accepted a
-	 * create it went on to refuse, and said nothing about the orphan that 2xx may well
-	 * have left behind. An audit row that contradicts the response is worse than no
-	 * row: it is the row an operator would trust (codex's P5 fix review, 2026-09-08).
-	 */
-	const entityId = returnedId && ENTITY_UUID.test(returnedId) ? returnedId : null;
-	const shapeFault = !apexResponse.ok
-		? null
-		: returnedId === null
-			? 'missing-entity-id'
-			: entityId === null
-				? 'malformed-entity-id'
-				: null;
+	// THE VERDICT, TAKEN BEFORE THE AUDIT IS WRITTEN. The rule and the reasoning are
+	// in `created-id.ts`, shared with the three sibling create handlers that had the
+	// same contradiction and did not originally get this fix.
+	const verdict = judgeCreatedId(apexResponse.ok, returnedEntityId(apexResponse.body), 'entity');
+	const entityId = verdict.id;
 
 	await auditOutcome(ctx, meta, guard.actor, {
 		// `upstream_shape_error`, NOT `accepted`: Apex answered 2xx, so a row almost
 		// certainly exists, and this operation cannot name it. That is neither a clean
 		// acceptance nor an upstream refusal, and calling it either loses the one fact
 		// that matters — an entity may be out there that nothing references.
-		outcome: !apexResponse.ok ? 'apex_error' : shapeFault ? 'upstream_shape_error' : 'accepted',
+		outcome: createdIdOutcome(apexResponse.ok, verdict),
 		detail: {
 			entityType: entityType.data,
 			entityId,
 			// The RAW value, capped, only when it is unusable — the handle an operator
 			// has on a row this handler could not name.
-			...(shapeFault
-				? { reason: shapeFault, returnedId: returnedId === null ? null : returnedId.slice(0, 120) }
-				: {}),
+			...shapeFaultDetail(verdict),
 			fields: Object.keys(parsed.data.fields_data),
 			apexStatus: apexResponse.status
 		}

@@ -6,6 +6,7 @@ import { rejectGuardFailure, rejectMutation } from '../reject';
 import { unwrapArchetypeRecord } from '../archetype-record';
 import { computePageVersion } from '../page-version';
 import { getPageSlugValidationError } from '../../../cms/page-slug-validation.js';
+import { createdIdOutcome, judgeCreatedId, shapeFaultDetail } from './created-id';
 import { rejectedWriteResponse } from './post-shape';
 import type { BffContext } from '../context';
 
@@ -76,18 +77,30 @@ export async function handleCreatePage(request: Request, ctx: BffContext): Promi
 		summary: parsed.data.summary ?? ''
 	});
 
+	// THE VERDICT, TAKEN BEFORE THE AUDIT IS WRITTEN — the rule and the reasoning are
+	// in `created-id.ts`. This handler used to audit `accepted` on any 2xx and then
+	// answer 502 for an idless body, and its id check was `typeof page.id ===
+	// 'string'`, which accepts the EMPTY STRING: an empty id reached the response as
+	// `page.id` and would have been interpolated into the next Apex URL the editor
+	// asked for (codex's P5 fix review, 2026-09-08).
+	const page = unwrapArchetypeRecord(apexResponse.body);
+	const verdict = judgeCreatedId(apexResponse.ok, page ? page.id : null, 'page');
+
 	await auditOutcome(ctx, meta, guard.actor, {
-		outcome: apexResponse.ok ? 'accepted' : 'apex_error',
-		detail: { slug: parsed.data.slug, apexStatus: apexResponse.status }
+		outcome: createdIdOutcome(apexResponse.ok, verdict),
+		detail: {
+			slug: parsed.data.slug,
+			pageId: verdict.id,
+			...shapeFaultDetail(verdict),
+			apexStatus: apexResponse.status
+		}
 	});
 
 	// Apex's own validation: `409 slug-taken` when the slug is what it refused,
 	// `422 invalid` with the field errors otherwise — the same rule as the posts.
 	if (apexResponse.status === 422) return rejectedWriteResponse(apexResponse.body);
 	if (!apexResponse.ok) return bffError(502, 'upstream error');
-
-	const page = unwrapArchetypeRecord(apexResponse.body);
-	if (!page || typeof page.id !== 'string') return bffError(502, 'unexpected upstream shape');
+	if (!page || !verdict.id) return bffError(502, 'unexpected upstream shape');
 
 	// The create echo carries the whole page (blocks `[]`, the SEO triple), so the
 	// version can be computed from it; the editor re-reads on open anyway.

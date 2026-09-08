@@ -9,6 +9,7 @@ import {
 	rejectMutation
 } from '../reject';
 import { cleanString, unwrapArchetypeRecord } from '../archetype-record';
+import { createdIdOutcome, judgeCreatedId, shapeFaultDetail } from './created-id';
 import { recordBodySchema, referenceFieldNames, summarizeRecord } from './record-shape';
 import { childListFieldNames } from './child-list';
 import { toApexFields } from './update-record';
@@ -138,9 +139,27 @@ export async function handleCreateRecord(
 	const fields = toApexFields(parsed.data.fields ?? {});
 	const apexResponse = await guard.apex.createContentLibraryRecord(params.schema, fields);
 
+	// THE VERDICT, TAKEN BEFORE THE AUDIT IS WRITTEN — the rule and the reasoning are
+	// in `created-id.ts`. This handler used to audit `accepted` on any 2xx and then
+	// answer 502 for an idless body, and it checked only that the id was a nonempty
+	// string before interpolating it into the re-read URL below (codex's P5 fix
+	// review, 2026-09-08).
+	const created = unwrapArchetypeRecord(apexResponse.body);
+	const verdict = judgeCreatedId(
+		apexResponse.ok,
+		created ? cleanString(created.id) : null,
+		'record'
+	);
+
 	await auditOutcome(ctx, meta, guard.actor, {
-		outcome: apexResponse.ok ? 'accepted' : 'apex_error',
-		detail: { schema: params.schema, fields: Object.keys(fields), apexStatus: apexResponse.status }
+		outcome: createdIdOutcome(apexResponse.ok, verdict),
+		detail: {
+			schema: params.schema,
+			recordId: verdict.id,
+			...shapeFaultDetail(verdict),
+			fields: Object.keys(fields),
+			apexStatus: apexResponse.status
+		}
 	});
 
 	if (!apexResponse.ok) {
@@ -149,9 +168,8 @@ export async function handleCreateRecord(
 		return noStoreJson({ error: 'upstream error', status: apexResponse.status }, status);
 	}
 
-	const created = unwrapArchetypeRecord(apexResponse.body);
-	const recordId = created ? cleanString(created.id) : '';
-	if (!recordId) return bffError(502, 'unexpected upstream shape');
+	const recordId = verdict.id;
+	if (recordId === null) return bffError(502, 'unexpected upstream shape');
 
 	// Proved by an independent re-read, not by the create echo. Apex's create
 	// response comes back with `primitives: {}` — the flattened read model has not
@@ -159,9 +177,23 @@ export async function handleCreateRecord(
 	// hand the browser a record with no values and the list would show a blank row
 	// for a record that is fine. A 200 is not evidence.
 	const reread = await guard.apex.getContentLibraryRecord(params.schema, recordId);
-	if (!reread.ok) return bffError(502, 'upstream error');
-	const record = unwrapArchetypeRecord(reread.body);
-	if (!record) return bffError(502, 'unexpected upstream shape');
+	const record = reread.ok ? unwrapArchetypeRecord(reread.body) : null;
+	if (!record) {
+		// The record EXISTS and this operation can name it, so the `accepted` row above
+		// is true and stays. Without this second row the log would say a create
+		// succeeded and be silent about the 502 the editor was actually sent, which is
+		// the same contradiction the verdict above exists to stop, one step later.
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: {
+				schema: params.schema,
+				recordId,
+				reason: 'post-create-read-failed',
+				apexStatus: reread.status
+			}
+		});
+		return bffError(502, reread.ok ? 'unexpected upstream shape' : 'upstream error');
+	}
 
 	return noStoreJson({ ok: true, record: summarizeRecord(contract, params.schema, record) }, 201);
 }

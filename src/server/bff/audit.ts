@@ -47,8 +47,9 @@ export interface AuditEntry {
 	 *   value because it is neither of its neighbours, and auditing it as `accepted`
 	 *   put a row in the log that contradicted the 502 the caller was sent.
 	 *
-	 * (The `0001` migration's comment lists the first three; the column is free
-	 * text and nothing reads it as an enum.)
+	 * (The `0001` migration's comment in all three repos now lists all four; the
+	 * column is free text and nothing reads it as an enum, so the comment is
+	 * documentation rather than a constraint.)
 	 */
 	outcome: 'accepted' | 'rejected' | 'apex_error' | 'upstream_shape_error';
 	detail?: unknown;
