@@ -823,6 +823,12 @@ function apexStub(calls, options = {}, stored = {}) {
 			calls.push(['getDocument', id]);
 			const seen = calls.filter(([name]) => name === 'getDocument').length;
 			if (options.documentStatus === 'throw') throw new TypeError('network');
+			// A 2xx the client could not PARSE. It classes a non-JSON or truncated 200 as
+			// a shape error and hands back `body: null` with `ok: true` — the third door
+			// into the fail-open defect, and the one the status and throw guards miss.
+			if (options.documentShapeFault && (!options.shapeFaultAfterWrite || documentWritten)) {
+				return { ok: true, status: 200, body: null };
+			}
 			if (typeof options.documentStatus === 'number' && options.documentStatus >= 400) {
 				return { ok: false, status: options.documentStatus, body: null };
 			}
@@ -1536,6 +1542,23 @@ describe('save-post-body — a failed read, and a write that may have landed', (
 		assert.equal(calls.filter(([name]) => name === 'updateDocumentBlocks').length, 0);
 	});
 
+	it('(a″) a 2xx the client could NOT PARSE is a failed read, not an empty document', async () => {
+		// The third door into the same defect. `apex-admin-client` deliberately classes a
+		// non-JSON or truncated 200 as a SHAPE error — `{ok:true, status:200, body:null}` —
+		// so the status guard and the throw guard both wave it through. It used to reduce
+		// to `[]` here, which is the fail-open state this phase exists to remove.
+		const { res, calls, audit } = await saveBody({ documentShapeFault: true, stored: {} }, KEEP);
+		assert.equal(res.status, 502, 'a read that did not parse is 502, never a 409 or a 200');
+		assert.deepEqual(await res.json(), { error: 'upstream error' });
+		assert.equal(
+			calls.filter(([name]) => name === 'updateDocumentBlocks').length,
+			0,
+			'ZERO PATCHes'
+		);
+		assert.equal(audit[0].outcome, 'rejected');
+		assert.match(audit[0].detail.reason, /document unreadable/u);
+	});
+
 	it('(b) PATCH 200 then a failed re-read → `body-written-unread`, ONE patch, audited accepted', async () => {
 		const { res, calls, audit } = await saveBody({ documentStatusAfterWrite: 500, stored: {} }, [
 			...KEEP,
@@ -1737,15 +1760,25 @@ describe('get-post — an unreadable document is 502, a missing post is 404', ()
 			404
 		);
 
-		for (const documentStatus of [500, 'throw']) {
-			const ctx = ctxWith([], { documentStatus });
+		// The third case is a 2xx the client could not PARSE. It is the dangerous one:
+		// a 500 or a throw is visibly a failure, but an unparsed 200 used to reduce to
+		// `[]` and answer 200 with an EMPTY BODY and `hash([])`. The editor would open a
+		// post that has paragraphs, see "no body yet", retype it, and save — both sides
+		// agreeing on `hash([])`, so the diff emitted only creates and destroyed nothing.
+		// The document would then hold the old body underneath the new one.
+		for (const options of [
+			{ documentStatus: 500 },
+			{ documentStatus: 'throw' },
+			{ documentShapeFault: true }
+		]) {
+			const ctx = ctxWith([], options);
 			const s = await signIn(ctx);
 			const res = await handleGetPost(
 				request(`/api/admin/posts/story/${POST}`, 'GET', undefined, s),
 				ctx,
 				{ schema: 'story', postId: POST }
 			);
-			assert.equal(res.status, 502, `documentStatus=${documentStatus}`);
+			assert.equal(res.status, 502, JSON.stringify(options));
 			assert.deepEqual(await res.json(), { error: 'upstream error' });
 		}
 	});
@@ -1766,14 +1799,16 @@ describe('get-post — an unreadable document is 502, a missing post is 404', ()
 	it('the version read: 502 for an unreadable document — not a token that agrees with `[]`', async () => {
 		// Hashing an empty read produced a token the NEXT save then agreed with, so the
 		// stale check passed and the body was diffed against nothing.
-		const ctx = ctxWith([], { documentStatus: 500 });
-		const session = await signIn(ctx);
-		const res = await handleReadPostVersion(
-			request(`/api/admin/posts/story/${POST}/version`, 'GET', undefined, session),
-			ctx,
-			{ schema: 'story', postId: POST }
-		);
-		assert.equal(res.status, 502);
+		for (const options of [{ documentStatus: 500 }, { documentShapeFault: true }]) {
+			const ctx = ctxWith([], options);
+			const session = await signIn(ctx);
+			const res = await handleReadPostVersion(
+				request(`/api/admin/posts/story/${POST}/version`, 'GET', undefined, session),
+				ctx,
+				{ schema: 'story', postId: POST }
+			);
+			assert.equal(res.status, 502, JSON.stringify(options));
+		}
 	});
 });
 

@@ -476,8 +476,17 @@ export async function readDocumentBlocks(
 	}
 	if (!response.ok) return null;
 	const record = unwrapArchetypeRecord(response.body);
-	const blocks = record && Array.isArray(record.blocks) ? record.blocks : [];
-	return blocks
+	// A 2xx whose body did not parse is a FAILED read, not an empty document. The
+	// client classes a non-JSON or truncated 2xx as a shape error and hands back
+	// `body: null` (`apex-admin-client.ts`), which used to reduce to `[]` here and
+	// re-opened the fail-open door this function exists to close: `handleGetPost`
+	// would answer 200 with an empty body and `hash([])`, and a save made against
+	// that view emits nothing but creates, so the stored blocks survive UNDER the
+	// new ones. A healthy read always carries the key — `Cms::Document#as_json`
+	// emits `blocks` whenever the controller includes it, which it always does —
+	// so an absent or non-array `blocks` is upstream damage, never an empty body.
+	if (!record || !Array.isArray(record.blocks)) return null;
+	return record.blocks
 		.filter(isRecord)
 		.slice()
 		.sort((a, b) => Number(a.position ?? 0) - Number(b.position ?? 0));
