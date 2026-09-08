@@ -3,7 +3,12 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { publishContent } from '../src/server/content/publish.ts';
-import { CONTENT_KEY, readContent, resetContentMemo } from '../src/server/content/read.ts';
+import {
+	CONTENT_KEY,
+	installContentMemo,
+	readContent,
+	resetContentMemo
+} from '../src/server/content/read.ts';
 
 const ACCOUNT = '11111111-2222-4333-8444-555555555555';
 
@@ -603,6 +608,101 @@ describe('readContent', () => {
 				'the older snapshot never took the memo — a third read gets the newer one'
 			);
 			assert.equal(backwards.state.reads, readsBefore + 2, 'the memo was not refreshed either');
+		} finally {
+			Date.now = realNow;
+		}
+	});
+
+	it('a publish stamped BELOW the floor still leaves memo and floor describing one snapshot', async () => {
+		/**
+		 * OPUS O4. `installContentMemo` used to RAISE the floor
+		 * (`if (stamp > memoFloor)`), on the reasoning that a publish must never lower
+		 * a bar this isolate had already cleared. It breaks the invariant every other
+		 * line here depends on: THE MEMO AND THE FLOOR DESCRIBE THE SAME SNAPSHOT.
+		 *
+		 * The interleaving: this isolate reads a snapshot stamped T2, then publishes
+		 * one stamped T1 < T2 — which is not exotic, it is the same unsynchronised wall
+		 * clocks that made the floor necessary in the first place. Memo is now at T1,
+		 * floor still at T2. KV then answers a read with bytes at T1.5 — NEWER than
+		 * what this isolate holds — and `olderThanFloor` refuses them (T1.5 < T2) and
+		 * returns `memo ?? snapshot`, handing back T1: OLDER than the bytes it just
+		 * fetched, on the strength of a comment claiming the memo is past the floor.
+		 *
+		 * MUTATION: `memoFloor = stamp` → `if (stamp > memoFloor) memoFloor = stamp`
+		 * in `installContentMemo` fails the last assertion below.
+		 */
+		resetContentMemo();
+		const kv = memoryStore();
+
+		// T2: what this isolate has already seen.
+		await publishContent({
+			apex: stubApex(),
+			kv,
+			accountId: ACCOUNT,
+			publishedBy: 'e',
+			now: 200_000
+		});
+		const t2 = JSON.parse(kv.map.get(CONTENT_KEY));
+		assert.equal((await readContent(kv)).version, t2.version, 'the floor is now T2');
+
+		// T1 < T2: this isolate's own publish, on a clock behind the one that wrote T2.
+		await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'e', now: 100 });
+		const t1 = JSON.parse(kv.map.get(CONTENT_KEY));
+		assert.ok(
+			Date.parse(t1.publishedAt) < Date.parse(t2.publishedAt),
+			'the publish really is stamped below the snapshot already seen'
+		);
+		assert.equal(
+			(await readContent(kv)).version,
+			t1.version,
+			'the publisher serves what it published'
+		);
+
+		// T1.5: newer than the memo, older than the OLD floor. Written straight into the
+		// store, which is all this isolate can see of somebody else's publish.
+		const between = { ...t1, version: 'between', publishedAt: new Date(150_000).toISOString() };
+		kv.map.set(CONTENT_KEY, JSON.stringify(between));
+
+		const realNow = Date.now;
+		try {
+			Date.now = () => realNow() + 120_000; // past MEMO_TTL_MS, so the memo re-checks
+			assert.equal(
+				(await readContent(kv)).version,
+				'between',
+				'a snapshot NEWER than the memo is installed — the floor moved with the memo'
+			);
+		} finally {
+			Date.now = realNow;
+		}
+	});
+
+	it('installContentMemo with an unparseable stamp leaves the floor where it was', async () => {
+		// The one case that must NOT set the floor: "unknown age" is not "age zero", and
+		// dropping the bar to 0 would reopen the edge-cache hazard the floor exists for.
+		resetContentMemo();
+		const kv = memoryStore();
+		await publishContent({
+			apex: stubApex(),
+			kv,
+			accountId: ACCOUNT,
+			publishedBy: 'e',
+			now: 200_000
+		});
+		const good = JSON.parse(kv.map.get(CONTENT_KEY));
+		assert.equal((await readContent(kv)).version, good.version);
+
+		installContentMemo({ ...good, version: 'undated', publishedAt: 'whenever' });
+
+		const older = { ...good, version: 'older', publishedAt: new Date(1000).toISOString() };
+		kv.map.set(CONTENT_KEY, JSON.stringify(older));
+		const realNow = Date.now;
+		try {
+			Date.now = () => realNow() + 120_000;
+			assert.equal(
+				(await readContent(kv)).version,
+				'undated',
+				'the floor survived, so bytes below it are still refused'
+			);
 		} finally {
 			Date.now = realNow;
 		}

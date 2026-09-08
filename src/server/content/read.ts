@@ -60,10 +60,15 @@ let generation = 0;
  * above stops them being installed — and once installed they are served for a whole
  * `MEMO_TTL_MS`.
  *
- * Two things raise the floor, and between them they close both directions:
+ * Two things move the floor, and between them they close both directions:
  *
- *   1. every snapshot this isolate installs, so KV handing back bytes OLDER than the
- *      memo (the same eventual-consistency window, one TTL later) cannot replace it;
+ *   1. every snapshot this isolate installs — the floor is SET to that snapshot's
+ *      stamp, so the floor and the memo always describe the same bytes, and KV
+ *      handing back something OLDER than the memo (the same eventual-consistency
+ *      window, one TTL later) cannot replace it. A read only ever raises it, because
+ *      a read that would lower it is refused by this very test; `installContentMemo`
+ *      may lower it, and `installContentMemo` is the publisher saying which bytes
+ *      are now live (see its docblock);
  *   2. `resetContentMemo(publishedAt)` — the publish path KNOWS the timestamp it
  *      just wrote, and passes it, so the very next read cannot install anything
  *      older than the publish that invalidated the memo.
@@ -223,8 +228,25 @@ export function resetContentMemo(publishedAt?: string) {
  * Installing what we wrote removes the read entirely: there is nothing for the edge
  * cache to answer wrongly, the publisher sees its own publish immediately (which is
  * what the invalidation was for), and the publish costs ZERO extra KV reads instead
- * of one. The floor moves only UPWARD here — a publish must never lower a bar this
- * isolate has already cleared.
+ * of one.
+ *
+ * THE FLOOR IS SET TO THE INSTALLED STAMP, NOT RAISED TOWARDS IT (Opus O4). It used
+ * to move only upward, on the reasoning that a publish must never lower a bar this
+ * isolate had already cleared — which sounds right and breaks the one invariant
+ * `readContent` depends on: THE MEMO AND THE FLOOR DESCRIBE THE SAME SNAPSHOT.
+ * An isolate that has read a snapshot stamped T2 and then publishes one stamped
+ * T1 < T2 (the same unsynchronised wall clocks that motivated the floor) would hold
+ * `memo@T1` with `floor@T2`. `readContent`'s `olderThanFloor` branch then returns
+ * `memo ?? snapshot` on the strength of a comment saying "the memo is past the floor
+ * by construction" — and hands back a memo OLDER than the bytes KV just answered
+ * with. Setting the floor removes the case: memo and floor always move together.
+ *
+ * WHAT IS TRADED, stated because it is a real read property and not free: a
+ * publisher pins ITS OWN bytes for a full `MEMO_TTL_MS` even when it has previously
+ * seen a snapshot with a higher stamp. That is the correct direction — the publisher
+ * asked for these bytes to be live — and it is bounded by the TTL, where the
+ * alternative (a memo below its own floor) is a self-contradictory state with no
+ * bound on what it may serve.
  *
  * ⚠ ACCEPTED LIMITATION, and it is not fixable here. This orders what ONE isolate
  * serves. It does not order two isolates' WRITES: whichever `put` lands last wins
@@ -241,5 +263,8 @@ export function installContentMemo(snapshot: ContentSnapshot) {
 	memo = snapshot;
 	memoCheckedAt = Date.now();
 	const stamp = publishedAtMs(snapshot.publishedAt);
-	if (stamp !== null && stamp > memoFloor) memoFloor = stamp;
+	// SET, not raise: the floor describes the memo. An unparseable stamp leaves the
+	// floor where it is — the memo is then "unknown age", and lowering the bar to 0
+	// on it would reopen the edge-cache hazard the floor exists for.
+	if (stamp !== null) memoFloor = stamp;
 }

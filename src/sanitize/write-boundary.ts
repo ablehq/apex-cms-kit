@@ -57,6 +57,15 @@ export const MAX_FIELD_VALUE_CHARS = 200_000;
  * full decode is not a URL any editor typed; it is an encoding this judge cannot
  * read, and "cannot be read" must not resolve to "safe".
  *
+ * TWO NARROW FALSE POSITIVES, accepted (Opus O5, Fable FF6). A DOUBLE-ENCODED
+ * reference — `&amp;amp;`, `&amp;#x26;` — decodes ONCE here to `&amp;` / `&#x26;`,
+ * which still matches, so the value is refused; a browser also single-decodes it, to
+ * the harmless text `&amp;`. And `?a=1&#2024` in a query string looks like the start
+ * of a numeric reference. Both are refusals of something safe, which is the correct
+ * direction for a fail-closed rule — but a SILENT strip of a safe attribute is not,
+ * which is what `residualReferenceFieldNames` below exists to fix: the caller can
+ * now name the field and say why instead of quietly dropping the link.
+ *
  * Deliberately asymmetric: a NUMERIC reference is refused with or without its
  * semicolon, because a browser decodes `&#106` unterminated too, while a NAMED one is
  * refused only when terminated — an ordinary query string is full of `&name=value`
@@ -100,9 +109,22 @@ const EVENT_ATTRIBUTE = /(?:\s|(?<=["'/]))on[a-z0-9_:-]+\s*=\s*(?:"[^"]*"|'[^']*
  * attributeName="href" values="javascript:…">` needs no event attribute and no
  * `href` on the svg itself, so neither the handler strip nor the protocol allowlist
  * sees it. `form`, `button` and `input` bring `formaction`, which is a navigation
- * target spelled somewhere the allowlist was not looking. All five are dropped with
- * their contents, which is what `html.js` already does with them on the render side
- * (`DROP_WITH_CONTENT`) — the two lists are meant to agree.
+ * target spelled somewhere the allowlist was not looking. All five are dropped here
+ * with their contents.
+ *
+ * HOW THIS RELATES TO THE RENDER SIDE, precisely — the sentence that used to sit
+ * here said "the two lists are meant to agree", and they do not, because they are
+ * answering different questions. `html.js` has THREE lists: `DROP_WITH_CONTENT`
+ * (dropped with their contents at render — `script`, `style`, `iframe`, `object`,
+ * `embed`, `link`, `meta`, `base`, `svg`, `math` and more), `ALLOWED_TAGS` (kept),
+ * and everything else, which is UNWRAPPED: the tag goes and its text stays. `form`,
+ * `button` and `input` fall in that third bucket, so at render they lose their
+ * attributes and leave their text — inert, but not the same operation as the drop
+ * this list performs. `NEVER_ALLOWED` in `html.js` is the list that genuinely
+ * corresponds to this one: what a site may never add to the render allowlist, and
+ * it is a superset of both. The invariant that matters is not list equality, it is
+ * that NOTHING EXECUTABLE SURVIVES EITHER SIDE — which each list secures on its own,
+ * so neither depends on the other being right.
  */
 const EXECUTABLE_ELEMENT =
 	/<(script|style|iframe|object|embed|link|meta|base|svg|math|form|button|input)\b[^>]*>[\s\S]*?<\/\1\s*>|<\/?(?:script|style|iframe|object|embed|link|meta|base|svg|math|form|button|input)\b[^>]*>?/giu;
@@ -290,4 +312,56 @@ export function oversizedFieldNames(fields: unknown): string[] {
 		if (fieldValueChars(value) > MAX_FIELD_VALUE_CHARS) over.push(name);
 	}
 	return over;
+}
+
+/**
+ * Does this string carry a URL attribute that is being refused ONLY because it still
+ * holds a character reference after a full decode?
+ *
+ * The distinction matters. `sanitizeWriteHtml` drops a `javascript:` href, and that
+ * is a correct silent strip — nobody needs to be told their script was removed. It
+ * ALSO drops an href the decoder could not read, which is a different act: the value
+ * may be perfectly safe (`?a=1&#2024`, a double-encoded `&amp;amp;`) and the editor
+ * is simply told nothing while their link disappears. Fail-closed is right; failing
+ * SILENTLY is not.
+ */
+function hasResidualReferenceUrl(value: string): boolean {
+	if (!value.includes('<')) return false;
+	for (const match of value.matchAll(URL_ATTRIBUTE)) {
+		const raw = match[1] ?? match[2] ?? match[3] ?? '';
+		if (raw === '') continue;
+		if (RESIDUAL_REFERENCE.test(decodeReferences(raw))) return true;
+	}
+	return false;
+}
+
+/** Walk one field value the way `sanitizeFieldValue` does, looking for the above. */
+function residualReferenceInValue(value: unknown): boolean {
+	if (typeof value === 'string') return hasResidualReferenceUrl(value);
+	if (Array.isArray(value)) return value.some(residualReferenceInValue);
+	if (!value || typeof value !== 'object') return false;
+	return Object.values(value as Record<string, unknown>).some(residualReferenceInValue);
+}
+
+/**
+ * The names of the fields in one write that carry a URL this judge cannot read.
+ *
+ * OPUS O5. The shape is `oversizedFieldNames`': names rather than a boolean, so the
+ * refusal can say WHICH field, and the caller turns it into a typed 400
+ * (`unreadable-url` — `refuseUnreadableUrls` in `server/bff/reject.ts`). The two are
+ * deliberately the same shape and are called next to each other on every write path,
+ * because they are the same kind of rule: something about this write cannot be
+ * accepted, and the editor should be told which field to look at rather than left to
+ * find it by bisection or, worse, to discover afterwards that a link is gone.
+ *
+ * This does NOT widen what is stored. `sanitizeWriteHtml` still strips the attribute
+ * if the value ever reaches it; the write is simply refused first, with a reason.
+ */
+export function residualReferenceFieldNames(fields: unknown): string[] {
+	if (!fields || typeof fields !== 'object' || Array.isArray(fields)) return [];
+	const named: string[] = [];
+	for (const [name, value] of Object.entries(fields as Record<string, unknown>)) {
+		if (residualReferenceInValue(value)) named.push(name);
+	}
+	return named;
 }

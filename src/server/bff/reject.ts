@@ -1,7 +1,7 @@
 import { bffError } from './boundary';
 import { auditRejection } from './audit';
 import { resolveSession } from './guard';
-import { oversizedFieldNames } from '../../sanitize/write-boundary';
+import { oversizedFieldNames, residualReferenceFieldNames } from '../../sanitize/write-boundary';
 import type { GuardResult } from './guard';
 import type { BffContext } from './context';
 
@@ -86,7 +86,16 @@ export async function rejectGuardFailure(
 	guard: Extract<GuardResult, { ok: false }>
 ): Promise<Response> {
 	const session =
-		guard.status === 401 ? null : await resolveSession(request, ctx).catch(() => null);
+		guard.status === 401
+			? null
+			: // ATTRIBUTION ONLY (Opus O6). The request is already refused; the single
+				// question left is "whose editor session was it?". `{ refresh: false }`
+				// answers that from the row and stops there — no `sessions.delete` on an
+				// expired cookie, no upstream token refresh. Both are WRITES (D1, and an
+				// Apex round-trip) bought by a request that will not be served, on a path
+				// the open internet can reach; and a refused request is the worst possible
+				// moment to end somebody's session as a side effect.
+				await resolveSession(request, ctx, { refresh: false }).catch(() => null);
 	if (!session) return guard.response;
 	return rejectMutation(
 		ctx,
@@ -116,4 +125,35 @@ export async function refuseOversizedFields(
 	const over = oversizedFieldNames(fields);
 	if (over.length === 0) return null;
 	return rejectMutation(ctx, meta, 400, 'field-too-large', `field too large: ${over.join(', ')}`);
+}
+
+/**
+ * The unreadable-URL refusal, the twin of `refuseOversizedFields`.
+ *
+ * OPUS O5. `sanitizeWriteHtml` fails closed on a URL attribute that still carries a
+ * character reference after a full decode — correct, because the decoder's windows
+ * are narrower than a browser's and nothing re-escapes at the write boundary — but
+ * it did so by SILENTLY DROPPING the attribute. An editor whose link had a
+ * double-encoded `&amp;amp;` in it saved, got a 200, and found the link gone with no
+ * explanation. The known false positives are narrow and harmless
+ * (`residualReferenceFieldNames` names them), which is exactly why the answer is a
+ * typed refusal naming the field rather than a wider rule or a silent strip.
+ *
+ * Same call shape as the ceiling: `null` when nothing is wrong, a typed 400 when
+ * something is. Called on every write path that carries authored HTML.
+ */
+export async function refuseUnreadableUrls(
+	ctx: BffContext,
+	meta: RejectMeta,
+	fields: unknown
+): Promise<Response | null> {
+	const named = residualReferenceFieldNames(fields);
+	if (named.length === 0) return null;
+	return rejectMutation(
+		ctx,
+		meta,
+		400,
+		'unreadable-url',
+		`link cannot be read: ${named.join(', ')}`
+	);
 }

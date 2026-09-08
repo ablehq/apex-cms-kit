@@ -3,7 +3,12 @@ import { auditOutcome } from '../audit';
 import { containsReviewOnlyField } from '../authorization';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { refuseOversizedFields, rejectGuardFailure, rejectMutation } from '../reject';
+import {
+	refuseOversizedFields,
+	refuseUnreadableUrls,
+	rejectGuardFailure,
+	rejectMutation
+} from '../reject';
 import { sanitizeFieldValue } from '../../../sanitize/write-boundary';
 import type { BffContext } from '../context';
 
@@ -97,6 +102,11 @@ export async function handlePatchEntityFields(
 	// WHICH field is over the ceiling.
 	const tooLarge = await refuseOversizedFields(ctx, actorMeta, parsed.data.fields_data);
 	if (tooLarge) return tooLarge;
+	// The other half of the same rule (Opus O5): a URL attribute this judge cannot
+	// read is refused BY NAME rather than silently stripped on the way through the
+	// sanitizer, so an editor is told which field to look at.
+	const unreadable = await refuseUnreadableUrls(ctx, actorMeta, parsed.data.fields_data);
+	if (unreadable) return unreadable;
 
 	const fieldsData: Record<string, unknown> = {};
 	for (const [name, value] of Object.entries(parsed.data.fields_data)) {

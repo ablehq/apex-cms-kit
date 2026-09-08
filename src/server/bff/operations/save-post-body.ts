@@ -1,7 +1,12 @@
 import { auditOutcome } from '../audit';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { refuseOversizedFields, rejectGuardFailure, rejectMutation } from '../reject';
+import {
+	refuseOversizedFields,
+	refuseUnreadableUrls,
+	rejectGuardFailure,
+	rejectMutation
+} from '../reject';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import {
 	apexBlockRows,
@@ -62,6 +67,11 @@ export async function handleSavePostBody(
 	// blocks was the one. Run first, so the typed answer wins.
 	const tooLarge = await refuseOversizedFields(ctx, actor, blockHtmlValues(bodyJson));
 	if (tooLarge) return tooLarge;
+	// The other half of the same rule (Opus O5): a URL attribute this judge cannot
+	// read is refused BY NAME rather than silently stripped on the way through the
+	// sanitizer, so an editor is told which field to look at.
+	const unreadable = await refuseUnreadableUrls(ctx, actor, blockHtmlValues(bodyJson));
+	if (unreadable) return unreadable;
 
 	const parsed = savePostBodySchema.safeParse(bodyJson);
 	if (!parsed.success) return rejectMutation(ctx, actor, 400, 'invalid body', 'invalid body');

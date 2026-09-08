@@ -114,6 +114,74 @@ const DROP_WITH_CONTENT = new Set([
  */
 const VOID_DROP_TAGS = new Set(['base', 'embed', 'frame', 'link', 'meta']);
 
+/**
+ * WHAT A SITE MAY NEVER ADD TO THE ALLOWLIST — the refusal set `allowRichTextTags`
+ * checks, and a superset of `DROP_WITH_CONTENT`.
+ *
+ * The docblock on `allowRichTextTags` promises "nothing that executes, loads or
+ * navigates", and checking `DROP_WITH_CONTENT` alone did not keep that promise:
+ * `form`, `button`, `input`, `select` and `option` are the submission machinery
+ * (`formaction` is a navigation target spelled where a URL allowlist is not
+ * looking), `img` loads, `body` and `html` are document structure a fragment
+ * sanitizer must never emit, and `marquee` and `keygen` are legacy elements with
+ * their own parser quirks. `frame` and `frameset` are here as well as in
+ * `DROP_WITH_CONTENT` — belt and braces, and it makes this set readable on its own.
+ *
+ * Not exploitable today: `serializeAttributes` keeps `class` everywhere and
+ * `href`/`title` on `<a>`, so a registered `<form>` would emit `<form>` with no
+ * `action` and a registered `<img>` with no `src`. There is no attribute extension
+ * point, and adding one must not silently turn a wrong-but-inert allowlist into a
+ * live sink. Refusing now is cheaper than remembering later.
+ *
+ * The write boundary's `EXECUTABLE_ELEMENT` (`sanitize/write-boundary.ts`) is the
+ * OTHER list, and the two are NOT identical and are not meant to be: this one is
+ * "what a render allowlist may never contain", which is broader than "what a write
+ * must strip on sight". They OVERLAP on everything that executes.
+ */
+const NEVER_ALLOWED = new Set([
+	...DROP_WITH_CONTENT,
+	'body',
+	'button',
+	'form',
+	'frame',
+	'frameset',
+	'html',
+	'img',
+	'input',
+	'keygen',
+	'marquee',
+	'option',
+	'select'
+]);
+
+/**
+ * HTML's void elements — no closing tag, ever.
+ *
+ * `VOID_TAGS` above is what this module currently EMITS that way (`br`, `hr`). A
+ * site registering one of the others through `allowRichTextTags` would otherwise get
+ * `<wbr></wbr>` out of the serializer, which is not what it registered and not valid
+ * HTML, so registration adds it to `VOID_TAGS` rather than leaving the caller to
+ * discover the mismatch. Most of this list is refused outright by `NEVER_ALLOWED`
+ * (it loads, or it is document metadata); `area`, `col`, `param`, `source`, `track`
+ * and `wbr` are the ones a site could legitimately ask for.
+ */
+const VOID_ELEMENTS = new Set([
+	'area',
+	'base',
+	'br',
+	'col',
+	'embed',
+	'hr',
+	'img',
+	'input',
+	'link',
+	'meta',
+	'param',
+	'source',
+	'track',
+	'wbr'
+]);
+
 /** Attributes kept per element. Nothing is global except `class`. */
 const ALLOWED_ATTRIBUTES = new Map([['a', new Set(['href', 'title'])]]);
 
@@ -153,9 +221,11 @@ export function allowRichTextClasses(classes) {
  * may add is bounded by what this module can safely emit: every element here is
  * re-serialized from its parsed name with only its allowlisted attributes, so a
  * presentational tag adds no sink. AN EXECUTABLE ONE WOULD, and is refused —
- * `DROP_WITH_CONTENT` wins over this list by construction (`sanitizeHtml` checks it
- * first), and an attempt to add one of those names throws rather than silently
- * doing nothing, so a caller cannot believe it succeeded.
+ * `NEVER_ALLOWED` (`DROP_WITH_CONTENT` plus the submission, loading and
+ * document-structure elements) throws rather than silently doing nothing, so a
+ * caller cannot believe it succeeded. `DROP_WITH_CONTENT` also wins over this list
+ * by construction at render time (`sanitizeHtml` checks it first), which is the
+ * second lock on the same door.
  *
  * @param {string[]} tags
  */
@@ -163,8 +233,10 @@ export function allowRichTextTags(tags) {
 	for (const name of tags) {
 		const tag = name.toLowerCase();
 		if (!/^[a-z][a-z0-9]{0,15}$/u.test(tag)) throw new Error(`not an element name: ${name}`);
-		if (DROP_WITH_CONTENT.has(tag))
-			throw new Error(`refusing to allow an executable element: ${tag}`);
+		if (NEVER_ALLOWED.has(tag)) throw new Error(`refusing to allow an executable element: ${tag}`);
+		// A void element must be SERIALIZED as one, or the site gets `<wbr></wbr>`
+		// back out of the sanitizer and no explanation of why.
+		if (VOID_ELEMENTS.has(tag)) VOID_TAGS.add(tag);
 		ALLOWED_TAGS.add(tag);
 	}
 }

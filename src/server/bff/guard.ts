@@ -89,11 +89,21 @@ export async function guardRequest<Ctx extends BffContext>(
  * Any failure DELETES the row rather than leaving a half-dead session behind: an
  * expired envelope and a refresh Apex refuses are both terminal, and the next
  * request should look like a clean "not signed in" rather than retry forever.
+ *
+ * `{ refresh: false }` asks the OTHER question — "whose session is this?" — and
+ * nothing more (Opus O6). It reads the row, refuses an expired one, and performs NO
+ * WRITES: no `sessions.delete`, no upstream token refresh, no `last_seen_at` touch.
+ * That is what `rejectGuardFailure` needs, because by then the request is already
+ * refused and the only thing left to do with the answer is attribute an audit row.
+ * Serving a request must still use the default: a caller that goes on to CALL Apex
+ * needs a token that is actually current, and needs a dead session to end.
  */
 export async function resolveSession(
 	request: Request,
-	ctx: BffContext
+	ctx: BffContext,
+	options: { refresh?: boolean } = {}
 ): Promise<SessionRecord | null> {
+	const refresh = options.refresh ?? true;
 	const secret = readSessionCookie(request);
 	if (!secret) return null;
 
@@ -103,9 +113,16 @@ export async function resolveSession(
 
 	const now = ctx.now ?? Date.now();
 	if (isSessionExpired(record, now)) {
+		// An expired session is not "this person"; it is nobody, either way. With
+		// `refresh: false` it is simply reported as such, and the row is left for the
+		// next served request (or the sweeper) to clear.
+		if (!refresh) return null;
 		await ctx.sessions.delete(id).catch(() => {});
 		return null;
 	}
+
+	// Attribution only: the row as stored, and not one write on the way out.
+	if (!refresh) return record;
 
 	let current = record;
 	if (needsAccessRefresh(current, now)) {

@@ -3,7 +3,12 @@ import { auditOutcome } from '../audit';
 import { containsNullPrimitive } from '../authorization';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { refuseOversizedFields, rejectGuardFailure, rejectMutation } from '../reject';
+import {
+	refuseOversizedFields,
+	refuseUnreadableUrls,
+	rejectGuardFailure,
+	rejectMutation
+} from '../reject';
 import { cleanString, unwrapArchetypeRecord } from '../archetype-record';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import { toApexFields } from './update-record';
@@ -117,6 +122,11 @@ export async function handleCreatePost(
 	// while its three siblings refused it. Found by the P4 review (finding 2).
 	const tooLarge = await refuseOversizedFields(ctx, actor, submitted);
 	if (tooLarge) return tooLarge;
+	// The other half of the same rule (Opus O5): a URL attribute this judge cannot
+	// read is refused BY NAME rather than silently stripped on the way through the
+	// sanitizer, so an editor is told which field to look at.
+	const unreadable = await refuseUnreadableUrls(ctx, actor, submitted);
+	if (unreadable) return unreadable;
 
 	const parsed = createPostBodySchema(contract, params.schema).safeParse(bodyJson);
 	if (!parsed.success) return rejectMutation(ctx, actor, 400, 'invalid body', 'invalid body');

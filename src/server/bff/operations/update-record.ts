@@ -2,7 +2,12 @@ import { auditOutcome } from '../audit';
 import { containsNullPrimitive } from '../authorization';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { refuseOversizedFields, rejectGuardFailure, rejectMutation } from '../reject';
+import {
+	refuseOversizedFields,
+	refuseUnreadableUrls,
+	rejectGuardFailure,
+	rejectMutation
+} from '../reject';
 import { readUpdatedAt, unbackedPrimitiveKeys, unwrapArchetypeRecord } from '../archetype-record';
 import {
 	hasManyDiff,
@@ -107,6 +112,11 @@ export async function handleUpdateRecord(
 	// WHICH field is over it (`field-too-large`) rather than a generic `invalid body`.
 	const tooLarge = await refuseOversizedFields(ctx, actorMeta, submitted);
 	if (tooLarge) return tooLarge;
+	// The other half of the same rule (Opus O5): a URL attribute this judge cannot
+	// read is refused BY NAME rather than silently stripped on the way through the
+	// sanitizer, so an editor is told which field to look at.
+	const unreadable = await refuseUnreadableUrls(ctx, actorMeta, submitted);
+	if (unreadable) return unreadable;
 
 	const parsed = recordBodySchema(contract, params.schema).safeParse(bodyJson);
 	if (!parsed.success) {

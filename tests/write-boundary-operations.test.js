@@ -436,16 +436,18 @@ describe('patch-entity-fields sanitizes what it stores', () => {
 		 *
 		 * The assertion is on the STORED value, not the status: a 200 over an
 		 * unsanitized store is exactly the failure this file exists to catch.
+		 *
+		 * TWO OF THE EIGHT MOVED (Opus O5). The over-long numeric references are the
+		 * two the write judge cannot READ rather than the six it can read and refuse,
+		 * and a value it cannot read is now a typed 400 naming the field rather than a
+		 * silent strip — see the test below, which is strictly stronger than this one
+		 * (nothing is stored at all, not even a sanitized version).
 		 */
 		const apex = recordingApex();
 		const ctx = ctxWith(apex);
 		await patchEntity(ctx, {
 			// (a) `&Tab;` — the real entity. The local table spelled it `tab`.
 			named_tab: '<a href="java&Tab;script:alert(1)">x</a>',
-			// (b) references longer than the decoder's 7-decimal / 6-hex windows. A
-			// browser has no window; these ARE `javascript:` to it.
-			long_decimal: '<a href="&#00000000106;avascript:alert(1)">x</a>',
-			long_hex: '<a href="&#x0000006A;avascript:alert(1)">x</a>',
 			// (c) a handler with no whitespace before it — a slash, a quote, a slash.
 			svg_onload: '<svg/onload=alert(1)></svg>',
 			img_onerror: '<img src="x"onerror=alert(1)>',
@@ -457,8 +459,6 @@ describe('patch-entity-fields sanitizes what it stores', () => {
 		});
 		assert.deepEqual(apex.stored.entityFields.fieldsData, {
 			named_tab: '<a>x</a>',
-			long_decimal: '<a>x</a>',
-			long_hex: '<a>x</a>',
 			svg_onload: '',
 			img_onerror: '<img src="x">',
 			anchor_onclick: '<a href="/x"/>y</a>',
@@ -470,6 +470,63 @@ describe('patch-entity-fields sanitizes what it stores', () => {
 		assert.doesNotMatch(serialized, /javascript/iu);
 		assert.doesNotMatch(serialized, /on(?:load|error|click)\s*=/iu);
 		assert.doesNotMatch(serialized, /<(?:svg|button|animate)/iu);
+	});
+
+	it('REFUSES BY NAME the two payloads whose URL the judge cannot read', async () => {
+		/**
+		 * OPUS O5, and the other two of the eight. `&#00000000106;avascript:` and
+		 * `&#x0000006A;avascript:` are longer than `decodeReferences`'s 7-decimal and
+		 * 6-hex windows; a browser has no window, so both ARE `javascript:` to it. The
+		 * write boundary fails closed on a reference that survives decoding — right —
+		 * but it did so by SILENTLY DROPPING the attribute, which is how an editor
+		 * saves a link, gets a 200, and finds the link gone with no explanation.
+		 *
+		 * Now the whole write is refused, 400 `unreadable-url`, with the field named.
+		 * Strictly stronger than the strip: NOTHING is stored, and the person who typed
+		 * it is told which field to look at.
+		 *
+		 * The known false positives — a double-encoded `&amp;amp;`, a `?a=1&#2024` — are
+		 * refusals of something harmless, which is the correct direction for a
+		 * fail-closed rule and the reason it must not be silent.
+		 */
+		const apex = recordingApex();
+		const db = await createMigratedDatabase();
+		try {
+			const ctx = ctxWith(apex, db);
+			const response = await patchEntity(ctx, {
+				long_decimal: '<a href="&#00000000106;avascript:alert(1)">x</a>',
+				long_hex: '<a href="&#x0000006A;avascript:alert(1)">x</a>',
+				untouched: '<p>ok</p>'
+			});
+			assert.equal(response.status, 400);
+			assert.equal(apex.stored.entityFields, null, 'the write never reached Apex');
+
+			// The audit row names both fields, so the refusal is answerable.
+			const { results } = await db
+				.prepare("SELECT outcome, detail FROM bff_audit_log WHERE outcome = 'rejected'")
+				.bind()
+				.all();
+			const detail = `${results.at(-1)?.detail ?? ''}`;
+			assert.match(detail, /unreadable-url|long_decimal/u);
+			assert.match(detail, /long_decimal/u);
+			assert.match(detail, /long_hex/u);
+			assert.doesNotMatch(detail, /untouched/u);
+		} finally {
+			db.close();
+		}
+	});
+
+	it('a plain ampersand in a query string is not mistaken for a reference', async () => {
+		// The bound on the rule above: `&b=` is what every second URL looks like, and
+		// refusing it would make the boundary unusable. Only a TERMINATED reference —
+		// `&name;`, `&#…`, `&#x…` — is refused.
+		const apex = recordingApex();
+		const ctx = ctxWith(apex);
+		await patchEntity(ctx, { body: '<a href="/search?a=1&b=2">x</a>', name: 'Ravi & Co' });
+		assert.deepEqual(apex.stored.entityFields.fieldsData, {
+			body: '<a href="/search?a=1&b=2">x</a>',
+			name: 'Ravi & Co'
+		});
 	});
 
 	it('leaves an ordinary value exactly as it arrived', async () => {
@@ -771,6 +828,121 @@ describe('a failed guard buys no D1 write', () => {
 		});
 		assert.deepEqual(await auditRows(db), []);
 		db.close();
+	});
+
+	it('a refused request never DELETES an expired session, and never refreshes a token', async () => {
+		/**
+		 * OPUS O6. `rejectGuardFailure` resolves the session on a non-401 failure to
+		 * ATTRIBUTE the audit row — and `resolveSession`'s default does more than
+		 * answer: an expired envelope is deleted, and a session near its access-token
+		 * cutoff is refreshed against Apex. Both are WRITES (a D1 delete, an upstream
+		 * round-trip) bought by a request that has already been refused, on a path the
+		 * open internet can reach. And ending somebody's session as a side effect of
+		 * refusing one request is the wrong moment for it.
+		 *
+		 * `{ refresh: false }` answers the question and stops. The two halves are
+		 * asserted separately below, because they fail differently.
+		 *
+		 * MUTATION: drop `{ refresh: false }` from `rejectGuardFailure` — the expired
+		 * row is gone from the store, and the refresh stub records a call.
+		 */
+		const db = await createMigratedDatabase();
+		try {
+			// (a) AN EXPIRED SESSION IS NOT DELETED.
+			const expiredCtx = ctxWith(recordingApex(), db);
+			const secret = createSessionSecret();
+			const id = await sessionIdFor(secret);
+			const past = Date.now() - 10_000;
+			await expiredCtx.sessions.create({
+				id,
+				createdAt: past - 3600_000,
+				lastSeenAt: past,
+				expiresAt: past,
+				staffEmail: 'e@site.test',
+				staffId: 'aaaaaaaa-1111-4222-8333-444444444444',
+				staffName: 'E',
+				accessToken: 't',
+				tokenType: 'Bearer',
+				accessExpiresAt: past,
+				refreshToken: 'r'
+			});
+			const refusedExpired = await handlePatchEntityFields(
+				new Request(`${ORIGIN}/api/admin/entities/${TYPE_ID}/${ENTITY_ID}`, {
+					method: 'PATCH',
+					headers: {
+						origin: ORIGIN,
+						'sec-fetch-site': 'same-origin',
+						'x-csrf-token': 'not-the-cookie',
+						'content-type': 'application/json',
+						cookie: `apex_admin_session=${secret}; apex_bff_csrf=${CSRF}`
+					},
+					body: JSON.stringify({ fields_data: { note: 'x' } })
+				}),
+				expiredCtx,
+				{ entityTypeId: TYPE_ID, entityId: ENTITY_ID }
+			);
+			assert.equal(refusedExpired.status, 403);
+			assert.ok(expiredCtx.sessions.rows.has(id), 'the refused request did not end the session');
+			assert.deepEqual(await auditRows(db), [], 'and an expired session attributes nothing');
+
+			// (b) A LIVE SESSION DUE FOR A REFRESH IS NOT REFRESHED — it is only named.
+			const refreshes = [];
+			const refreshCtx = ctxWith(recordingApex(), db);
+			refreshCtx.auth.refreshGrant = async (token) => {
+				refreshes.push(token);
+				return {
+					accessToken: 'new',
+					tokenType: 'Bearer',
+					refreshToken: 'r2',
+					expiresInSec: 3600
+				};
+			};
+			const liveSecret = createSessionSecret();
+			const liveId = await sessionIdFor(liveSecret);
+			const now = Date.now();
+			await refreshCtx.sessions.create({
+				id: liveId,
+				createdAt: now,
+				lastSeenAt: now,
+				expiresAt: now + 3600_000,
+				staffEmail: 'e@site.test',
+				staffId: 'aaaaaaaa-1111-4222-8333-444444444444',
+				staffName: 'E',
+				accessToken: 't',
+				tokenType: 'Bearer',
+				// Already past the access-token cutoff, so the default path WOULD refresh.
+				accessExpiresAt: now - 1,
+				refreshToken: 'r'
+			});
+			const refusedLive = await handlePatchEntityFields(
+				new Request(`${ORIGIN}/api/admin/entities/${TYPE_ID}/${ENTITY_ID}`, {
+					method: 'PATCH',
+					headers: {
+						origin: ORIGIN,
+						'sec-fetch-site': 'same-origin',
+						'x-csrf-token': 'not-the-cookie',
+						'content-type': 'application/json',
+						cookie: `apex_admin_session=${liveSecret}; apex_bff_csrf=${CSRF}`
+					},
+					body: JSON.stringify({ fields_data: { note: 'x' } })
+				}),
+				refreshCtx,
+				{ entityTypeId: TYPE_ID, entityId: ENTITY_ID }
+			);
+			assert.equal(refusedLive.status, 403);
+			assert.deepEqual(refreshes, [], 'a refused request bought no upstream refresh');
+			assert.equal(
+				refreshCtx.sessions.rows.get(liveId)?.accessToken,
+				't',
+				'and the stored token is untouched'
+			);
+			// Attribution still works, which is the whole reason the resolve happens.
+			const rows = await auditRows(db);
+			assert.equal(rows.length, 1);
+			assert.equal(rows[0].actor_email, 'e@site.test');
+		} finally {
+			db.close();
+		}
 	});
 
 	it('a REAL session that fails the boundary IS audited, attributed to that editor', async () => {

@@ -393,12 +393,50 @@ test('a site may add a PRESENTATIONAL element, and may not add an executable one
 	allowRichTextTags(['MARK']);
 	assert.equal(sanitizeHtml('<mark>x</mark>'), '<mark>x</mark>', 'and case-folded on the way in');
 
-	// The bound: an element that executes, loads or carries executable children is
+	// The bound: an element that executes, loads, submits or structures a DOCUMENT is
 	// refused OUT LOUD, so a caller cannot believe the call did something.
-	for (const executable of ['script', 'svg', 'iframe', 'object', 'math', 'style']) {
+	//
+	// OPUS O3. This loop used to name six, and the check behind it was
+	// `DROP_WITH_CONTENT.has(tag)` — which omits every element on the second line
+	// below, while the docblock promised "nothing that executes, loads or navigates".
+	// Not exploitable at the time (`serializeAttributes` keeps `class` everywhere and
+	// `href`/`title` on `<a>`, so a registered `<form>` emits `<form>` with no
+	// `action`), and wrong, and the day an attribute extension point is added it stops
+	// being merely wrong.
+	for (const executable of [
+		'script',
+		'svg',
+		'iframe',
+		'object',
+		'math',
+		'style',
+		'link',
+		'meta',
+		'base',
+		'template',
+		'textarea',
+		'noscript',
+		'audio',
+		'video',
+		'canvas',
+		'applet',
+		'form',
+		'button',
+		'input',
+		'select',
+		'option',
+		'img',
+		'body',
+		'html',
+		'marquee',
+		'keygen',
+		'frame',
+		'frameset'
+	]) {
 		assert.throws(
 			() => allowRichTextTags([executable]),
-			/refusing to allow an executable element/u
+			/refusing to allow an executable element/u,
+			`${executable} was allowed onto the render allowlist`
 		);
 	}
 	for (const nonsense of ['a b', '<script>', '', 'div/script', 'h1!']) {
@@ -407,4 +445,13 @@ test('a site may add a PRESENTATIONAL element, and may not add an executable one
 	// And the refusal really is a refusal, not a partial application.
 	assert.equal(sanitizeHtml('<script>alert(1)</script>'), '');
 	assert.equal(sanitizeHtml('<svg><animate/></svg>'), '');
+	assert.equal(sanitizeHtml('<form action="/x">a</form>'), 'a', 'still unwrapped, never kept');
+	assert.equal(sanitizeHtml('<img src=x onerror=alert(1)>'), '');
+
+	// A VOID element registers as one, or the serializer would hand back
+	// `<wbr></wbr>` — an element the site did not register and not valid HTML.
+	assert.equal(sanitizeHtml('<p>a<wbr>b</p>'), '<p>ab</p>', 'unknown, so unwrapped');
+	allowRichTextTags(['wbr']);
+	assert.equal(sanitizeHtml('<p>a<wbr>b</p>'), '<p>a<wbr>b</p>');
+	assert.equal(sanitizeHtml('<p>a<wbr/>b</p>'), '<p>a<wbr>b</p>', 'self-closing too');
 });
