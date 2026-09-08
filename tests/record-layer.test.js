@@ -210,9 +210,15 @@ describe('DELETE /records/:schema/:id — the in-use refusal', () => {
 		});
 		return secret;
 	}
-	function req(session, { confirm = false } = {}) {
+	function req(session, { confirm = false, confirmReferenceCount } = {}) {
+		const query = new URLSearchParams();
+		if (confirm) query.set('confirm', '1');
+		if (confirmReferenceCount !== undefined) {
+			query.set('confirmReferenceCount', String(confirmReferenceCount));
+		}
+		const suffix = query.toString() ? `?${query.toString()}` : '';
 		return new Request(
-			`${ORIGIN}/api/admin/records/focus_area/8f14e45f-ceea-467a-9a3c-3f1a7c9d2b55${confirm ? '?confirm=1' : ''}`,
+			`${ORIGIN}/api/admin/records/focus_area/8f14e45f-ceea-467a-9a3c-3f1a7c9d2b55${suffix}`,
 			{
 				method: 'DELETE',
 				headers: {
@@ -293,6 +299,133 @@ describe('DELETE /records/:schema/:id — the in-use refusal', () => {
 		const body = await response.json();
 		assert.equal(body.error, 'in-use');
 		assert.equal(body.referenceCount, 1);
+	});
+
+	/**
+	 * THE CONFIRMATION NAMES A NUMBER, AND THE NUMBER IS CHECKED.
+	 *
+	 * `?confirm=1` is a flag, and a flag cannot say WHAT was agreed to. Until
+	 * 2026-09-08 that was the whole guard on the confirmed leg: the count was
+	 * recomputed and then never compared, so a confirmation shown for ONE referrer
+	 * deleted just as happily once a second had appeared — stripping a reference
+	 * nobody was ever shown, with no error from Apex and no undo. The operation's own
+	 * docblock claimed the guarantee; the code did not have it (codex's P5 review).
+	 *
+	 * `deleteContentLibraryRecord` THROWS in the fixtures below wherever the delete
+	 * must not happen, so "it refused" is not something a 409 assertion could fake.
+	 */
+	describe('the confirmed leg must agree with the count that is true NOW', () => {
+		const countableOnly = {
+			...contract,
+			referrersTo: () => ({
+				countable: [{ slug: 'partner', displayName: 'partner', itemName: 'focus_area' }],
+				uncounted: []
+			})
+		};
+		/** An Apex whose focus_area is referenced by exactly `count` partners. */
+		function apexWithReferrers(count, { onDelete } = {}) {
+			return {
+				async listContentLibrary() {
+					return {
+						status: 200,
+						ok: true,
+						body: {
+							data: Array.from({ length: count }, (_unused, index) => ({
+								id: `p${index + 1}`,
+								archetype_items: [
+									{
+										id: `join-${index + 1}`,
+										relatable_type: 'Specification::Archetype',
+										archetype_schema_item: { name: 'focus_area' },
+										fields_data: { focus_area: '8f14e45f-ceea-467a-9a3c-3f1a7c9d2b55' }
+									}
+								]
+							})),
+							pagination: { total_count: count, current_page: 1, total_pages: 1 }
+						}
+					};
+				},
+				async deleteContentLibraryRecord() {
+					if (onDelete) return onDelete();
+					throw new Error('must not delete');
+				}
+			};
+		}
+		const params = {
+			schema: 'focus_area',
+			recordId: '8f14e45f-ceea-467a-9a3c-3f1a7c9d2b55'
+		};
+
+		it('a STALE count is refused, and the 409 carries the number that is true now', async () => {
+			// The editor was shown 1 and confirmed it; a second reference landed since.
+			const ctx = { ...ctxWith(apexWithReferrers(2)), contract: countableOnly };
+			const response = await handleDeleteRecord(
+				req(await signIn(ctx), { confirm: true, confirmReferenceCount: 1 }),
+				ctx,
+				params
+			);
+			assert.equal(response.status, 409);
+			const body = await response.json();
+			assert.equal(body.error, 'in-use');
+			assert.equal(body.referenceCount, 2, 'the CURRENT count, so the screen re-asks with it');
+		});
+
+		it('`confirm=1` with NO count named is not a confirmation', async () => {
+			const ctx = { ...ctxWith(apexWithReferrers(1)), contract: countableOnly };
+			const response = await handleDeleteRecord(
+				req(await signIn(ctx), { confirm: true }),
+				ctx,
+				params
+			);
+			assert.equal(response.status, 409);
+			assert.equal((await response.json()).error, 'in-use');
+		});
+
+		it('a malformed count confirms nothing — no coercion, in either direction', async () => {
+			// `Number('')` is 0 and `parseInt('1x')` is 1; either would turn a broken
+			// parameter into an agreement. Only a plain run of digits counts.
+			for (const claimed of ['', '1x', ' 1', '+1', '1.0', 'null']) {
+				const ctx = { ...ctxWith(apexWithReferrers(1)), contract: countableOnly };
+				const response = await handleDeleteRecord(
+					req(await signIn(ctx), { confirm: true, confirmReferenceCount: claimed }),
+					ctx,
+					params
+				);
+				assert.equal(response.status, 409, `“${claimed}” must not confirm`);
+			}
+		});
+
+		it('the MATCHING count deletes — the positive control', async () => {
+			let deleted = 0;
+			const apex = apexWithReferrers(2, {
+				onDelete: () => {
+					deleted += 1;
+					return { ok: true, status: 200, body: {} };
+				}
+			});
+			const ctx = { ...ctxWith(apex), contract: countableOnly };
+			const response = await handleDeleteRecord(
+				req(await signIn(ctx), { confirm: true, confirmReferenceCount: 2 }),
+				ctx,
+				params
+			);
+			assert.equal(response.status, 200, await response.clone().text());
+			assert.equal(deleted, 1, 'and it really did delete');
+		});
+
+		it('a record NOTHING references still deletes unconfirmed — no number to agree about', async () => {
+			let deleted = 0;
+			const apex = apexWithReferrers(0, {
+				onDelete: () => {
+					deleted += 1;
+					return { ok: true, status: 200, body: {} };
+				}
+			});
+			const ctx = { ...ctxWith(apex), contract: countableOnly };
+			const response = await handleDeleteRecord(req(await signIn(ctx)), ctx, params);
+			assert.equal(response.status, 200, await response.clone().text());
+			assert.equal(deleted, 1);
+		});
 	});
 });
 

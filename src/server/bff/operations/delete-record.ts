@@ -20,14 +20,28 @@ import type { BffContext } from '../context';
  *
  *   1. count, FRESH, how many records reference this one — not trusting a number
  *      the browser sent or a list it loaded ten minutes ago;
- *   2. if that count is non-zero and the caller did not pass `?confirm=1`, refuse
+ *   2. if that count is non-zero and the caller did not confirm THAT COUNT, refuse
  *      with `409 {code:'in-use', referenceCount, …}` and touch nothing;
  *   3. only then delete, and report what it emptied so the screen can say what
  *      actually happened rather than "Deleted".
  *
- * The count is recomputed on the confirmed call too, because between the warning
- * and the confirmation somebody else may have added a reference — a confirmation
- * for "2 partners" must not silently strip 3.
+ * ── THE CONFIRMATION NAMES A NUMBER ──────────────────────────────────────────
+ * `?confirm=1` alone is not a confirmation, it is a flag, and a flag cannot say
+ * WHAT was agreed to. This paragraph used to claim the guarantee below and the code
+ * did not have it: the count was recomputed on the confirmed call and then never
+ * compared, so a `confirm=1` sent after a dialog that said "2 partners" deleted
+ * happily when a third had appeared in between — silently stripping a reference
+ * nobody was shown. Found by codex's P5 review, 2026-09-08.
+ *
+ * So a confirmed delete carries `&confirmReferenceCount=N`, and N must EQUAL the
+ * fresh count. Anything else — a different number, or no number at all — is the same
+ * 409 as an unconfirmed call, carrying the CURRENT count, which is exactly what the
+ * screens' "this changed since you looked" branch already knew how to draw. The
+ * window is small and the action is unrecoverable (Apex strips the references with no
+ * error and no undo), which is the combination that makes it worth a round trip.
+ *
+ * A record NOTHING references still deletes on an unconfirmed call: there is no
+ * number to agree about, so there is nothing to name.
  *
  * ── WHAT THE COUNT COVERS, AND WHAT HAPPENS WHEN IT CANNOT ───────────────────
  * It covers every referrer the site's contract names as `countable`: content-
@@ -79,7 +93,18 @@ export async function handleDeleteRecord(
 
 	// Only the exact string `1`. A truthy-ish `?confirm=maybe` is not a
 	// confirmation, and this is not a parameter to be liberal about.
-	const confirmed = new URL(request.url).searchParams.get('confirm') === '1';
+	const query = new URL(request.url).searchParams;
+	const confirmed = query.get('confirm') === '1';
+	/**
+	 * The count the editor was actually shown, when the caller names one. Parsed
+	 * strictly for the same reason `confirm` is: `Number('')` is 0 and `parseInt('2x')`
+	 * is 2, and either would turn a malformed parameter into an agreement to delete
+	 * something. Only a plain run of digits counts; anything else is `null`, which
+	 * confirms nothing.
+	 */
+	const claimedRaw = query.get('confirmReferenceCount');
+	const claimedCount =
+		claimedRaw !== null && /^\d{1,9}$/u.test(claimedRaw) ? Number(claimedRaw) : null;
 
 	const referrers = contract.referrersTo(params.schema);
 	const uncounted = referrers.uncounted.map((entry) => entry.displayName);
@@ -116,10 +141,23 @@ export async function handleDeleteRecord(
 	}
 	const referenceCount = counted.count;
 
-	if (referenceCount > 0 && !confirmed) {
+	// The confirmation has to name THIS count. `confirm=1` with no number, or with a
+	// stale one, is refused exactly like no confirmation at all — and the 409 below
+	// carries the number that is true now, so the screen can re-ask with it.
+	const agreed = confirmed && claimedCount === referenceCount;
+
+	if (referenceCount > 0 && !agreed) {
 		await auditOutcome(ctx, meta, guard.actor, {
 			outcome: 'rejected',
-			detail: { schema: params.schema, recordId: idResult.data, reason: 'in-use', referenceCount }
+			detail: {
+				schema: params.schema,
+				recordId: idResult.data,
+				reason: 'in-use',
+				referenceCount,
+				// What the caller claimed, so a mismatch is distinguishable in the audit
+				// from a first, unconfirmed ask. `null` is "named no number".
+				confirmedReferenceCount: confirmed ? claimedCount : undefined
+			}
 		});
 		// A 409 with the count IN THE BODY, not a bare error code: the number is the
 		// whole message, and the screen re-asks the question with it.
