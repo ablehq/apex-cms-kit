@@ -20,11 +20,21 @@
 // ── Pages (plan §8, 3a) ─────────────────────────────────────────────────────
 
 /**
- * The tiptap-shaped value a `rich_text` field stores, as Apex's validator and the
- * public renderer both read it (`rich-text.js`).
+ * The value a `rich_text` field stores, as Apex's validator and the public renderer
+ * both read it (`rich-text.js`).
+ *
+ * `editor` is nullable ON THE INPUT SIDE and only there: every Poovayya archetype
+ * primitive is stored with `editor: null` (measured across all twelve `team_member`
+ * records), so a type that insists on a string describes a shape two of the three
+ * sites do not hold. What `plainToRichText` RETURNS always names an editor — the
+ * stored one, or the site's `defaultEditor`.
+ *
+ * `content` is a Quill delta (`{ops: […]}`) when `editor` is `quilljs` and a
+ * ProseMirror document (`{}` when empty) when it is `tiptap`. The two are not
+ * interchangeable; `rich-text.js` branches rather than guessing.
  */
 export interface RichTextValue {
-	editor: string;
+	editor: string | null;
 	html: string;
 	content: object;
 }

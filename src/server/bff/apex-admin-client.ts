@@ -32,6 +32,23 @@ export interface ApexAdminClientOptions {
 	 * post schemas; GLC, which has its own article methods, names none.
 	 */
 	allowedPostSlugs?: readonly string[];
+	/**
+	 * The content-library ENTITY TYPES this site may CREATE entities of.
+	 *
+	 * A third allowlist, and it follows `allowedPostSlugs`' REFUSE-WHEN-ABSENT shape,
+	 * not `allowedSchemaSlugs`' allow-when-absent one. That difference is the whole
+	 * security property of `createEntity`: this is a general-purpose writer into the
+	 * content library, and a site that has not said which types it mints must not have
+	 * one. Godrej and GLC name none and cannot reach the method at all — their entities
+	 * are created by the page structure, and neither has an `array_ref` field.
+	 *
+	 * Poovayya derives its list from `childListFields()` across `CONTENT_LIBRARY_SLUGS`
+	 * — the child types its record screens can add a row to, and nothing else.
+	 *
+	 * A type is a uuid or a slug (`entity_types/:id_or_slug`); the list holds whichever
+	 * spelling the site's screens use, and the comparison is exact.
+	 */
+	allowedEntityTypes?: readonly string[];
 }
 
 /**
@@ -326,6 +343,39 @@ export interface ApexAdminClient {
 		entityId: string,
 		fieldsData: Record<string, unknown>
 	): Promise<ApexResponse>;
+	/**
+	 * May this client create entities of `entityType`? The BOOLEAN half of
+	 * `allowedEntityTypes`, so an operation can answer 404 for a type this site does
+	 * not mint instead of catching the throw `createEntity` raises on the same input.
+	 * Two spellings of one rule, reading the same option.
+	 */
+	allowsEntityType(entityType: string): boolean;
+	/**
+	 * Mint ONE content-library entity, returning Apex's `{data: {id, fields_data}}`.
+	 *
+	 * `POST /content_library/entity_types/:ref/entities` — the SAME endpoint
+	 * `updateEntityFields` PATCHes, and deliberately not `entity_models`: one
+	 * `permitted_params` on `entities_controller` serves create and update
+	 * (`:113-115`), arrays are permitted for `text_array` / `number_array` /
+	 * `array_ref/*` on both (`entity_data_model.rb:32-50`), and `entity_models` takes a
+	 * FLAT payload with different unknown-key behaviour and a different creation path.
+	 *
+	 * WHY THIS EXISTS. An `array_ref` field's value is a list of ids of entities that
+	 * ALREADY EXIST — the validator resolves each element against
+	 * `ContentLibrary::Entity` and errors if the row is absent
+	 * (`content_library/property_set_form_helper.rb:143`). There is no create-on-write,
+	 * so a row an editor just added by pressing "+ Add item" has no id, and putting it
+	 * in the parent's array is a validation error rather than an insert. The child is
+	 * created first, its id adopted, and only then does the parent's array mention it.
+	 *
+	 * THERE IS NO DELETE COUNTERPART, deliberately. Removing an array reference drops
+	 * the id from the parent's list and leaves the child entity in place, because that
+	 * is what removing a reference IS; the cost is that removed-and-never-re-added
+	 * children accumulate unreferenced. That is the correct trade for not destroying
+	 * data on a mis-click, and deletion is the top-level `content_library/entities/:id`
+	 * — a separate, deliberate act.
+	 */
+	createEntity(entityType: string, fieldsData: Record<string, unknown>): Promise<ApexResponse>;
 	changePageStatus(pageId: string, statusEvent: PageStatusEvent): Promise<ApexResponse>;
 	createGalleryItem(galleryId: string, caption: string, alt: string): Promise<ApexResponse>;
 	createSignedUploadUrl(file: SignedUploadFile): Promise<ApexResponse>;
@@ -612,6 +662,20 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			throw new Error('post methods are not enabled for this client');
 		}
 	}
+	/**
+	 * The entity-type twin of `postSlug`, and it copies THAT shape rather than
+	 * `contentLibrarySlug`'s: a type the site has not named is refused, and with no
+	 * allowlist at all `createEntity` is unreachable. Getting this backwards would
+	 * ship a general-purpose content-library writer to two sites that pass no list.
+	 */
+	function entityTypeToCreate(entityType: string): string {
+		const allowed = options.allowedEntityTypes;
+		if (!allowed || !allowed.includes(entityType)) {
+			throw new Error(`not an allowed entity type: ${entityType}`);
+		}
+		assertEntityTypeRef(entityType);
+		return encodeURIComponent(entityType);
+	}
 	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
 	if (!options.baseUrl) throw new Error('Apex base URL is not configured');
 	if (!options.token) throw new Error('Apex admin token is not configured');
@@ -765,6 +829,16 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 				`${ENTITY_TYPES_BASE}/${encodeURIComponent(entityTypeId)}/entities/${encodeURIComponent(entityId)}`,
 				{ method: 'PATCH', body: JSON.stringify({ fields_data: fieldsData }) }
 			);
+		},
+		allowsEntityType(entityType) {
+			const allowed = options.allowedEntityTypes;
+			return Boolean(allowed && allowed.includes(entityType));
+		},
+		async createEntity(entityType, fieldsData) {
+			return call(`${ENTITY_TYPES_BASE}/${entityTypeToCreate(entityType)}/entities`, {
+				method: 'POST',
+				body: JSON.stringify({ fields_data: fieldsData })
+			});
 		},
 		async changePageStatus(pageId, statusEvent) {
 			assertUuid(pageId);

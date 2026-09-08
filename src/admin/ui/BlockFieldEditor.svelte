@@ -60,6 +60,17 @@
 	 */
 	export let emptyValue = DELETE_MARKER;
 	/**
+	 * Forwarded to every `RichTextField` below: the editor name written into a
+	 * rich-text value that has NONE (a Poovayya archetype primitive is stored
+	 * `editor: null`). A stored non-empty name always wins over it.
+	 *
+	 * Per SITE. GLC's page fields are tiptap — which is this default, so GLC needs no
+	 * change — while Godrej's and Poovayya's stored values are quilljs with populated
+	 * Quill deltas, and both pass `defaultEditor="quilljs"`.
+	 * @type {string}
+	 */
+	export let defaultEditor = 'tiptap';
+	/**
 	 * Optional per-field help, by field name — for fields whose NAME does not say
 	 * what they are for.
 	 * @type {Record<string, string>}
@@ -157,6 +168,7 @@
 						<RichTextField
 							value={valueOf(def.field_name)}
 							ariaLabel={def.display_name}
+							{defaultEditor}
 							onChange={(next) => onChange(def.field_name, next)}
 						/>
 					{:else if def.validator_kind === 'text_array'}

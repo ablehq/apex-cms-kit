@@ -10,18 +10,32 @@
 	alternative was a 200 KB editor dependency for five buttons, which the plan and
 	the prototype both refuse.
 
+	The emitted value is built from the PREVIOUS stored value
+	(`plainToRichText(html, value, {defaultEditor})`), so a field whose HTML did not
+	move comes back byte for byte — same `editor`, same `content`, same object.
+	Editors are still using Apex's own CMS UI on these same records, and what that UI
+	does with a value whose `editor` flipped and whose `content` was emptied is
+	verified by nobody.
+
+	A value this control cannot READ — GLC's `{editor, content_html}` article blocks —
+	puts the surface into a read-only state with a notice instead of presenting the
+	field as empty. Displaying `''` and then storing it on the next keystroke is how
+	an article body disappears.
+
 	The one subtlety is not fighting the caret. `applied` remembers the HTML this
 	component last put into — or last took out of — the element, so an external
 	change (a save's reconcile, a reload) rewrites the surface while the editor's own
 	keystrokes never do. Nothing is written back into a focused element.
 
-	Paste is forced to plain text: it keeps a paste from Word out of the page, and it
-	is the whole of this control's sanitization story on the way in.
+	Paste is forced to plain text: it keeps a paste from Word out of the page. The Link
+	button refuses anything that is not `http` / `https` / `mailto` / `tel` or a path
+	on this site — a courtesy to the person typing, not a boundary. The boundary is
+	server-side, in `sanitize/write-boundary`.
 
 	Legacy Svelte mode.
 -->
 <script>
-	import { plainToRichText } from '../rich-text.js';
+	import { plainToRichText, richTextHtml } from '../rich-text.js';
 
 	/**
 	 * The stored field value: the tiptap-shaped `{ editor, html, content }`, a bare
@@ -33,6 +47,16 @@
 	export let value = '';
 	export let disabled = false;
 	export let ariaLabel = '';
+	/**
+	 * The editor name written into a value that HAS NONE — a Poovayya archetype
+	 * primitive is stored `editor: null`. A stored non-empty name always wins.
+	 *
+	 * Per SITE: GLC's page fields are tiptap, Godrej's and Poovayya's values are
+	 * quilljs with populated deltas. `'tiptap'` is what this component did before the
+	 * prop existed, so a site that passes nothing is unchanged.
+	 * @type {string}
+	 */
+	export let defaultEditor = 'tiptap';
 	/** @type {(next: import('../types').RichTextValue) => void} */
 	export let onChange = () => {};
 
@@ -42,17 +66,12 @@
 	/** @type {string | null} */
 	let applied = null;
 
-	/**
-	 * @param {unknown} stored
-	 * @returns {string}
-	 */
-	function htmlOf(stored) {
-		if (stored && typeof stored === 'object') return 'html' in stored ? `${stored.html ?? ''}` : '';
-		return `${stored ?? ''}`;
-	}
-
-	$: incoming = htmlOf(value);
-	$: if (el && incoming !== applied && el !== documentActiveElement()) {
+	// `richTextHtml` answers a typed result rather than a string, so a shape this
+	// control cannot read is VISIBLE here instead of arriving as `''`.
+	$: read = richTextHtml(value);
+	$: unreadable = !read.ok;
+	$: incoming = read.ok ? read.html : '';
+	$: if (el && read.ok && incoming !== applied && el !== documentActiveElement()) {
 		applied = incoming;
 		el.innerHTML = incoming;
 	}
@@ -62,10 +81,16 @@
 	}
 
 	function emit() {
-		const next = plainToRichText(el.innerHTML);
+		// Never write back over a value this control could not display: `el.innerHTML`
+		// is empty because the value was unreadable, not because anyone deleted it.
+		if (unreadable) return;
+		// `value` is passed as the previous value, which is what lets an unchanged field
+		// come back byte-identical rather than reshaped.
+		const next = plainToRichText(el.innerHTML, value, { defaultEditor });
 		// Remember what we produced so the reactive write-back above does not treat our
 		// own edit as an external change and reset the caret.
-		applied = next.html;
+		const readBack = richTextHtml(next);
+		applied = readBack.ok ? readBack.html : '';
 		onChange(next);
 	}
 
@@ -82,10 +107,48 @@
 		emit();
 	}
 
+	/**
+	 * The protocols a link may use. What is being kept out is `javascript:` — the
+	 * stored HTML is rendered on the public site with `{@html}`, so a link typed here
+	 * is script an anonymous visitor would run — and `data:` / `vbscript:` with it.
+	 *
+	 * The check RESOLVES rather than string-matching, because the URL parser is the
+	 * only thing that agrees with the browser about what `java<TAB>script:…` means. A
+	 * root-relative or in-page href resolves against this origin and so lands on
+	 * `https:`, which is why they need no case of their own.
+	 *
+	 * This is a courtesy to the person typing, NOT the boundary. The boundary is
+	 * server-side, in `sanitize/write-boundary`, because this route into the field is
+	 * not the only one.
+	 */
+	const SAFE_PROTOCOLS = ['http:', 'https:', 'mailto:', 'tel:'];
+
+	/**
+	 * @param {string} href
+	 * @returns {boolean}
+	 */
+	function isSafeHref(href) {
+		try {
+			return SAFE_PROTOCOLS.includes(new URL(href, window.location.origin).protocol);
+		} catch {
+			return false;
+		}
+	}
+
 	function link() {
-		if (disabled) return;
-		const href = typeof window === 'undefined' ? null : window.prompt('Link to which address?');
+		if (disabled || typeof window === 'undefined') return;
+		const typed = window.prompt('Link to which address?');
+		if (typed === null) return;
+		const href = typed.trim();
 		if (!href) return;
+		if (!isSafeHref(href)) {
+			// Said rather than silently dropped: a link that vanishes without a word
+			// reads as a bug in the editor.
+			window.alert(
+				'That link was not added. Use a web address (https://…), an email (mailto:…), a phone number (tel:…), or a path on this site (/… or #…).'
+			);
+			return;
+		}
 		exec('createLink', href);
 	}
 
@@ -132,7 +195,7 @@
 	<div
 		class="rich-body"
 		bind:this={el}
-		contenteditable={!disabled}
+		contenteditable={!disabled && !unreadable}
 		role="textbox"
 		aria-multiline="true"
 		aria-label={ariaLabel}
@@ -140,4 +203,10 @@
 		on:input={emit}
 		on:paste={onPaste}
 	></div>
+	{#if unreadable}
+		<p class="notice">
+			This field is stored in a format this editor cannot show. It has been left exactly as it is;
+			edit it in the CMS instead.
+		</p>
+	{/if}
 </div>
