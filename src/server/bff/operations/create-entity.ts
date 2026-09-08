@@ -10,6 +10,7 @@ import {
 	rejectMutation
 } from '../reject';
 import { sanitizeFieldValue } from '../../../sanitize/write-boundary';
+import { ENTITY_TYPE_REF } from '../apex-admin-client';
 import type { BffContext } from '../context';
 
 /**
@@ -60,11 +61,15 @@ import type { BffContext } from '../context';
  * different service with different error bodies.
  */
 
-/** A uuid OR a slug — `entity_types/:id_or_slug`. Nothing that could carry a path. */
-const entityTypeRef = z
-	.string()
-	.regex(/^[0-9a-z][0-9a-z-]*$/iu)
-	.max(120);
+/**
+ * A uuid OR a slug — `entity_types/:id_or_slug`. Nothing that could carry a path.
+ *
+ * THE CLIENT'S OWN REGEX, for the reason spelled out on `ENTITY_TYPE_REF`: a second
+ * spelling with an `i` flag let a case-folded reference pass this route and then be
+ * refused by a throw inside the client, which is a framework 500 rather than the
+ * audited 400 this route already answers.
+ */
+const entityTypeRef = z.string().regex(ENTITY_TYPE_REF);
 
 const fieldNameSchema = z.string().regex(/^[a-z][a-z0-9_]*$/u);
 
@@ -80,8 +85,15 @@ export const createEntityBodySchema = z
 	})
 	.strict();
 
-/** Apex's single-entity envelope. A created entity has `{id, fields_data}` and no `primitives`. */
-function createdEntityId(body: unknown): string | null {
+/**
+ * Apex's single-entity envelope, EXACTLY as it came back — not yet judged.
+ *
+ * A created entity has `{id, fields_data}` and no `primitives`. The raw string is
+ * kept separate from the verdict because the two are wanted for different things:
+ * the verdict decides whether this operation may answer `{ok: true}`, and the raw
+ * value is what an operator needs in the audit row to go and find the orphan.
+ */
+function returnedEntityId(body: unknown): string | null {
 	if (!body || typeof body !== 'object') return null;
 	const envelope = body as { data?: unknown; id?: unknown };
 	const data =
@@ -90,6 +102,14 @@ function createdEntityId(body: unknown): string | null {
 			: (envelope as { id?: unknown });
 	return typeof data.id === 'string' ? data.id : null;
 }
+
+/**
+ * Apex mints entity ids as uuids. Anything else is a shape this operation does not
+ * understand, and "nonempty string" is not the same check: a caller that puts the
+ * returned value straight into a parent's `array_ref` array would be sending Apex's
+ * validator something it will refuse — after the child already exists.
+ */
+const ENTITY_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu;
 
 export async function handleCreateEntity(
 	request: Request,
@@ -155,13 +175,39 @@ export async function handleCreateEntity(
 	}
 
 	const apexResponse = await guard.apex.createEntity(entityType.data, fieldsData);
-	const entityId = createdEntityId(apexResponse.body);
+	const returnedId = returnedEntityId(apexResponse.body);
+	/**
+	 * THE VERDICT, TAKEN BEFORE THE AUDIT IS WRITTEN.
+	 *
+	 * The audit used to be written first, `accepted` on any 2xx, and only then was an
+	 * idless body rejected with a 502 — so the log said this operation had accepted a
+	 * create it went on to refuse, and said nothing about the orphan that 2xx may well
+	 * have left behind. An audit row that contradicts the response is worse than no
+	 * row: it is the row an operator would trust (codex's P5 fix review, 2026-09-08).
+	 */
+	const entityId = returnedId && ENTITY_UUID.test(returnedId) ? returnedId : null;
+	const shapeFault = !apexResponse.ok
+		? null
+		: returnedId === null
+			? 'missing-entity-id'
+			: entityId === null
+				? 'malformed-entity-id'
+				: null;
 
 	await auditOutcome(ctx, meta, guard.actor, {
-		outcome: apexResponse.ok ? 'accepted' : 'apex_error',
+		// `upstream_shape_error`, NOT `accepted`: Apex answered 2xx, so a row almost
+		// certainly exists, and this operation cannot name it. That is neither a clean
+		// acceptance nor an upstream refusal, and calling it either loses the one fact
+		// that matters — an entity may be out there that nothing references.
+		outcome: !apexResponse.ok ? 'apex_error' : shapeFault ? 'upstream_shape_error' : 'accepted',
 		detail: {
 			entityType: entityType.data,
 			entityId,
+			// The RAW value, capped, only when it is unusable — the handle an operator
+			// has on a row this handler could not name.
+			...(shapeFault
+				? { reason: shapeFault, returnedId: returnedId === null ? null : returnedId.slice(0, 120) }
+				: {}),
 			fields: Object.keys(parsed.data.fields_data),
 			apexStatus: apexResponse.status
 		}

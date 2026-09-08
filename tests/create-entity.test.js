@@ -311,6 +311,68 @@ describe('the create-entity operation', () => {
 		assert.equal((await response.json()).error, 'unexpected upstream shape');
 	});
 
+	/**
+	 * THE AUDIT ROW MAY NOT CONTRADICT THE RESPONSE.
+	 *
+	 * The row was written FIRST, `accepted` on any 2xx, and the idless body was
+	 * rejected afterwards — so the log recorded an acceptance for a request that was
+	 * answered 502, and said nothing about the entity that 2xx had probably created
+	 * and this handler could no longer name. And "nonempty string" was the whole id
+	 * check, so `{"id": "yes"}` was accepted outright and handed to a caller that
+	 * would put it in a parent's `array_ref` (codex's P5 fix review, 2026-09-08).
+	 *
+	 * MUTATIONS: audit `apexResponse.ok ? 'accepted' : 'apex_error'` again — the
+	 * first two cases fail; drop `ENTITY_UUID.test(returnedId)` — the third fails.
+	 */
+	it('a 2xx this handler cannot NAME is audited `upstream_shape_error`, never accepted', async () => {
+		async function rows(db) {
+			return db.sqlite
+				.prepare('SELECT outcome, detail FROM bff_audit_log ORDER BY occurred_at, rowid')
+				.all()
+				.map((row) => ({ ...row, detail: JSON.parse(row.detail) }));
+		}
+
+		const missingDb = await createMigratedDatabase();
+		const missing = await create(
+			ctxWith(recordingApex({ status: 200, body: { data: {} } }), missingDb),
+			{ title: 'x' }
+		);
+		assert.equal(missing.status, 502);
+		const [missingRow] = await rows(missingDb);
+		assert.equal(missingRow.outcome, 'upstream_shape_error');
+		assert.equal(missingRow.detail.reason, 'missing-entity-id');
+		assert.equal(missingRow.detail.entityId, null);
+		assert.equal(missingRow.detail.returnedId, null);
+		missingDb.close();
+
+		// A non-uuid id is a shape this operation does not understand, and passing it
+		// on would put a value in a parent's array that Apex's validator refuses —
+		// after the child already exists.
+		const junkDb = await createMigratedDatabase();
+		const junk = await create(
+			ctxWith(recordingApex({ status: 200, body: { data: { id: 'yes' } } }), junkDb),
+			{ title: 'x' }
+		);
+		assert.equal(junk.status, 502);
+		assert.equal((await junk.json()).error, 'unexpected upstream shape');
+		const [junkRow] = await rows(junkDb);
+		assert.equal(junkRow.outcome, 'upstream_shape_error');
+		assert.equal(junkRow.detail.reason, 'malformed-entity-id');
+		assert.equal(junkRow.detail.returnedId, 'yes', 'the handle on the row nothing can name');
+		junkDb.close();
+
+		// The control: a real uuid is accepted, and audited as accepted.
+		const goodDb = await createMigratedDatabase();
+		const good = await create(ctxWith(recordingApex(), goodDb), { title: 'x' });
+		assert.equal(good.status, 200);
+		assert.equal((await good.json()).entityId, NEW_ID);
+		const [goodRow] = await rows(goodDb);
+		assert.equal(goodRow.outcome, 'accepted');
+		assert.equal(goodRow.detail.entityId, NEW_ID);
+		assert.equal(goodRow.detail.reason, undefined);
+		goodDb.close();
+	});
+
 	it('an unauthenticated attempt buys no D1 row; a real session that fails the boundary does', async () => {
 		const db = await createMigratedDatabase();
 		try {

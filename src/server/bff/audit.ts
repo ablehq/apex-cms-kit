@@ -38,7 +38,19 @@ export interface AuditEntry {
 	accountId?: string | null;
 	pageId?: string | null;
 	requestId?: string | null;
-	outcome: 'accepted' | 'rejected' | 'apex_error';
+	/**
+	 * `accepted` — the write happened and this operation can account for it.
+	 * `rejected` — this BFF refused it; nothing reached Apex.
+	 * `apex_error` — Apex was asked and answered a failure (or never answered).
+	 * `upstream_shape_error` — Apex answered SUCCESS with a body this operation
+	 *   cannot use: the write probably happened and cannot be named. It is its own
+	 *   value because it is neither of its neighbours, and auditing it as `accepted`
+	 *   put a row in the log that contradicted the 502 the caller was sent.
+	 *
+	 * (The `0001` migration's comment lists the first three; the column is free
+	 * text and nothing reads it as an enum.)
+	 */
+	outcome: 'accepted' | 'rejected' | 'apex_error' | 'upstream_shape_error';
 	detail?: unknown;
 }
 
