@@ -17,6 +17,7 @@ import { createApexAdminClient } from '../src/server/bff/apex-admin-client.ts';
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
 import { createMemorySessionStore } from './harness/session-store.ts';
+import { createMigratedDatabase } from './harness/d1.ts';
 
 const ORIGIN = 'https://site.test';
 const CSRF = 'csrf-record';
@@ -172,7 +173,7 @@ describe('countReferencesTo — fails closed', () => {
 });
 
 describe('DELETE /records/:schema/:id — the in-use refusal', () => {
-	function ctxWith(apex) {
+	function ctxWith(apex, db) {
 		return {
 			allowedOrigins: parseAllowedOrigins(ORIGIN),
 			sessions: createMemorySessionStore(),
@@ -189,6 +190,7 @@ describe('DELETE /records/:schema/:id — the in-use refusal', () => {
 				async revoke() {}
 			},
 			createApexClient: () => apex,
+			db,
 			contract
 		};
 	}
@@ -425,6 +427,111 @@ describe('DELETE /records/:schema/:id — the in-use refusal', () => {
 			const response = await handleDeleteRecord(req(await signIn(ctx)), ctx, params);
 			assert.equal(response.status, 200, await response.clone().text());
 			assert.equal(deleted, 1);
+		});
+
+		/**
+		 * A FIRST REFUSAL IS NOT A STALE ONE, AND THE 409 HAS TO SAY WHICH.
+		 *
+		 * Both answered with the same code and the same count, so both screens drew
+		 * "this changed since you looked" on the FIRST in-use response — the one where
+		 * nothing had changed. Telling an editor the world moved when it did not is how
+		 * a warning becomes something to click through (codex's P5 fix review,
+		 * 2026-09-08).
+		 *
+		 * MUTATION: `const confirmationMismatch = referenceCount > 0` (set it on the
+		 * first ask too) — the first case below fails.
+		 */
+		it('the FIRST in-use 409 carries no `confirmationMismatch`; a stale one does', async () => {
+			const first = { ...ctxWith(apexWithReferrers(2)), contract: countableOnly };
+			const firstBody = await (
+				await handleDeleteRecord(req(await signIn(first)), first, params)
+			).json();
+			assert.equal(firstBody.error, 'in-use');
+			assert.equal(firstBody.referenceCount, 2);
+			assert.equal(
+				firstBody.confirmationMismatch,
+				undefined,
+				'nothing changed — this is the first ask'
+			);
+
+			const stale = { ...ctxWith(apexWithReferrers(2)), contract: countableOnly };
+			const staleBody = await (
+				await handleDeleteRecord(
+					req(await signIn(stale), { confirm: true, confirmReferenceCount: 1 }),
+					stale,
+					params
+				)
+			).json();
+			assert.equal(staleBody.confirmationMismatch, true, 'the editor agreed to 1, it is 2');
+
+			// `confirm=1` with no usable number is an agreement that did not hold either.
+			const numberless = { ...ctxWith(apexWithReferrers(2)), contract: countableOnly };
+			const numberlessBody = await (
+				await handleDeleteRecord(
+					req(await signIn(numberless), { confirm: true }),
+					numberless,
+					params
+				)
+			).json();
+			assert.equal(numberlessBody.confirmationMismatch, true);
+		});
+
+		/**
+		 * WHAT THE AUDIT SAYS THE CALLER CLAIMED.
+		 *
+		 * MUTATIONS: drop `...claimDetail` from the ACCEPTED audit — the accepted case
+		 * fails; `confirmedCountMalformed: false` — the malformed case fails.
+		 */
+		it('audits the claim on the rejected AND the accepted row, malformed named as such', async () => {
+			async function auditRows(db) {
+				return db.sqlite
+					.prepare('SELECT outcome, detail FROM bff_audit_log ORDER BY occurred_at, rowid')
+					.all()
+					.map((row) => ({ ...row, detail: JSON.parse(row.detail) }));
+			}
+
+			// A confirmation whose number did not parse: an attempt, not a claim.
+			const malformedDb = await createMigratedDatabase();
+			const malformed = {
+				...ctxWith(apexWithReferrers(1), malformedDb),
+				contract: countableOnly
+			};
+			await handleDeleteRecord(
+				req(await signIn(malformed), { confirm: true, confirmReferenceCount: '1x' }),
+				malformed,
+				params
+			);
+			const [rejected] = await auditRows(malformedDb);
+			assert.equal(rejected.outcome, 'rejected');
+			assert.equal(rejected.detail.confirmationAttempted, true);
+			assert.equal(rejected.detail.confirmedReferenceCount, null, 'no usable number was named');
+			assert.equal(rejected.detail.confirmedCountMalformed, true, 'and it was not merely absent');
+			assert.equal(rejected.detail.confirmationMismatch, true);
+			malformedDb.close();
+
+			// The accepted row is the ONLY trace the stripped references leave anywhere,
+			// so it has to say what the delete was confirming.
+			const acceptedDb = await createMigratedDatabase();
+			const accepted = {
+				...ctxWith(
+					apexWithReferrers(2, { onDelete: () => ({ ok: true, status: 200, body: {} }) }),
+					acceptedDb
+				),
+				contract: countableOnly
+			};
+			const response = await handleDeleteRecord(
+				req(await signIn(accepted), { confirm: true, confirmReferenceCount: 2 }),
+				accepted,
+				params
+			);
+			assert.equal(response.status, 200);
+			const [row] = await auditRows(acceptedDb);
+			assert.equal(row.outcome, 'accepted');
+			assert.equal(row.detail.confirmationAttempted, true);
+			assert.equal(row.detail.confirmedReferenceCount, 2, 'the claim it was accepted on');
+			assert.equal(row.detail.confirmedCountMalformed, false);
+			assert.equal(row.detail.strippedReferences, 2);
+			acceptedDb.close();
 		});
 	});
 });

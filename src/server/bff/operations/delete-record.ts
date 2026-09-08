@@ -43,6 +43,29 @@ import type { BffContext } from '../context';
  * A record NOTHING references still deletes on an unconfirmed call: there is no
  * number to agree about, so there is nothing to name.
  *
+ * ── THE 409 SAYS WHICH KIND OF REFUSAL IT IS ─────────────────────────────────
+ * A first, unconfirmed ask and a confirmation that named a STALE number answer with
+ * the same code and the same count, and until now with nothing to tell them apart —
+ * so both screens drew "this changed since you looked" on the FIRST in-use response,
+ * where nothing had changed at all. An editor who is told the world moved under them
+ * when it did not learns to click through the warning, which is the one habit this
+ * guard cannot survive (codex's P5 fix review, 2026-09-08).
+ *
+ * `confirmationMismatch` is therefore `true` ONLY when the caller confirmed and the
+ * agreement did not hold — a different number, or `confirm=1` with no usable number
+ * at all. It is absent on a first ask. The count is the same in both cases; what
+ * differs is the sentence the screen should say.
+ *
+ * ── THE DELETE ITSELF IS NOT ATOMIC — AN ACCEPTED LIMITATION ─────────────────
+ * The count and the delete are two requests. A reference created between them is
+ * stripped by Apex unseen, exactly as if it had never been counted: this operation
+ * narrows the window to one round trip and cannot close it. Closing it needs
+ * something Apex does not have — a transactional delete-if-reference-count-equals,
+ * evaluated inside the same transaction as the destroy. Until that exists, the
+ * guarantee this operation offers is "no reference that existed at the moment of
+ * the count is stripped without being named", NOT "no reference is stripped
+ * unseen". Do not read the paragraphs above as more than that.
+ *
  * ── WHAT THE COUNT COVERS, AND WHAT HAPPENS WHEN IT CANNOT ───────────────────
  * It covers every referrer the site's contract names as `countable`: content-
  * library schemas through the generic list, and post schemas (`update`, `story`)
@@ -105,6 +128,23 @@ export async function handleDeleteRecord(
 	const claimedRaw = query.get('confirmReferenceCount');
 	const claimedCount =
 		claimedRaw !== null && /^\d{1,9}$/u.test(claimedRaw) ? Number(claimedRaw) : null;
+	/**
+	 * What the caller CLAIMED, on every audit row this request can write — the
+	 * rejected one and the accepted one alike.
+	 *
+	 * The accepted row used to carry only the `confirmed` flag, so the audit could
+	 * say a delete was confirmed and not what it was confirming; and a
+	 * `confirmReferenceCount=2x` was indistinguishable in the log from naming no
+	 * number at all, though the two are different mistakes — one is a caller that
+	 * tried and is broken, the other a caller that did not try.
+	 */
+	const claimDetail = {
+		confirmationAttempted: confirmed,
+		/** The parsed claim. `null` is "named no usable number". */
+		confirmedReferenceCount: claimedCount,
+		/** A `confirmReferenceCount` WAS sent and did not parse. */
+		confirmedCountMalformed: claimedRaw !== null && claimedCount === null
+	};
 
 	const referrers = contract.referrersTo(params.schema);
 	const uncounted = referrers.uncounted.map((entry) => entry.displayName);
@@ -145,6 +185,9 @@ export async function handleDeleteRecord(
 	// stale one, is refused exactly like no confirmation at all — and the 409 below
 	// carries the number that is true now, so the screen can re-ask with it.
 	const agreed = confirmed && claimedCount === referenceCount;
+	// The caller AGREED TO A NUMBER AND THE NUMBER WAS WRONG — as opposed to not
+	// having been asked yet. Only this is "it changed since you looked".
+	const confirmationMismatch = confirmed && !agreed;
 
 	if (referenceCount > 0 && !agreed) {
 		await auditOutcome(ctx, meta, guard.actor, {
@@ -154,9 +197,8 @@ export async function handleDeleteRecord(
 				recordId: idResult.data,
 				reason: 'in-use',
 				referenceCount,
-				// What the caller claimed, so a mismatch is distinguishable in the audit
-				// from a first, unconfirmed ask. `null` is "named no number".
-				confirmedReferenceCount: confirmed ? claimedCount : undefined
+				confirmationMismatch,
+				...claimDetail
 			}
 		});
 		// A 409 with the count IN THE BODY, not a bare error code: the number is the
@@ -166,6 +208,9 @@ export async function handleDeleteRecord(
 				error: 'in-use',
 				code: 'in-use',
 				referenceCount,
+				// Absent on a first ask, so a caller that does not know about this field
+				// cannot read one into it. Present and `true` only for a stale agreement.
+				...(confirmationMismatch ? { confirmationMismatch: true } : {}),
 				referrers: referrers.countable.map((entry) => entry.displayName),
 				uncountedReferrers: uncounted
 			},
@@ -184,6 +229,10 @@ export async function handleDeleteRecord(
 			schema: params.schema,
 			recordId: idResult.data,
 			confirmed,
+			// The claim this delete was ACCEPTED on, which the accepted row omitted: a
+			// row saying only `confirmed: true` cannot say what was agreed to, and this
+			// row is the only trace the stripped references leave anywhere.
+			...claimDetail,
 			strippedReferences: referenceCount,
 			uncountedReferrers: uncounted,
 			apexStatus: apexResponse.status
