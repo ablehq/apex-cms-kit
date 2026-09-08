@@ -425,6 +425,36 @@ describe('sanitizeFieldValue judges a rich-text value part by part', () => {
 		);
 	});
 
+	it('refuses a URL key whose value is not a string, and keeps an explicit `null`', () => {
+		// Opus review of fix pass 5, finding 5. `CONTENT_URL_KEYS` only judged
+		// strings, so `{link: ['javascript:…']}` and `{link: {url: '…'}}` walked past
+		// the predicate as ordinary structure and rode through verbatim. A URL is a
+		// string; anything else at one of these keys is something the judge cannot
+		// read, and it drops to the same inert state a refused string does.
+		assert.deepEqual(
+			sanitizeFieldValue({ ops: [{ insert: 'x', attributes: { link: ['javascript:alert(1)'] } }] }),
+			{ ops: [{ insert: 'x', attributes: {} }] }
+		);
+		assert.deepEqual(
+			sanitizeFieldValue({
+				ops: [{ insert: 'x', attributes: { link: { url: 'javascript:alert(1)' } } }]
+			}),
+			{ ops: [{ insert: 'x', attributes: {} }] }
+		);
+		// The embed key is the same rule with the whole insert as the value.
+		assert.deepEqual(sanitizeFieldValue({ ops: [{ insert: { image: { u: 'javascript:x' } } }] }), {
+			ops: [{ insert: {} }]
+		});
+		// …but an explicit `null` STAYS. A tiptap link mark with no target is
+		// `attrs: {href: null}`, that is already the inert state, and rewriting it
+		// would move a stored value for nothing — identity included.
+		const unset = {
+			type: 'doc',
+			content: [{ type: 'text', text: 'x', marks: [{ type: 'link', attrs: { href: null } }] }]
+		};
+		assert.equal(sanitizeFieldValue(unset), unset);
+	});
+
 	it('leaves the structural walk in place for a `content` that is NOT a delta', () => {
 		// `{blocks: [{html}]}` is markup living under `content`, and it stays markup.
 		// The exemption is for the two formatting dialects, not for the key name.
@@ -461,6 +491,167 @@ describe('sanitizeFieldValue judges a rich-text value part by part', () => {
 			}),
 			[]
 		);
+	});
+});
+
+/**
+ * THE SCOPE OF THE EXEMPTION — what is a formatting record, and WHERE
+ * (codex P5 fix 6, item 1).
+ *
+ * The block above says what a formatting record is judged BY. This one says which
+ * objects get to be one, and it is the assertion whose absence let a HIGH
+ * regression ship through the pass that wrote the block above: `isQuillDelta` asked
+ * only "is there an `ops` array", so `{editor, html: '<hostile>', content: {},
+ * ops: []}` was handed WHOLE to `sanitizeFormattingRecord` — which by design
+ * rewrites nothing but URL keys — and the `html` the public sites render was stored
+ * verbatim through a real handler, 200 OK. Apex drops the unknown `ops` on the way
+ * in, so the stored value does not even carry the disguise; Godrej renders `.html`
+ * through `{@html}` with no render-time sanitizer behind it.
+ *
+ * Two rules, and BOTH are needed — neither implies the other:
+ *
+ *   SHAPE. The object must be the dialect and nothing else. `{ops, html}` is not a
+ *   delta; it is an object with a delta in it, and its `html` is markup.
+ *   POSITION. A formatting record lives at the `content` of a rich-text value, or is
+ *   the whole field value. `{a: {ops: […]}}` is some other field's nested object and
+ *   nothing there has said its strings are a document's text; it keeps the
+ *   structural walk, which is exactly what it got before the exemption existed.
+ */
+describe('sanitizeFieldValue recognises a formatting record by shape AND by position', () => {
+	const HOSTILE = '<img src=x onerror=alert(1)><script>alert(2)</script>';
+	const SANITIZED = '<img src=x>';
+
+	it('SHAPE — one extra key means the object is not the delta, and its html is markup', () => {
+		// The reproduction, at the unit the endpoint tests mount.
+		assert.deepEqual(
+			sanitizeFieldValue({ editor: 'quilljs', html: HOSTILE, content: {}, ops: [] }),
+			{ editor: 'quilljs', html: SANITIZED, content: {}, ops: [] }
+		);
+		// …and the control it must equal: the same value with the decoy removed.
+		assert.deepEqual(sanitizeFieldValue({ editor: 'quilljs', html: HOSTILE, content: {} }), {
+			editor: 'quilljs',
+			html: SANITIZED,
+			content: {}
+		});
+	});
+
+	it('SHAPE — the same for a doc, whose own keys are `type`, `content` and `attrs`', () => {
+		assert.deepEqual(sanitizeFieldValue({ type: 'doc', html: HOSTILE }), {
+			type: 'doc',
+			html: SANITIZED
+		});
+		// A doc node's real keys still make a doc, `attrs` included…
+		const doc = { type: 'doc', attrs: { id: 1 }, content: [{ type: 'text', text: HOSTILE }] };
+		assert.equal(sanitizeFieldValue(doc), doc, 'text inside a doc is text, and untouched');
+		// …and a `content` that is not a list of nodes is not a doc at all.
+		assert.deepEqual(sanitizeFieldValue({ type: 'doc', content: HOSTILE }), {
+			type: 'doc',
+			content: SANITIZED
+		});
+	});
+
+	it('SHAPE — a delta with an extra key UNDER `content` is not exempt either', () => {
+		assert.deepEqual(
+			sanitizeFieldValue({
+				editor: 'quilljs',
+				html: '<p>ok</p>',
+				content: { ops: [{ insert: '<b>x</b>' }], html: HOSTILE }
+			}),
+			{
+				editor: 'quilljs',
+				html: '<p>ok</p>',
+				// `<b>x</b>` survives because `<b>` is allowed markup, not because it is
+				// text — the point is that this object went through the MARKUP judge.
+				content: { ops: [{ insert: '<b>x</b>' }], html: SANITIZED }
+			}
+		);
+	});
+
+	it('POSITION — the `content` of a rich-text value is a record; the value AROUND it is not', () => {
+		// `rich-text.js`'s header lists the stored shapes: a `content` beside an `html`
+		// string or an `editor` (which is `null` on every Poovayya archetype primitive,
+		// so presence is what counts). Both spellings reach the exemption.
+		const byEditor = { editor: null, content: { ops: [{ insert: '<b>x</b>\n' }] } };
+		assert.equal(sanitizeFieldValue(byEditor), byEditor);
+		const byHtml = { html: '<p>x</p>', content: { ops: [{ insert: '<script>x</script>\n' }] } };
+		assert.equal(sanitizeFieldValue(byHtml), byHtml);
+		// And the negative that gives the predicate its edge: a `content` with neither
+		// half of a rich-text value beside it is not a rich-text value's `content`. The
+		// key name alone does not buy the exemption, or any field could be spelled into
+		// it.
+		assert.deepEqual(
+			sanitizeFieldValue({ a: 1, content: { ops: [{ insert: '<script>x</script>' }] } }),
+			{
+				a: 1,
+				content: { ops: [{ insert: '' }] }
+			}
+		);
+	});
+
+	it('POSITION — a field value that IS a delta is judged as one', () => {
+		// `sanitizeFieldValue` is called once per field on all four write paths, so the
+		// field value itself is the other place a record can legitimately be. It still
+		// needs the exact shape, so it cannot be used to smuggle an `html` in beside it.
+		assert.deepEqual(sanitizeFieldValue({ ops: [{ insert: { image: 'javascript:alert(1)' } }] }), {
+			ops: [{ insert: {} }]
+		});
+		const text = { ops: [{ insert: '<script>alert(1)</script>\n' }] };
+		assert.equal(sanitizeFieldValue(text), text);
+	});
+
+	it('POSITION — a delta-shaped object somewhere else keeps the structural walk', () => {
+		// THE DELIBERATE TRADE, pinned so it is a decision rather than a drift. Shape
+		// alone would say "an object with only an `ops` array is a formatting record
+		// wherever it appears", and then any nested corner of any field could claim the
+		// exemption by being spelled that way. Position says what the thing IS.
+		//
+		// What this costs: a `javascript:` string under `{a: {ops: […]}}` is stored
+		// rather than dropped — which is what it did before the exemption existed at
+		// all, since a string with no `<` in it was never markup. What it buys: the
+		// strings there are still sanitized as markup, and no unrecognised structure
+		// can turn off the judge for an `html` beside it.
+		assert.deepEqual(sanitizeFieldValue({ a: { ops: [{ insert: HOSTILE }] } }), {
+			a: { ops: [{ insert: SANITIZED }] }
+		});
+	});
+
+	it('the residual-reference walk asks the SAME question in the SAME places', () => {
+		// The two must agree or the refusal drifts away from the strip it announces.
+		// `{ops: []}` switched this one off too: the field went unnamed where the
+		// identical value without the decoy named it.
+		const unreadable = '<a href="&#00000000106;avascript:x">c</a>';
+		assert.deepEqual(
+			residualReferenceFieldNames({
+				decoy_ops: { editor: 'quilljs', html: unreadable, content: {}, ops: [] },
+				decoy_doc: { type: 'doc', html: unreadable },
+				control: { editor: 'quilljs', html: unreadable, content: {} }
+			}),
+			['decoy_ops', 'decoy_doc', 'control']
+		);
+		// And the record positions it must still reach: the `content` of an envelope,
+		// and a field value that is itself a delta.
+		assert.deepEqual(
+			residualReferenceFieldNames({
+				in_content: {
+					editor: 'quilljs',
+					html: '<p>x</p>',
+					content: { ops: [{ insert: 'x', attributes: { link: '&#00000000106;avascript:x' } }] }
+				},
+				bare: { ops: [{ insert: 'x', attributes: { link: '&#00000000106;avascript:x' } }] }
+			}),
+			['in_content', 'bare']
+		);
+		// …and the positions it must NOT reach, which is the same rule as
+		// `sanitizeFieldValue`'s and has to move with it. THIS REFUSAL EXISTS TO
+		// ANNOUNCE A STRIP: in a non-record position the sanitizer treats these strings
+		// as markup, `&#00000000106;avascript:x` has no `<` in it so nothing is
+		// stripped, and a 400 naming the field would be a refusal of a write that was
+		// about to be stored intact. The two walks agree or the boundary lies.
+		const elsewhere = {
+			body: { a: { ops: [{ insert: 'x', attributes: { link: '&#00000000106;avascript:x' } }] } }
+		};
+		assert.deepEqual(residualReferenceFieldNames(elsewhere), []);
+		assert.equal(sanitizeFieldValue(elsewhere.body), elsewhere.body, 'nothing was stripped');
 	});
 });
 

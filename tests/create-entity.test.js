@@ -321,6 +321,49 @@ describe('the create-entity operation', () => {
 		assert.doesNotMatch(JSON.stringify(apex.stored.created), /javascript:/iu);
 	});
 
+	/**
+	 * THE DECOY KEY, ON THE CREATE PATH TOO (codex P5 fix 6, item 1).
+	 *
+	 * `sanitizeFieldValue` is one function on four write paths, so a hole in the
+	 * recogniser is a hole in all of them; this is the same pin as
+	 * `write-boundary-operations.test.js`'s, mounted on the operation that first
+	 * writes a block field rather than the one that edits it. Both are asserted on
+	 * the STORED value against a CONTROL — the same payload without the decoy — so
+	 * the claim is "the sanitizer ran", not "the response was 200".
+	 */
+	it('an outer `ops: []` or `type: "doc"` does not exempt the html from the sanitizer', async () => {
+		const HOSTILE =
+			'<p><img src=x onerror=alert(1)><script>alert(2)</script><a href="javascript:alert(3)">c</a></p>';
+		const apex = recordingApex();
+		await create(ctxWith(apex), {
+			decoy_ops: { editor: 'quilljs', html: HOSTILE, content: {}, ops: [] },
+			decoy_doc: { type: 'doc', html: HOSTILE },
+			control: { editor: 'quilljs', html: HOSTILE, content: {} }
+		});
+		const stored = apex.stored.created.fieldsData;
+		assert.equal(stored.control.html, '<p><img src=x><a>c</a></p>');
+		assert.equal(stored.decoy_ops.html, stored.control.html);
+		assert.equal(stored.decoy_doc.html, stored.control.html);
+		const serialized = JSON.stringify(stored);
+		assert.doesNotMatch(serialized, /<script/iu);
+		assert.doesNotMatch(serialized, /onerror/iu);
+		assert.doesNotMatch(serialized, /javascript:/iu);
+	});
+
+	it('and the decoy does not switch off the unreadable-URL refusal either', async () => {
+		const apex = recordingApex();
+		const refused = await create(ctxWith(apex), {
+			body: {
+				editor: 'quilljs',
+				html: '<a href="&#00000000106;avascript:x">c</a>',
+				content: {},
+				ops: []
+			}
+		});
+		assert.equal(refused.status, 400);
+		assert.equal(apex.stored.created, null, 'the write never reached Apex');
+	});
+
 	it('carries the per-field ceiling and the unreadable-URL refusal', async () => {
 		const apex = recordingApex();
 		const tooLarge = await create(ctxWith(apex), {

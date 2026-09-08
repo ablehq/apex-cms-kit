@@ -243,25 +243,81 @@ export function sanitizeWriteHtml(html: string): string {
  */
 const CONTENT_URL_KEYS = new Set(['link', 'href', 'src', 'image', 'video']);
 
-/** A Quill delta — `{ops: [{insert, attributes?}, …]}`. */
+/**
+ * A Quill delta — `{ops: [{insert, attributes?}, …]}` AND NOTHING ELSE.
+ *
+ * THE `every` IS THE WHOLE POINT, not a tidiness check. Recognising a formatting
+ * record hands the object to `sanitizeFormattingRecord`, which by design rewrites
+ * nothing but URL keys — so asking only "does it have an `ops` array" let one extra
+ * JSON key exempt every SIBLING of that key from the markup sanitizer:
+ *
+ *   {editor: 'quilljs', html: '<img src=x onerror=alert(1)>', content: {}, ops: []}
+ *
+ * stored VERBATIM through `handlePatchEntityFields`, 200 OK, while the identical
+ * value without the decoy `ops` was sanitized. Apex accepts `editor`/`html`/`content`
+ * and drops the unknown `ops`, so the script tag lands in storage clean of its own
+ * disguise, and Godrej renders `.html` through `{@html}` with no render-time
+ * sanitizer behind it. `fields_data` is `z.record(name, z.unknown())`, so the shape
+ * passes validation on all four write paths.
+ *
+ * A delta with a key that is not `ops` is therefore not a delta. It is an object
+ * that contains one, and the walk treats it as what it is.
+ */
 function isQuillDelta(value: unknown): boolean {
 	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-	return Array.isArray((value as { ops?: unknown }).ops);
+	const node = value as Record<string, unknown>;
+	if (!Array.isArray(node.ops)) return false;
+	return Object.keys(node).every((key) => key === 'ops');
 }
 
 /**
- * A ProseMirror/tiptap document — `{type: 'doc', content: […]}`.
+ * A ProseMirror/tiptap document — `{type: 'doc', content: […]}` and nothing else.
  *
  * Recognised by the DOCUMENT's own shape, not by a bare node's. `{type: 'video',
  * src: '…'}` in some future block field is not a formatting record, and reading it
  * as one would stop sanitizing markup inside it; the doc node is the one shape that
  * cannot mean anything else, and every node below it is reached by walking from
  * there.
+ *
+ * `attrs` is allowed beside `type`/`content` because ProseMirror's own doc node
+ * carries one; anything else — an `html`, an `editor` — means this is an object with
+ * a document in it rather than the document, for the reason spelled out on
+ * `isQuillDelta`. `{type: 'doc', html: '<script>…'}` was the second bypass.
  */
 function isTiptapDoc(value: unknown): boolean {
 	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-	const node = value as { type?: unknown; content?: unknown };
-	return node.type === 'doc' && (node.content === undefined || Array.isArray(node.content));
+	const node = value as Record<string, unknown>;
+	if (node.type !== 'doc') return false;
+	if (node.content !== undefined && !Array.isArray(node.content)) return false;
+	return Object.keys(node).every((key) => key === 'type' || key === 'content' || key === 'attrs');
+}
+
+/** Either dialect, exactly. */
+function isFormattingRecord(value: unknown): boolean {
+	return isQuillDelta(value) || isTiptapDoc(value);
+}
+
+/**
+ * The `{editor, html, content}` object a `rich_text` field actually holds.
+ *
+ * WHERE a formatting record is allowed to be, which is the other half of the fix
+ * above. Tightening the two recognisers to their own key sets stops the decoy-key
+ * bypass, but on its own it still says "an object with only an `ops` array is a
+ * formatting record wherever it appears" — including as some unrelated field's
+ * nested value, where nothing has established that its strings are a document's
+ * text. Position says what the thing IS: a formatting record is the `content` of a
+ * rich-text value, and the outer object is ALWAYS sanitized as markup.
+ *
+ * `rich-text.js`'s header lists the shapes the three tenants store; the constant
+ * across all of them is a `content` key beside an `html` string or an `editor` (which
+ * is `null` on every Poovayya archetype primitive, so its presence is what counts,
+ * not its type).
+ */
+function isRichTextEnvelope(value: unknown): boolean {
+	if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+	const node = value as Record<string, unknown>;
+	if (!Object.hasOwn(node, 'content')) return false;
+	return typeof node.html === 'string' || Object.hasOwn(node, 'editor');
 }
 
 /**
@@ -306,8 +362,19 @@ function sanitizeFormattingRecord(value: unknown): unknown {
 	let moved = false;
 	const walked: Record<string, unknown> = {};
 	for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-		if (CONTENT_URL_KEYS.has(key) && typeof nested === 'string') {
-			if (isSafeUrlValue(nested)) {
+		if (CONTENT_URL_KEYS.has(key) && nested !== null && nested !== undefined) {
+			// A URL IS A STRING, and this judge reads nothing else. `{link: ['javascript:…']}`
+			// and `{link: {url: '…'}}` used to walk on past `isSafeUrlValue` as ordinary
+			// structure and ride through verbatim (Opus review of fix pass 5, finding 5).
+			// Neither editor writes that shape and Quill's own `Link.sanitize` neutralises
+			// it at render, but "the judge could not read it" must fail the same way here
+			// as it does for a string it cannot read: the KEY goes, which is the inert
+			// state this whole function drops to.
+			//
+			// `null`/`undefined` are kept rather than dropped: a tiptap link mark carries
+			// `attrs: {href: null}` when it has no target, that IS the inert state already,
+			// and rewriting it would move a stored value for nothing.
+			if (typeof nested === 'string' && isSafeUrlValue(nested)) {
 				walked[key] = nested;
 				continue;
 			}
@@ -349,29 +416,51 @@ function sanitizeFormattingRecord(value: unknown): unknown {
  * Everything else inside a `content` keeps the structural walk: `content: {blocks:
  * [{html: '…'}]}` is neither a delta nor a doc, and its `html` is still markup.
  *
+ * THAT EXEMPTION IS BOUNDED BY POSITION AS WELL AS BY SHAPE, and both halves are
+ * load-bearing (see `isQuillDelta` and `isRichTextEnvelope`). A nested object is
+ * read as a formatting record only where a formatting record LIVES — the `content`
+ * of a rich-text value — so the outer object, the one carrying the `html` the public
+ * sites render, is always sanitized as markup no matter what keys it also holds.
+ * The field value ITSELF is the one other position, because `sanitizeFieldValue` is
+ * called once per field (`patch-entity-fields.ts`, `create-entity.ts`,
+ * `update-record.ts`) and a field whose whole value is a delta is a delta; that case
+ * still needs the exact shape, so it cannot be used to smuggle an `html` in beside
+ * it. Anywhere else — `{a: {ops: […]}}` — the walk stays structural, because nothing
+ * there has said those strings are a document's text rather than markup.
+ *
  * The identity contract is unchanged: a value nothing needed doing to comes back as
  * the SAME object, so a caller can still tell "sanitized" from "untouched" by
  * reference.
  */
 export function sanitizeFieldValue(value: unknown): unknown {
+	// The field value itself, the outer position described above.
+	if (isFormattingRecord(value)) return sanitizeFormattingRecord(value);
+	return sanitizeMarkupValue(value);
+}
+
+/** `sanitizeFieldValue`'s structural walk: everything here is markup until proven text. */
+function sanitizeMarkupValue(value: unknown): unknown {
 	if (typeof value === 'string') {
 		return value.includes('<') ? sanitizeWriteHtml(value) : value;
 	}
 	if (Array.isArray(value)) {
 		let moved = false;
 		const walked = value.map((entry) => {
-			const next = sanitizeFieldValue(entry);
+			const next = sanitizeMarkupValue(entry);
 			if (next !== entry) moved = true;
 			return next;
 		});
 		return moved ? walked : value;
 	}
 	if (!value || typeof value !== 'object') return value;
-	if (isQuillDelta(value) || isTiptapDoc(value)) return sanitizeFormattingRecord(value);
+	const envelope = isRichTextEnvelope(value);
 	let moved = false;
 	const walked: Record<string, unknown> = {};
 	for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-		const next = sanitizeFieldValue(nested);
+		const next =
+			envelope && key === 'content' && isFormattingRecord(nested)
+				? sanitizeFormattingRecord(nested)
+				: sanitizeMarkupValue(nested);
 		if (next !== nested) moved = true;
 		walked[key] = next;
 	}
@@ -458,15 +547,35 @@ function residualReferenceInFormattingRecord(value: unknown): boolean {
 	});
 }
 
-/** Walk one field value the way `sanitizeFieldValue` does, looking for the above. */
+/**
+ * Walk one field value the way `sanitizeFieldValue` does, looking for the above.
+ *
+ * "The way `sanitizeFieldValue` does" is the contract, and it includes WHERE the
+ * two recognisers are consulted, not just that they are. The pair must agree or the
+ * refusal drifts away from the strip it exists to announce — and when this walk
+ * classified an object as a formatting record more eagerly than it should, the
+ * decoy `{ops: []}` key switched this check off for the `html` beside it too:
+ * `{body: {ops: [], html: '<a href="&#00000000106;avascript:x">'}}` named no field
+ * where the same value without `ops` named `body`. So: a record at the field-value
+ * root, a record at the `content` of a rich-text envelope, and markup everywhere
+ * else.
+ */
 function residualReferenceInValue(value: unknown): boolean {
+	if (isFormattingRecord(value)) return residualReferenceInFormattingRecord(value);
+	return residualReferenceInMarkupValue(value);
+}
+
+/** The structural half of the walk above, mirroring `sanitizeMarkupValue`. */
+function residualReferenceInMarkupValue(value: unknown): boolean {
 	if (typeof value === 'string') return hasResidualReferenceUrl(value);
-	if (Array.isArray(value)) return value.some(residualReferenceInValue);
+	if (Array.isArray(value)) return value.some(residualReferenceInMarkupValue);
 	if (!value || typeof value !== 'object') return false;
-	if (isQuillDelta(value) || isTiptapDoc(value)) {
-		return residualReferenceInFormattingRecord(value);
-	}
-	return Object.values(value as Record<string, unknown>).some(residualReferenceInValue);
+	const envelope = isRichTextEnvelope(value);
+	return Object.entries(value as Record<string, unknown>).some(([key, nested]) =>
+		envelope && key === 'content' && isFormattingRecord(nested)
+			? residualReferenceInFormattingRecord(nested)
+			: residualReferenceInMarkupValue(nested)
+	);
 }
 
 /**

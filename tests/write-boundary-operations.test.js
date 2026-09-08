@@ -624,6 +624,174 @@ describe('patch-entity-fields sanitizes what it stores', () => {
 	});
 });
 
+/**
+ * WHAT COUNTS AS A FORMATTING RECORD, AND WHERE — pinned at the endpoint
+ * (codex P5 fix 6, item 1).
+ *
+ * P5 fix 5 gave a rich-text value's two halves two different judges: `html` keeps
+ * `sanitizeWriteHtml`, a `content` that is a Quill delta or a ProseMirror document
+ * is a formatting record whose strings are TEXT. That is right, and it is also the
+ * most dangerous kind of change, because the exemption is worth exactly as much as
+ * the question that decides who gets it — and the question `isQuillDelta` asked was
+ * "does this object have an `ops` array".
+ *
+ *   {editor: 'quilljs', html: '<hostile>', content: {}, ops: []}
+ *
+ * One key nobody wrote, and every SIBLING of it — including the `html` the public
+ * sites render — left the sanitizer untouched, 200 OK, through this handler. Apex
+ * accepts `editor`/`html`/`content` and silently drops the unknown `ops`
+ * (`entity_models_controller.rb:149-157,204-209`), so the decoy does not even
+ * survive into storage to give the value away; Godrej declares these fields as rich
+ * text and renders `.html` through `{@html}` with no render-time sanitizer at all
+ * (`page-block-templates.v1.json:159-173`, `[slug]/+page.svelte:19-32,362-370`).
+ * Well-formed request in, script tag on a live page.
+ *
+ * NOTHING IN THE FIX-5 SUITE PINNED THE RECOGNISER'S SCOPE, which is why a HIGH
+ * regression shipped through a pass whose whole subject was this function. These
+ * are that pin, and each asserts the STORED value against the CONTROL — the same
+ * payload with the decoy key removed — so "the sanitizer ran" is measured against
+ * what it does when nobody is trying to switch it off, not against a hand-written
+ * expectation that could drift with it.
+ */
+describe('a decoy formatting-record key does not exempt the html beside it', () => {
+	const HOSTILE =
+		'<p><img src=x onerror=alert(1)><script>alert(2)</script><a href="javascript:alert(3)">c</a></p>';
+	const SANITIZED = '<p><img src=x><a>c</a></p>';
+
+	/** PATCH one field and hand back what Apex was stored. */
+	async function storedValue(fieldValue) {
+		const apex = recordingApex();
+		const response = await patchEntity(ctxWith(apex), { body: fieldValue });
+		assert.equal(response.status, 200);
+		return apex.stored.entityFields.fieldsData.body;
+	}
+
+	it('an outer `ops: []` does not stop the html being sanitized', async () => {
+		const decoy = await storedValue({
+			editor: 'quilljs',
+			html: HOSTILE,
+			content: {},
+			ops: []
+		});
+		const control = await storedValue({ editor: 'quilljs', html: HOSTILE, content: {} });
+		assert.equal(control.html, SANITIZED, 'the control names the sanitizer’s own answer');
+		assert.equal(decoy.html, control.html);
+		// The decoy key itself is carried through as the ordinary value it is.
+		assert.deepEqual(decoy, { editor: 'quilljs', html: SANITIZED, content: {}, ops: [] });
+	});
+
+	it('an outer `type: "doc"` does not either', async () => {
+		const decoy = await storedValue({ type: 'doc', html: HOSTILE });
+		const control = await storedValue({ html: HOSTILE });
+		assert.equal(control.html, SANITIZED);
+		assert.equal(decoy.html, control.html);
+		assert.deepEqual(decoy, { type: 'doc', html: SANITIZED });
+	});
+
+	it('nor a `content` that is a delta with one extra key in it', async () => {
+		// The exemption is bounded by SHAPE at the `content` position too: an object
+		// that merely contains an `ops` array is not the delta, and the `html` it also
+		// holds is markup.
+		const stored = await storedValue({
+			editor: 'quilljs',
+			html: '<p>ok</p>',
+			content: { ops: [{ insert: 'x\n' }], html: HOSTILE }
+		});
+		assert.deepEqual(stored, {
+			editor: 'quilljs',
+			html: '<p>ok</p>',
+			content: { ops: [{ insert: 'x\n' }], html: SANITIZED }
+		});
+	});
+
+	it('and none of the three leaves anything executable in the store', async () => {
+		const apex = recordingApex();
+		await patchEntity(ctxWith(apex), {
+			decoy_ops: { editor: 'quilljs', html: HOSTILE, content: {}, ops: [] },
+			decoy_doc: { type: 'doc', html: HOSTILE },
+			decoy_in_content: {
+				editor: 'quilljs',
+				html: '<p>ok</p>',
+				content: { ops: [], html: HOSTILE }
+			}
+		});
+		const serialized = JSON.stringify(apex.stored.entityFields.fieldsData);
+		assert.doesNotMatch(serialized, /<script/iu);
+		assert.doesNotMatch(serialized, /onerror/iu);
+		assert.doesNotMatch(serialized, /javascript:/iu);
+	});
+
+	it('the unreadable-URL refusal is not switched off by the decoy either', async () => {
+		// The other half of the same boundary, and it failed the same way: a URL the
+		// judge cannot READ is a typed 400 naming the field, and `{ops: []}` turned it
+		// into a silent 200. Asserted here as "the write never reached Apex", which is
+		// the strong form.
+		for (const value of [
+			{
+				editor: 'quilljs',
+				html: '<a href="&#00000000106;avascript:x">c</a>',
+				content: {},
+				ops: []
+			},
+			{ type: 'doc', html: '<a href="&#00000000106;avascript:x">c</a>' }
+		]) {
+			const apex = recordingApex();
+			const response = await patchEntity(ctxWith(apex), { body: value });
+			assert.equal(response.status, 400, JSON.stringify(value));
+			assert.equal(apex.stored.entityFields, null, 'the write never reached Apex');
+		}
+	});
+
+	it('a GENUINE delta still passes its text through and still judges attributes.link', async () => {
+		// The fix-5 behaviour the tightening must not take back with it. Both
+		// directions in one value: literal text that looks like a tag survives, and a
+		// scheme in `attributes.link` is dropped exactly as the href beside it is.
+		const stored = await storedValue({
+			editor: 'quilljs',
+			html: '<p>&lt;b&gt;<a href="javascript:alert(1)">c</a></p>',
+			content: {
+				ops: [
+					{ insert: '<b>' },
+					{ insert: 'c', attributes: { link: 'javascript:alert(1)', bold: true } },
+					{ insert: '\n' }
+				]
+			}
+		});
+		assert.deepEqual(stored, {
+			editor: 'quilljs',
+			html: '<p>&lt;b&gt;<a>c</a></p>',
+			content: {
+				ops: [{ insert: '<b>' }, { insert: 'c', attributes: { bold: true } }, { insert: '\n' }]
+			}
+		});
+	});
+
+	it('and a genuine tiptap doc does too', async () => {
+		const stored = await storedValue({
+			editor: 'tiptap',
+			html: '<p><a href="javascript:alert(1)">c</a></p>',
+			content: {
+				type: 'doc',
+				content: [
+					{
+						type: 'paragraph',
+						content: [
+							{
+								type: 'text',
+								text: '<b>c',
+								marks: [{ type: 'link', attrs: { href: 'javascript:alert(1)' } }]
+							}
+						]
+					}
+				]
+			}
+		});
+		assert.equal(stored.html, '<p><a>c</a></p>');
+		assert.equal(stored.content.content[0].content[0].text, '<b>c', 'the delta text is TEXT');
+		assert.deepEqual(stored.content.content[0].content[0].marks, [{ type: 'link', attrs: {} }]);
+	});
+});
+
 describe('the record write paths sanitize too — the same sanitizer, one place', () => {
 	it('update-record strips script out of a rich-text field', async () => {
 		const apex = recordingApex();

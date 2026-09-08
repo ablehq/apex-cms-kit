@@ -486,6 +486,29 @@ describe('htmlToDelta: the document structure a contenteditable produces', () =>
 		// At the END of the document the space is still content — Quill reads
 		// `a<br> ` as `"a\n "` — so it gets a line rather than being discarded.
 		assert.deepEqual(htmlToDelta('a<br> '), { ops: [{ insert: 'a\n \n' }] });
+
+		/**
+		 * KNOWN, PINNED, AND NOT FIXED HERE (Opus review of fix pass 5, finding 3).
+		 *
+		 * The same end-of-document rule reads a LONGER trailing run the same way, and
+		 * the fix-5 fuzzer counted ~7 documents per 3,000 where it emits a whitespace
+		 * line Quill does not — always at end of document, always whitespace only, no
+		 * text lost either way (against 3 the other way, and dwarfed by the structural
+		 * agreement the same change bought: 1185 → 1957 matching line counts per 3,000).
+		 *
+		 * NOT CHANGED, because the two measurements on record disagree and this pass
+		 * cannot settle them: the line above is a direct Quill 2.0.3 reading that the
+		 * trailing content space is KEPT (`a<br> ` → `"a\n "`), while the fuzzer's
+		 * verdict on the longer run is that it is dropped. No Quill build is reachable
+		 * from this pass to break the tie, and guessing at the converter is exactly the
+		 * move that put a HIGH regression in fix pass 5. Pinned as the current answer so
+		 * that whoever does settle it changes a decision rather than discovers one.
+		 *
+		 * Note the shape: only a run with NO newline in it reaches `pushText`. A
+		 * newline-bearing run is split by `LAYOUT_RUN` first and agrees with Quill.
+		 */
+		assert.deepEqual(htmlToDelta('<br>   '), { ops: [{ insert: '\n   \n' }] });
+		assert.deepEqual(htmlToDelta('<br>  \n  '), { ops: [{ insert: '\n' }] });
 	});
 
 	it('a LINE BREAK in the source is layout — it never becomes a line in the delta', () => {
@@ -768,7 +791,17 @@ describe('htmlToDelta: the document structure a contenteditable produces', () =>
 		);
 		// `th`, `tbody`, `thead` and `caption` are genuinely absent from Quill's list
 		// — the two cells of a header row are ONE line — so the row break comes from
-		// the `<tr>` around them and nothing else.
+		// the `<tr>` around them and nothing else. Measured WRAPPED, on a document the
+		// browser keeps: a bare `<thead>` is one of the shapes it deletes, and quoting
+		// one is the fallacy that produced the wrong claim above (Opus review of fix
+		// pass 5, finding 4). Both header cells share a line; both body cells do not.
+		assert.deepEqual(
+			htmlToDelta(
+				'<table><thead><tr><th>h1</th><th>h2</th></tr></thead>' +
+					'<tbody><tr><td>a</td><td>b</td></tr></tbody></table>'
+			),
+			{ ops: [{ insert: 'h1h2\na\nb\n' }] }
+		);
 		assert.deepEqual(
 			htmlToDelta(
 				'<table><thead><tr><th>h1</th><th>h2</th></tr></thead><tbody><tr><td>a</td></tr></tbody></table>'
@@ -778,6 +811,30 @@ describe('htmlToDelta: the document structure a contenteditable produces', () =>
 		assert.deepEqual(htmlToDelta('<table><tr><td>cell</td></tr></table>'), {
 			ops: [{ insert: 'cell\n' }]
 		});
+
+		/**
+		 * THE KNOWN DIVERGENCE THE ABOVE BUYS (Opus review of fix pass 5, finding 2).
+		 *
+		 * Cells with no `<table>` around them: Quill 2.0.3 reads `"ab"`, because the
+		 * browser's parser deletes the bare `<td>` tags before the clipboard sees them
+		 * and only their text arrives. This module has no parser to delete them, so
+		 * `td` being a line here makes it `"a\nb"`.
+		 *
+		 * The assertion pinning this was DELETED in fix pass 5 as "not a measurement of
+		 * Quill's rule", and that reasoning was right about what it measures and wrong
+		 * about what it was for: it is not evidence for the rule, but it was a correct
+		 * expectation, and losing it is how a divergence stops being a decision and
+		 * becomes a surprise. It is here as a pin, labelled — not as an oracle match.
+		 *
+		 * Unreachable on stored data: 0 of 489 stored strings across the three tenants
+		 * contains a table tag, and neither producer emits one. A paste is how one
+		 * arrives, and a pasted table is wrapped.
+		 */
+		assert.deepEqual(
+			htmlToDelta('<td>a</td><td>b</td>'),
+			{ ops: [{ insert: 'a\nb\n' }] },
+			'known divergence: Quill reads "ab" — the browser deletes bare cells'
+		);
 	});
 
 	it('pathological nesting is bounded rather than unbounded, and keeps the text', () => {

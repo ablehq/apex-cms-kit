@@ -179,11 +179,19 @@ const BLOCK_ATTRIBUTE = new Map([
  * STILL ABSENT, and each of these genuinely measured NOT to end a line under the
  * same build: `tbody`, `thead`, `th`, `caption`, `details`, `summary`, `hgroup`,
  * `legend`, `aside` — note `th` and `tbody`, which are the two the review's summary
- * named alongside the real three and which the list above does not contain
- * (`<thead><tr><th>h1</th><th>h2</th></tr></thead>` is `"h1h2"`, one line). And
- * `pre` stays out for the reason the header gives: Quill's serializer has already
- * emptied a code block by the time this module sees it, so giving `<pre>` a line of
- * its own would add a blank line and nothing else.
+ * named alongside the real three and which the `isLine` list above does not contain.
+ * MEASURED WRAPPED, because a bare `<thead>` is one of the shapes the browser
+ * deletes before Quill is handed it — quoting one is the same fallacy that produced
+ * the wrong sentence this paragraph replaced (Opus review of fix pass 5, finding 4):
+ *
+ *   <table><thead><tr><th>h1</th><th>h2</th></tr></thead>
+ *          <tbody><tr><td>a</td><td>b</td></tr></tbody></table>   quill "h1h2\na\nb"
+ *
+ * The two `th` share one line while the two `td` do not, which is `th` out and `td`
+ * in, on a document the browser keeps. And `pre` stays out for the reason the header
+ * gives: Quill's serializer has already emptied a code block by the time this module
+ * sees it, so giving `<pre>` a line of its own would add a blank line and nothing
+ * else.
  *
  * Unreachable on the three sites today: 0 of 97 stored rich-text values contains a
  * table tag. A paste is how one arrives.
