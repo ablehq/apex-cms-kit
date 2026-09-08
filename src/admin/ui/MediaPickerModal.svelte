@@ -14,6 +14,11 @@
 	and GLC's page editor never did — so its picker rendered "No upload destination is
 	configured" and could never upload at all.
 
+	`uploadEnabled` is how a caller that DID look says what it found, without the id
+	coming back into the browser. Three states, and the default is the permissive one,
+	because the bug above was caused by treating "I have not asked" as "it is absent".
+	Poovayya's record editor is the only caller that passes it today.
+
 	── NOT IMAGE-ONLY ANY MORE ───────────────────────────────────────────────────
 	`accept`, `hasAlt` and the labels come from the gallery's entry in
 	`media-types.js`, so the same component serves Files and Videos: a PDF gets a PDF
@@ -37,6 +42,29 @@
 	 * @type {Array<{ id: string, url?: string | null, caption?: string, alt?: string }>}
 	 */
 	export let images = [];
+	/**
+	 * Whether this ACCOUNT actually has the gallery, when the caller has read it.
+	 *
+	 *   `null` (default) — NOT KNOWN. Upload is offered. This is the state every site
+	 *     that does not list its gallery is in, and it must stay permissive: see the
+	 *     docblock above, where requiring evidence is the bug GLC shipped.
+	 *   `true`  — the site listed the gallery and it is there.
+	 *   `false` — the site listed the gallery and it is NOT there. Upload is refused
+	 *     HERE, with a reason, rather than accepted and failed at finalize after the
+	 *     bytes have already been pushed to storage.
+	 *
+	 * A failed READ is `null`, not `false`: "I could not ask" is not "it is absent",
+	 * and an upload resolves its own destination server-side from the gallery NAME
+	 * without needing this list at all.
+	 * @type {boolean | null}
+	 */
+	export let uploadEnabled = null;
+	/**
+	 * What to say when `uploadEnabled` is `false`. A caller that knows more about its
+	 * own configuration can say something more useful.
+	 * @type {string | null}
+	 */
+	export let uploadDisabledReason = null;
 	/** @type {(galleryItemId: string) => void} */
 	export let onSelect = () => {};
 	export let onClose = () => {};
@@ -117,7 +145,10 @@
 	}
 
 	async function save() {
-		if (!file || !media || !client || busy) return;
+		// `uploadEnabled === false` is checked HERE too, not only in the markup. The
+		// markup hides the form; this refuses the call, so a stale `file` from before
+		// the caller learned the gallery was absent cannot still be sent.
+		if (!file || !media || !client || busy || uploadEnabled === false) return;
 		error = '';
 		// The destination is captured HERE, so a `gallery` that changes while the
 		// bytes are in flight cannot misfile what is already on its way.
@@ -206,6 +237,17 @@
 				{/if}
 				{#if !media}
 					<p class="notice">There is no “{gallery}” library to upload to.</p>
+				{:else if uploadEnabled === false}
+					<!--
+						The caller LOOKED and the gallery is not on this account. Refusing here
+						is the whole point: without it the editor fills in a file and a caption,
+						presses Save, the bytes go to storage, and finalize is the first thing
+						that fails — after the upload, with nothing to show for it.
+					-->
+					<p class="notice">
+						{uploadDisabledReason ??
+							`This workspace has no “${gallery}” library yet, so there is nowhere to upload to.`}
+					</p>
 				{:else}
 					<div class="fields">
 						<div class="f">
@@ -260,7 +302,7 @@
 				<button
 					type="button"
 					class="btn btn-primary"
-					disabled={!file || !media || busy}
+					disabled={!file || !media || busy || uploadEnabled === false}
 					on:click={save}
 				>
 					<!--
