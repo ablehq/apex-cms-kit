@@ -41,8 +41,23 @@
 	/**
 	 * Apex's spelling for "clear this field", not ours: `PropertySetFormHelper`
 	 * merges a PATCH's `fields_data` into the stored property set and drops every
-	 * NIL attribute as "not supplied", so `null` is a silent no-op — Apex answers
-	 * 200 and keeps the old row. Only `"__delete__"` removes a row of any kind.
+	 * NIL attribute as "not supplied". Only `"__delete__"` clears a value on every
+	 * surface.
+	 *
+	 * WHAT `null` DOES DEPENDS ON THE SURFACE, and this used to claim the entities
+	 * answer for both (measured raw at Apex, 2026-09-08):
+	 *
+	 *   ENTITIES endpoint (`content_library/entity_types/:ref/entities/:id`) — 200,
+	 *     and THE VALUE SURVIVES. This is the silent no-op the paragraph described.
+	 *   RECORD route (`archetype_schemas/:slug/archetype_models/:id`) — 200, the KEY
+	 *     IS REMOVED from `primitives` and the archetype ITEM ROW IS DESTROYED with
+	 *     it (Poovayya `practice_area` and Godrej `team_member` alike, on a media
+	 *     field and on a text field). Not a no-op at all.
+	 *
+	 * No hazard reaches Apex from this kit either way: the record operations refuse a
+	 * null primitive with a 400 `null-field` before a request is built. But a comment
+	 * that says "200 and the old row is kept" about the route where the row is
+	 * destroyed is the kind of thing the next person measures against.
 	 *
 	 * `emptyValue` reaches EXACTLY ONE call site: the Remove button inside the
 	 * `ref/model/Cms::GalleryItem` branch below. So the only field kind it can ever
