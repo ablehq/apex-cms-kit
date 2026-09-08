@@ -8,6 +8,7 @@ import { handleUpdateRecord } from '../src/server/bff/operations/update-record.t
 import { handleUpdatePostArchetype } from '../src/server/bff/operations/update-post-archetype.ts';
 import { handleCreatePost } from '../src/server/bff/operations/create-post.ts';
 import { handleSavePostBody } from '../src/server/bff/operations/save-post-body.ts';
+import { computeBodyVersion } from '../src/server/bff/operations/post-shape.ts';
 import { MAX_FIELD_VALUE_CHARS } from '../src/sanitize/write-boundary.ts';
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
@@ -297,10 +298,22 @@ async function createPost(ctx, body) {
 	});
 }
 
+/**
+ * The recording Apex answers an EMPTY document, so every body save here carries
+ * the version of an empty document. It is computed rather than pasted: the hash
+ * covers the row shape, and a literal would be a second definition of it.
+ */
+const EMPTY_BODY_VERSION = await computeBodyVersion([]);
+
 async function savePostBody(ctx, body) {
 	const session = await signIn(ctx);
 	return handleSavePostBody(
-		signedRequest(session, `/api/admin/posts/article/${POST_ID}/body`, body, 'PUT'),
+		signedRequest(
+			session,
+			`/api/admin/posts/article/${POST_ID}/body`,
+			{ bodyVersion: EMPTY_BODY_VERSION, ...body },
+			'PUT'
+		),
 		ctx,
 		{ schema: 'article', postId: POST_ID }
 	);

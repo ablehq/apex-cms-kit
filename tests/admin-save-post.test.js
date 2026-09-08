@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+	carryPendingStages,
 	createPostDraft,
 	hasPostArchetypeChanges,
 	hasPostFieldChanges,
@@ -59,20 +60,30 @@ const post = {
 };
 
 /** A recording BFF double. `fail` forces one method to answer not-ok. */
-function makeClient({ fail = null, status = 500, version = 'v1', errors = undefined } = {}) {
+function makeClient({
+	fail = null,
+	status = 500,
+	version = 'v1',
+	bodyVersion = 'bv1',
+	errors = undefined,
+	code = undefined,
+	getPostThrows = false
+} = {}) {
 	const calls = [];
 	const ok =
 		(name) =>
 		async (...args) => {
 			calls.push({ name, args });
-			if (fail === name) return errors ? { ok: false, status, errors } : { ok: false, status };
-			return { ok: true, status: 200 };
+			if (fail === name) {
+				return { ok: false, status, ...(errors ? { errors } : {}), ...(code ? { code } : {}) };
+			}
+			return { ok: true, status: 200, ...(name === 'savePostBody' ? { bodyVersion: 'bv2' } : {}) };
 		};
 	return {
 		calls,
 		readPostVersion: async (slug, id) => {
 			calls.push({ name: 'readPostVersion', args: [slug, id] });
-			return { version };
+			return { version, bodyVersion };
 		},
 		updatePost: ok('updatePost'),
 		savePostBody: ok('savePostBody'),
@@ -81,7 +92,8 @@ function makeClient({ fail = null, status = 500, version = 'v1', errors = undefi
 		changePostStatus: ok('changePostStatus'),
 		getPost: async (slug, id) => {
 			calls.push({ name: 'getPost', args: [slug, id] });
-			return { post: { ...post, title: 'T2' }, version: 'v2' };
+			if (getPostThrows) throw new TypeError('network');
+			return { post: { ...post, title: 'T2' }, version: 'v2', bodyVersion: 'bv2' };
 		}
 	};
 }
@@ -334,5 +346,169 @@ describe('savePost — the write order, and what never runs after a failure', ()
 		setPostField(draft, 'title', 'T2');
 		assert.deepEqual(await savePost(draft, client), { ok: true, refreshed: false });
 		assert.equal(hasPostFieldChanges(draft), true, 'still dirty, so the next save resends it');
+	});
+});
+
+describe('the four block kinds on the draft, and the body version it carries', () => {
+	const fourKinds = [
+		{ id: 'b1', kind: 'rich_text', html: '<p>one</p>' },
+		{ id: 'b2', kind: 'quote', quote: 'q', quotedBy: 'a' },
+		{ id: 'b3', kind: 'divider', dividerKind: 'large' },
+		{ id: 'b4', kind: 'image', galleryItemId: IMG }
+	];
+
+	it('holds all four verbatim, and `setPostBlocks` is kind-agnostic', () => {
+		const draft = createPostDraft('story', { ...post, blocks: fourKinds }, 'v1', contract, 'bv1');
+		assert.deepEqual(draft.blocks, fourKinds);
+		assert.equal(isPostDirty(draft), false);
+		setPostBlocks(draft, [...fourKinds].reverse());
+		assert.equal(draft.bodyDirty, true);
+		setPostBlocks(draft, fourKinds);
+		assert.equal(draft.bodyDirty, false, 'and back to clean, by value');
+		// A divider resized and an image repointed are edits, not no-ops.
+		setPostBlocks(draft, [{ ...fourKinds[2], dividerKind: 'small' }]);
+		assert.equal(draft.bodyDirty, true);
+	});
+
+	it('sends the body version with the body, and adopts the one the save answers', async () => {
+		const draft = createPostDraft('story', post, 'v1', contract, 'bv1');
+		setPostBlocks(draft, fourKinds);
+		const client = makeClient({});
+		const result = await savePost(draft, client);
+		assert.equal(result.ok, true);
+		const body = client.calls.find((call) => call.name === 'savePostBody');
+		assert.deepEqual(body.args[2], fourKinds, 'the blocks, verbatim');
+		assert.equal(body.args[3], 'bv1', 'and the version this editor loaded');
+		assert.equal(draft.bodyVersion, 'bv2', 're-baselined from the fresh load');
+	});
+
+	it('a body save that answers a new version updates the draft even when a LATER stage fails', async () => {
+		// Otherwise the next save is refused as stale by the write this one just made.
+		const draft = createPostDraft('story', post, 'v1', contract, 'bv1');
+		setPostBlocks(draft, fourKinds);
+		setPostTags(draft, []);
+		const result = await savePost(draft, makeClient({ fail: 'setPostTags' }));
+		assert.equal(result.ok, false);
+		assert.equal(result.stage, 'tags');
+		assert.equal(draft.bodyVersion, 'bv2');
+	});
+});
+
+describe('a body write that may have landed says Reload, never Retry', () => {
+	it('`body-written-unread` is stale:true, names what was not saved, and stops the save', async () => {
+		const draft = createPostDraft('story', post, 'v1', contract, 'bv1');
+		dirtyEverything(draft);
+		const client = makeClient({ fail: 'savePostBody', status: 502, code: 'body-written-unread' });
+		const result = await savePost(draft, client, { statusEvent: 'publish' });
+		assert.equal(result.ok, false);
+		assert.equal(result.stage, 'body');
+		assert.equal(result.code, 'body-written-unread');
+		assert.equal(result.stale, true, 'so the screen offers Reload, not Retry');
+		assert.match(result.message, /may have been saved but could not be read back/u);
+		assert.match(result.message, /references and tags/u);
+		// Nothing after the body ran — least of all the status event.
+		assert.deepEqual(names(client), ['readPostVersion', 'updatePost', 'savePostBody']);
+	});
+
+	it('a `409` on the body is stale too — the interleaved-save refusal', async () => {
+		const draft = createPostDraft('story', post, 'v1', contract, 'bv1');
+		setPostBlocks(draft, []);
+		const result = await savePost(draft, makeClient({ fail: 'savePostBody', status: 409 }));
+		assert.equal(result.stale, true);
+		assert.equal(result.message, STALE_MESSAGE);
+	});
+
+	it('an ordinary body failure is NOT stale — Retry is the right offer there', async () => {
+		const draft = createPostDraft('story', post, 'v1', contract, 'bv1');
+		setPostBlocks(draft, []);
+		const result = await savePost(draft, makeClient({ fail: 'savePostBody', status: 502 }));
+		assert.equal(result.stale, false);
+		assert.match(result.message, /Save again to retry/u);
+	});
+
+	it('a refused image names the picker, not "try again"', async () => {
+		const draft = createPostDraft('story', post, 'v1', contract, 'bv1');
+		setPostBlocks(draft, [{ id: null, kind: 'image', galleryItemId: IMG }]);
+		const result = await savePost(
+			draft,
+			makeClient({ fail: 'savePostBody', status: 400, code: 'unknown-image' })
+		);
+		assert.match(result.message, /image library/u);
+		assert.equal(result.stale, false);
+	});
+
+	it('a failed re-baseline is `refreshed:false` — every write landed, the draft is behind', async () => {
+		const draft = createPostDraft('story', post, 'v1', contract, 'bv1');
+		setPostField(draft, 'title', 'T2');
+		const result = await savePost(draft, makeClient({ getPostThrows: true }));
+		assert.deepEqual(result, { ok: true, refreshed: false });
+	});
+});
+
+describe('carryPendingStages — a Reload that does not throw away unwritten work', () => {
+	it('re-applies references, primitives, tags and the cover onto a fresh draft, and names them', () => {
+		const old = createPostDraft('story', post, 'v1', contract, 'bv1');
+		setPostReference(old, 'focus_area', [FA1, FA2]);
+		setPostReference(old, 'author', AUTHOR);
+		setPostArchetypeField(old, 'kind', 'interview');
+		setPostTags(old, []);
+		setPostCover(old, IMG);
+		setPostBlocks(old, [{ id: null, kind: 'divider', dividerKind: 'small' }]);
+
+		// The reload: the server's post, as it stands after the uncertain body write.
+		const fresh = createPostDraft('story', post, 'v2', contract, 'bv2');
+		const carried = carryPendingStages(fresh, old);
+
+		assert.deepEqual(carried.sort(), ['cover', 'fields', 'references', 'tags']);
+		assert.deepEqual(fresh.references, { author: AUTHOR, focus_area: [FA1, FA2] });
+		assert.deepEqual([...fresh.dirtyReferences].sort(), ['author', 'focus_area']);
+		assert.equal(fresh.archetypeFields.kind, 'interview');
+		assert.deepEqual(fresh.tagIds, []);
+		assert.equal(fresh.tagsDirty, true);
+		assert.equal(fresh.coverId, IMG);
+		assert.equal(fresh.coverDirty, true);
+		// THE BODY IS NOT CARRIED. It is the stage whose fate is unknown, and
+		// re-applying it is the append this whole path exists to prevent.
+		assert.deepEqual(fresh.blocks, post.blocks);
+		assert.equal(fresh.bodyDirty, false);
+		// …and the fresh baselines are the server's, so a second save writes the carried
+		// stages and nothing else.
+		assert.equal(fresh.baselineVersion, 'v2');
+		assert.equal(fresh.bodyVersion, 'bv2');
+		assert.equal(hasPostArchetypeChanges(fresh), true);
+		assert.equal(hasPostFieldChanges(fresh), true, 'the cover rides the fields patch');
+	});
+
+	it('carries NOTHING when the old draft had nothing pending, and never invents dirt', () => {
+		const old = createPostDraft('story', post, 'v1', contract, 'bv1');
+		const fresh = createPostDraft('story', post, 'v2', contract, 'bv2');
+		assert.deepEqual(carryPendingStages(fresh, old), []);
+		assert.equal(isPostDirty(fresh), false);
+	});
+
+	it('a carried value that the server ALREADY has is not re-dirtied', () => {
+		// The uncertain write is the body's; the references may nevertheless have been
+		// written by an earlier attempt. Carrying through the setters is what makes a
+		// value equal to the fresh baseline read as clean.
+		const old = createPostDraft('story', post, 'v1', contract, 'bv1');
+		setPostReference(old, 'focus_area', [FA1, FA2]);
+		const fresh = createPostDraft(
+			'story',
+			{
+				...post,
+				references: {
+					author: [],
+					focus_area: [
+						{ itemId: 'j1', targetId: FA1 },
+						{ itemId: 'j2', targetId: FA2 }
+					]
+				}
+			},
+			'v2',
+			contract,
+			'bv2'
+		);
+		assert.deepEqual(carryPendingStages(fresh, old), []);
+		assert.equal(isPostDirty(fresh), false);
 	});
 });

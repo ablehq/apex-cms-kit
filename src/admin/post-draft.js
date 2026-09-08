@@ -24,7 +24,11 @@
 
 /**
  * @typedef {import('./entity-draft.js').EntityContract} EntityContract
- * @typedef {{ id: string | null, kind: 'rich_text' | 'quote', html?: string, quote?: string, quotedBy?: string }} PostBlock
+ * @typedef {{ id: string | null, kind: 'rich_text', html: string }} RichTextBlock
+ * @typedef {{ id: string | null, kind: 'quote', quote: string, quotedBy: string }} QuoteBlock
+ * @typedef {{ id: string | null, kind: 'divider', dividerKind: 'small' | 'medium' | 'large' }} DividerBlock
+ * @typedef {{ id: string | null, kind: 'image', galleryItemId: string | null }} ImageBlock
+ * @typedef {RichTextBlock | QuoteBlock | DividerBlock | ImageBlock} PostBlock
  * @typedef {{
  *   id?: string,
  *   title?: string,
@@ -44,6 +48,7 @@
  *   contract: EntityContract,
  *   postId: string,
  *   baselineVersion: string,
+ *   bodyVersion: string,
  *   post: PostRecord,
  *   fields: Record<string, string>,
  *   baselineFields: Record<string, string>,
@@ -115,9 +120,10 @@ function sameIdSet(a, b) {
  * @param {PostRecord} post
  * @param {string} version
  * @param {EntityContract} contract the site's content contract
+ * @param {string} [bodyVersion] the document's own token, sent back with the body PUT
  * @returns {PostDraft}
  */
-export function createPostDraft(schemaSlug, post, version, contract) {
+export function createPostDraft(schemaSlug, post, version, contract, bodyVersion = '') {
 	if (!contract) throw new Error('createPostDraft needs the site content contract');
 	if (!contract.schema(schemaSlug)) throw new Error(`unknown schema: ${schemaSlug}`);
 	const meta = post?.meta ?? {};
@@ -157,6 +163,10 @@ export function createPostDraft(schemaSlug, post, version, contract) {
 		contract,
 		postId: post?.id ?? '',
 		baselineVersion: version ?? '',
+		// The DOCUMENT's own token, carried separately from the composite one: the body
+		// PUT sends it so a save cannot destroy a block another tab added between this
+		// load and that write (`post-shape.ts`, `computeBodyVersion`).
+		bodyVersion: bodyVersion ?? '',
 		post: clone(post ?? {}),
 		fields,
 		baselineFields: { ...fields },
@@ -340,13 +350,15 @@ export function hasPostArchetypeChanges(draft) {
  * Re-baseline after a successful save: adopt the server's post and version, and
  * clear every dirty set.
  * @param {PostDraft} draft @param {PostRecord} post @param {string} version
+ * @param {string} [bodyVersion]
  */
-export function reconcilePost(draft, post, version) {
+export function reconcilePost(draft, post, version, bodyVersion) {
 	const fresh = createPostDraft(
 		draft.schemaSlug,
 		post,
 		version || draft.baselineVersion,
-		draft.contract
+		draft.contract,
+		bodyVersion || draft.bodyVersion
 	);
 	draft.postId = fresh.postId || draft.postId;
 	draft.post = fresh.post;
@@ -369,4 +381,57 @@ export function reconcilePost(draft, post, version) {
 	draft.baselineBlocks = fresh.baselineBlocks;
 	draft.bodyDirty = false;
 	if (version) draft.baselineVersion = version;
+	if (bodyVersion) draft.bodyVersion = bodyVersion;
+}
+
+/**
+ * Carry a draft's PENDING work onto a freshly loaded one — the Reload after a
+ * write-uncertain body save.
+ *
+ * When the body save answers `body-written-unread` the fields stage may have
+ * landed, the body is uncertain, and the archetype, tag and status stages have NOT
+ * run at all (`save-post.js` stops at the first failure). The only safe next move
+ * is to Reload, because retrying would resend `id: null` blocks that now exist —
+ * but a plain reload replaces the whole draft and throws away the references, tags
+ * and cover the editor had changed and which were never written.
+ *
+ * So the fresh draft is re-dirtied in exactly those three stages, THROUGH THE
+ * SETTERS, so each is dirty only where its value really differs from what came
+ * back. The body is deliberately NOT carried: it is the stage whose fate is
+ * unknown, and re-applying it is the append this whole path exists to prevent.
+ *
+ * Returns the stage names that were actually carried, so the screen can say which.
+ *
+ * (`stale-recovery.js` is GLC's transcript-row recovery and is a different problem
+ * — it re-applies rows to a list, not stages to a post.)
+ *
+ * @param {PostDraft} freshDraft @param {PostDraft} oldDraft
+ * @returns {string[]}
+ */
+export function carryPendingStages(freshDraft, oldDraft) {
+	if (!freshDraft || !oldDraft) return [];
+	/** @type {string[]} */
+	const carried = [];
+	for (const name of oldDraft.dirtyReferences) {
+		if (!Object.prototype.hasOwnProperty.call(freshDraft.references, name)) continue;
+		setPostReference(freshDraft, name, oldDraft.references[name]);
+	}
+	if (freshDraft.dirtyReferences.size > 0) carried.push('references');
+	// The archetype PRIMITIVES ride on the same stage as the references
+	// (`postArchetypePatch` sends both in one PUT), so they are unwritten for exactly
+	// the same reason and are carried for exactly the same reason.
+	for (const name of oldDraft.dirtyArchetypeFields) {
+		if (!Object.prototype.hasOwnProperty.call(freshDraft.archetypeFields, name)) continue;
+		setPostArchetypeField(freshDraft, name, oldDraft.archetypeFields[name]);
+	}
+	if (freshDraft.dirtyArchetypeFields.size > 0) carried.push('fields');
+	if (oldDraft.tagsDirty) {
+		setPostTags(freshDraft, oldDraft.tagIds);
+		if (freshDraft.tagsDirty) carried.push('tags');
+	}
+	if (oldDraft.coverDirty) {
+		setPostCover(freshDraft, oldDraft.coverId);
+		if (freshDraft.coverDirty) carried.push('cover');
+	}
+	return carried;
 }

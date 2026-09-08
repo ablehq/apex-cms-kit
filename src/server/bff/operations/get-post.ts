@@ -3,6 +3,7 @@ import { guardRequest } from '../guard';
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import {
 	buildPostLoad,
+	computeBodyVersion,
 	computePostVersion,
 	loadPostView,
 	normalizeBlocks,
@@ -40,6 +41,11 @@ export async function handleGetPost(
 	const loaded = await buildPostLoad(contract, guard.apex, params.schema, idResult.data);
 	// A post of another schema, or a deleted one, finds nothing on the scoped read.
 	if (!loaded) return bffError(404, 'not found');
+	// A post that EXISTS but whose document (or reference targets) would not read is
+	// a 502, never a 404 and never a 200 carrying an empty body. Both mistakes are
+	// worse than the fault: a 404 makes the editor's Reload build a draft out of
+	// `undefined`, and a 200 with `blocks: []` invites a save that deletes the body.
+	if (loaded.ok !== true) return bffError(502, 'upstream error');
 	return noStoreJson(loaded);
 }
 
@@ -63,6 +69,10 @@ export async function handleReadPostVersion(
 		readPostArchetype(guard.apex, params.schema, ids.archetypeId),
 		readDocumentBlocks(guard.apex, ids.documentId)
 	]);
+	// The same rule as the load's: an unreadable document is a 502. Hashing `[]` for
+	// it produced a token that AGREED with the empty read, so the save that followed
+	// passed its stale check and then diffed the body against nothing.
+	if (apexBlocks === null) return bffError(502, 'upstream error');
 	const version = await computePostVersion(
 		view,
 		archetype,
@@ -70,5 +80,5 @@ export async function handleReadPostVersion(
 		contract,
 		params.schema
 	);
-	return noStoreJson({ version });
+	return noStoreJson({ version, bodyVersion: await computeBodyVersion(apexBlocks) });
 }

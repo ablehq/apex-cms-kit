@@ -26,7 +26,7 @@ import type { AdminRecord } from './record-shape';
  * `get-article.ts` + `save-body-article.ts`, parameterised on the schema slug and
  * widened for what a Godrej post carries that an article does not (plan 04, G1).
  *
- * A POST IS THREE RECORDS, addressed in TWO id spaces:
+ * A POST IS THREE RECORDS, addressed in THREE id spaces:
  *
  *   - a `Cms::Post`                — title / slug / summary / published_date /
  *                                    status / the SEO triple / the COVER
@@ -35,6 +35,13 @@ import type { AdminRecord } from './record-shape';
  *                                    REFERENCES (author, focus_area, partner),
  *                                    and the TAGGINGS;               by ARCHETYPE id
  *   - a `Cms::Document`            — the body blocks;                by DOCUMENT id
+ *
+ * …and the blocks are a FOURTH id space, with two halves. Every block has an
+ * OUTER id (`cms_document_blocks.id`, what `position` and `_destroy` address) and
+ * an INNER `blockable.id` (the `RichText` / `Quote` / `Divider` / `GalleryItem`
+ * row, `document_block.rb:7-17`), which an in-place update must name in
+ * `blockable_attributes.id` — omit it and Apex mints a fresh inner row on every
+ * save while the outer id holds, so the churn is invisible from the outside.
  *
  * `postId` is what every route is addressed by, because it is what the list
  * links on and what the status and field writes take. The archetype id and the
@@ -68,9 +75,34 @@ export const postIdSchema = archetypeIdSchema;
 /** The SEO triple `Cms::Post#create_meta_properties` mints in group `web` at create. */
 export const META_NAMES = ['title', 'description', 'keywords'] as const;
 
-/** The two `Cms::DocumentBlock` subclasses an editor can author here. */
+/**
+ * The FOUR `Cms::DocumentBlock` subclasses an editor can author here.
+ *
+ * `Cms::DocumentBlock::Video`, `Cms::DocumentBlock::Spacer`,
+ * `Cms::DocumentBlock::Entity` and the LEGACY `Cms::DocumentBlock::Image` are
+ * PASSTHROUGHS: they are not returned to the editor, they are never destroyed by a
+ * save, and their positions are restated rather than assumed. The legacy `Image`
+ * block (its own `Medium`, `image.rb:2`) is a different table from the `image`
+ * kind below, which is a `GalleryItem` block pointing at a row in the account's
+ * images gallery — a distinction worth naming because the two would otherwise
+ * read as the same thing.
+ */
 export const BLOCK_TYPE_RICH_TEXT = 'Cms::DocumentBlock::RichText';
 export const BLOCK_TYPE_QUOTE = 'Cms::DocumentBlock::Quote';
+export const BLOCK_TYPE_DIVIDER = 'Cms::DocumentBlock::Divider';
+export const BLOCK_TYPE_GALLERY_ITEM = 'Cms::DocumentBlock::GalleryItem';
+
+/** `Cms::DocumentBlock::Divider#kind` — the only three Apex validates (`divider.rb:2-3`). */
+export const DIVIDER_KINDS = ['small', 'medium', 'large'] as const;
+export type DividerKind = (typeof DIVIDER_KINDS)[number];
+
+/**
+ * What a divider with no stored `kind` reads as, and what the editor sends for a
+ * new one. `kind` is `allow_nil` upstream, so a null would round-trip as a
+ * divider whose size the public renderer has to guess; it guesses `medium`
+ * (Poovayya's article page), so this is that guess, made once, on the way out.
+ */
+export const DEFAULT_DIVIDER_KIND: DividerKind = 'medium';
 
 /** The `shared_gallery_items.kind` the public loaders read the cover from. */
 const COVER_KIND = 'cover';
@@ -122,13 +154,49 @@ export function postSchemaOf(contract: ContentContract, slug: string): Archetype
 	return schema && schema.target_model === 'Cms::Post' ? schema : null;
 }
 
-export interface AdminPostBlock {
+/**
+ * One body block, as the editor edits it — a DISCRIMINATED UNION on `kind`, and
+ * the outbound shape is the inbound shape.
+ *
+ * The draft holds what the server handed it verbatim and sends it back verbatim
+ * into a `.strict()` schema, so a read-only convenience key (an image's caption,
+ * say) added here would be refused on the very next save. The editor resolves an
+ * image's caption and thumbnail from the images list it already loads, not from
+ * the block.
+ */
+export interface AdminRichTextBlock {
 	id: string | null;
-	kind: 'rich_text' | 'quote';
-	html?: string;
-	quote?: string;
-	quotedBy?: string;
+	kind: 'rich_text';
+	html: string;
 }
+
+export interface AdminQuoteBlock {
+	id: string | null;
+	kind: 'quote';
+	quote: string;
+	quotedBy: string;
+}
+
+export interface AdminDividerBlock {
+	id: string | null;
+	kind: 'divider';
+	dividerKind: DividerKind;
+}
+
+export interface AdminImageBlock {
+	id: string | null;
+	kind: 'image';
+	/**
+	 * `cms_document_block_gallery_items.gallery_item_id` — a real, NULLABLE,
+	 * unvalidated FK (`gallery_item.rb:2`, migration `:5`). `null` is a block
+	 * upstream has that points at nothing; the editor shows it as a missing image
+	 * and offers the picker. A NEW or CHANGED image block may not be null.
+	 */
+	galleryItemId: string | null;
+}
+
+export type AdminPostBlock =
+	AdminRichTextBlock | AdminQuoteBlock | AdminDividerBlock | AdminImageBlock;
 
 /** One block as APEX holds it — what the body reconciliation needs and the browser never sees. */
 export interface ApexBlockRow {
@@ -136,6 +204,13 @@ export interface ApexBlockRow {
 	position: number;
 	blockableType: string;
 	blockableId: string;
+	/**
+	 * The GalleryItem block's stored item id, or `null` for every other kind AND for
+	 * a GalleryItem block that points at nothing. Carried so the body save can tell
+	 * a NEW or CHANGED image block (which must name a member of the images gallery)
+	 * from an unchanged one (which must not cost a gallery read).
+	 */
+	galleryItemId: string | null;
 }
 
 export interface AdminPostMeta {
@@ -181,9 +256,45 @@ export function normalizeDate(value: unknown): string {
 }
 
 /**
- * The one post record, from the ONLY read surface an editor's token can use
- * (`GET /cms/posts/:id` is 403 for a staff token), filtered by the schema slug —
- * fixed, last — so `q[id_eq]` can only ever select a post of THIS schema.
+ * Whether a `YYYY-MM-DD` string names a day that exists. `''` (the clear) passes.
+ *
+ * `Cms::Post` has NO validation on `published_date` (`post.rb`), so Rails casts
+ * what it cannot parse to `nil`: `2026-13-45` and `2026-02-30` both pass a shape
+ * regex, reach Apex, answer 200 and CLEAR the date the editor was trying to
+ * change. The regex is the shape; this is the calendar.
+ */
+export function isCalendarDate(value: string): boolean {
+	if (value === '') return true;
+	const match = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(value);
+	if (!match) return false;
+	const year = Number(match[1]);
+	const month = Number(match[2]);
+	const day = Number(match[3]);
+	if (month < 1 || month > 12 || day < 1 || day > 31) return false;
+	const date = new Date(Date.UTC(year, month - 1, day));
+	return (
+		date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+	);
+}
+
+/** `publishedDate` on both post write schemas: the shape AND the calendar. One definition. */
+export const publishedDateSchema = z
+	.string()
+	.regex(/^(?:\d{4}-\d{2}-\d{2})?$/u)
+	.refine(isCalendarDate, { message: 'not a calendar date' });
+
+/**
+ * The one post record, read through the SCHEMA-SCOPED list, filtered by the slug
+ * — fixed, last — so `q[id_eq]` can only ever select a post of THIS schema. That
+ * scoping is the cross-schema refusal, and it is why the list is used even where a
+ * direct read would work.
+ *
+ * `GET /cms/posts/:id` is NOT used, and the reason has changed. GLC measured it
+ * 403 for its staff token on 2026-07-31 (`get-article.ts:35-40`); on Poovayya's
+ * tenant it answers 200 for role `store-admin` (measured 2026-09-08). So it is not
+ * universally forbidden — it is simply not SCOPED, and an unscoped read by id is
+ * exactly what would let a post of one schema be loaded through another schema's
+ * route. Do not "optimise" this into a direct read.
  */
 export async function loadPostView(
 	apex: ApexAdminClient,
@@ -332,14 +443,38 @@ export function coverAttributes(
 	return attributes.length > 0 ? attributes : null;
 }
 
-/** Apex's block rows for a document, in position order. Empty when the read failed. */
+/**
+ * Apex's block rows for a document, in position order — or `null` when the read
+ * FAILED.
+ *
+ * THIS USED TO FAIL OPEN, and it was the most expensive bug in the post layer.
+ * It answered `[]` for a failed read, which is indistinguishable from an empty
+ * document, and `handleSavePostBody` diffs the desired body against exactly that:
+ * every block the editor sent became an id-less CREATE, the document DOUBLED, and
+ * the editor was told 200. The two read callers hashed the same empty answer into
+ * a stale-guard token, so the next save agreed with it.
+ *
+ * `null` is therefore load-bearing and every caller must branch on it: before a
+ * write it is `502` with nothing dispatched; after one it is write-uncertain
+ * (`save-post-body.ts`); on a read it is `502`, never a 200 with an empty body and
+ * never a 404 (a 404 makes an editor's Reload build a draft out of `undefined`).
+ *
+ * A transport THROW counts as a failed read, not as a crash: the Apex client's
+ * methods reject on a network fault, and an exception escaping here would have
+ * become a 500 with no audit row.
+ */
 export async function readDocumentBlocks(
 	apex: ApexAdminClient,
 	documentId: string
-): Promise<Record<string, unknown>[]> {
-	if (!documentId) return [];
-	const response = await apex.getDocument(documentId);
-	if (!response.ok) return [];
+): Promise<Record<string, unknown>[] | null> {
+	if (!documentId) return null;
+	let response;
+	try {
+		response = await apex.getDocument(documentId);
+	} catch {
+		return null;
+	}
+	if (!response.ok) return null;
 	const record = unwrapArchetypeRecord(response.body);
 	const blocks = record && Array.isArray(record.blocks) ? record.blocks : [];
 	return blocks
@@ -348,15 +483,18 @@ export async function readDocumentBlocks(
 		.sort((a, b) => Number(a.position ?? 0) - Number(b.position ?? 0));
 }
 
-/** Apex's block rows reduced to the ids the body reconciliation addresses. */
+/** Apex's block rows reduced to the ids and payload keys the body reconciliation addresses. */
 export function apexBlockRows(blocks: Record<string, unknown>[]): ApexBlockRow[] {
 	return blocks.map((block) => {
 		const blockable = isRecord(block.blockable) ? block.blockable : null;
+		const type = cleanString(block.blockable_type);
 		return {
 			id: cleanString(block.id),
 			position: Number(block.position ?? 0),
-			blockableType: cleanString(block.blockable_type),
-			blockableId: blockable ? cleanString(blockable.id) : ''
+			blockableType: type,
+			blockableId: blockable ? cleanString(blockable.id) : '',
+			galleryItemId:
+				type === BLOCK_TYPE_GALLERY_ITEM ? cleanString(blockable?.gallery_item_id) || null : null
 		};
 	});
 }
@@ -368,11 +506,14 @@ export function apexBlockRows(blocks: Record<string, unknown>[]): ApexBlockRow[]
  * value is rendered with `{@html}` on the public site, and the admin is a
  * first-party way to get HTML into that sink — one sanitizer, two consumers.
  *
- * A block whose `blockable_type` is neither editable kind — a
- * `Cms::DocumentBlock::GalleryItem`, which story bodies carry — is NOT returned.
- * That is deliberate and it is paired with the body write, which never destroys a
- * block it did not hand out: an editor cannot edit an image block here, and
- * cannot silently delete one either. The block survives a save untouched.
+ * FOUR editable kinds are returned: `rich_text`, `quote`, `divider` and `image`
+ * (a `Cms::DocumentBlock::GalleryItem` pointing at a row in the images gallery).
+ * A block of ANY OTHER `blockable_type` — `Video`, `Spacer`, `Entity` and the
+ * LEGACY `Image`, which is its own `Medium` and not this `image` kind — is NOT
+ * returned. That is deliberate and it is paired with the body write, which never
+ * destroys a block it did not hand out: an editor cannot edit one of those here,
+ * and cannot silently delete one either. It survives a save untouched, with only
+ * its position restated.
  */
 export function normalizeBlocks(blocks: Record<string, unknown>[]): AdminPostBlock[] {
 	const out: AdminPostBlock[] = [];
@@ -390,22 +531,84 @@ export function normalizeBlocks(blocks: Record<string, unknown>[]): AdminPostBlo
 				// `quoted_by` is the real attribution field.
 				quotedBy: cleanString(blockable?.quoted_by)
 			});
+		} else if (type === BLOCK_TYPE_DIVIDER) {
+			const stored = cleanString(blockable?.kind);
+			out.push({
+				id,
+				kind: 'divider',
+				dividerKind: (DIVIDER_KINDS as readonly string[]).includes(stored)
+					? (stored as DividerKind)
+					: DEFAULT_DIVIDER_KIND
+			});
+		} else if (type === BLOCK_TYPE_GALLERY_ITEM) {
+			out.push({
+				id,
+				kind: 'image',
+				galleryItemId: cleanString(blockable?.gallery_item_id) || null
+			});
 		}
 	}
 	return out;
 }
 
-const blockSchema = z
+const blockIdShape = { id: postIdSchema.nullable().optional() };
+
+/**
+ * One block on the wire in, per kind, each `.strict()`.
+ *
+ * A DISCRIMINATED union rather than one open object: with a single shape, a
+ * `quote` carrying an `html` key and a `divider` carrying nothing at all both
+ * parsed, and the write silently invented the missing half. Now the key set is
+ * exact per kind, and the outbound shape (`AdminPostBlock`) is this shape, so a
+ * round-trip of what the server handed out always parses.
+ */
+const blockSchema = z.discriminatedUnion('kind', [
+	z
+		.object({
+			...blockIdShape,
+			kind: z.literal('rich_text'),
+			html: z.string().max(MAX_FIELD_VALUE_CHARS).optional()
+		})
+		.strict(),
+	z
+		.object({
+			...blockIdShape,
+			kind: z.literal('quote'),
+			quote: z.string().max(20_000).optional(),
+			quotedBy: z.string().max(300).optional()
+		})
+		.strict(),
+	z
+		.object({
+			...blockIdShape,
+			kind: z.literal('divider'),
+			// Always sent — a divider with no size is a divider whose size the renderer
+			// guesses, and the guess belongs on the read (`DEFAULT_DIVIDER_KIND`).
+			dividerKind: z.enum(DIVIDER_KINDS)
+		})
+		.strict(),
+	z
+		.object({
+			...blockIdShape,
+			kind: z.literal('image'),
+			// Nullable, because a row upstream may point at nothing and must round-trip;
+			// `handleSavePostBody` is what refuses a null on a NEW or CHANGED block.
+			galleryItemId: archetypeIdSchema.nullable()
+		})
+		.strict()
+]);
+
+export const savePostBodySchema = z
 	.object({
-		id: postIdSchema.nullable().optional(),
-		kind: z.enum(['rich_text', 'quote']),
-		html: z.string().max(MAX_FIELD_VALUE_CHARS).optional(),
-		quote: z.string().max(20_000).optional(),
-		quotedBy: z.string().max(300).optional()
+		blocks: z.array(blockSchema).max(200),
+		/**
+		 * The `bodyVersion` this editor loaded — see `computeBodyVersion`. Required:
+		 * optional would mean a client could opt out of the interleaved-save check by
+		 * omitting one key, which is not a check.
+		 */
+		bodyVersion: z.string().min(1).max(200)
 	})
 	.strict();
-
-export const savePostBodySchema = z.object({ blocks: z.array(blockSchema).max(200) }).strict();
 
 /**
  * The block bodies in an UNVALIDATED save, keyed so a refusal can name the block.
@@ -435,16 +638,80 @@ export function blockHtmlValues(body: unknown): Record<string, unknown> {
 export type DesiredBlock = z.infer<typeof blockSchema>;
 
 /** The `blockable_type` an editable kind maps to. */
-function typeOf(kind: 'rich_text' | 'quote'): string {
-	return kind === 'quote' ? BLOCK_TYPE_QUOTE : BLOCK_TYPE_RICH_TEXT;
+export function typeOf(kind: AdminPostBlock['kind']): string {
+	if (kind === 'quote') return BLOCK_TYPE_QUOTE;
+	if (kind === 'divider') return BLOCK_TYPE_DIVIDER;
+	if (kind === 'image') return BLOCK_TYPE_GALLERY_ITEM;
+	return BLOCK_TYPE_RICH_TEXT;
 }
 
-/** The `blockable_attributes` payload for one desired block, sanitized. */
+/**
+ * The `blockable_attributes` payload for one desired block, sanitized.
+ *
+ * Every key here is one `documents_controller.rb:20-36` permits: `quote` /
+ * `quoted_by`, `kind`, `gallery_item_id`, `editor` / `content_html`. An
+ * unpermitted key is dropped by Rails in silence, so this list and that permit
+ * are the same list read twice.
+ */
 function payloadOf(block: DesiredBlock): Record<string, unknown> {
 	if (block.kind === 'quote') {
 		return { quote: block.quote ?? '', quoted_by: block.quotedBy ?? '' };
 	}
+	if (block.kind === 'divider') return { kind: block.dividerKind };
+	// `null` is sent as `null`: on an unchanged block it is a no-op, and it is the
+	// only way an existing null-backed row survives a save with its inner id.
+	if (block.kind === 'image') return { gallery_item_id: block.galleryItemId };
 	return { editor: 'quilljs', content_html: sanitizeHtml(block.html ?? '') };
+}
+
+/** Whether a stored row is one of the four kinds the editor is handed. */
+function isEditableRow(row: ApexBlockRow): boolean {
+	return (
+		row.blockableType === BLOCK_TYPE_RICH_TEXT ||
+		row.blockableType === BLOCK_TYPE_QUOTE ||
+		row.blockableType === BLOCK_TYPE_DIVIDER ||
+		row.blockableType === BLOCK_TYPE_GALLERY_ITEM
+	);
+}
+
+/**
+ * The stored row a desired block UPDATES IN PLACE, or `undefined` when it is a
+ * create. One rule, read by `buildBlocksAttributes` and by
+ * `changedImageBlocks` — spelling it twice is how the write and the gallery check
+ * come to disagree about which blocks are new.
+ *
+ * An id whose KIND changed is not an update: `blockable_type` is a different
+ * table, so it becomes a create plus a destroy.
+ */
+function matchingRow(
+	byId: Map<string, ApexBlockRow>,
+	block: DesiredBlock
+): ApexBlockRow | undefined {
+	const existing = block.id ? byId.get(block.id) : undefined;
+	return existing && existing.blockableType === typeOf(block.kind) ? existing : undefined;
+}
+
+/**
+ * The image blocks a save CREATES or CHANGES — the only ones whose
+ * `galleryItemId` has to be checked against the images gallery.
+ *
+ * A body whose image blocks all point where they already point performs no
+ * gallery read at all, which is the difference between one `cms_config` +
+ * paginated `gallery_items` walk per save and none.
+ */
+export function changedImageBlocks(
+	current: ApexBlockRow[],
+	desired: DesiredBlock[]
+): { index: number; galleryItemId: string | null }[] {
+	const byId = new Map(current.filter(isEditableRow).map((row) => [row.id, row]));
+	const out: { index: number; galleryItemId: string | null }[] = [];
+	desired.forEach((block, index) => {
+		if (block.kind !== 'image') return;
+		const existing = matchingRow(byId, block);
+		if (existing && existing.galleryItemId === block.galleryItemId) return;
+		out.push({ index, galleryItemId: block.galleryItemId });
+	});
+	return out;
 }
 
 /**
@@ -454,24 +721,31 @@ function payloadOf(block: DesiredBlock): Record<string, unknown> {
  * row simply omitted survives — so a client that sent the whole body twice would
  * DOUBLE it. This keeps by id, creates the id-less, destroys what the editor
  * removed, and never touches a block kind the editor was not shown.
+ *
+ * POSITIONS COME OUT CONTIGUOUS FROM 0. Passthrough rows hold their slot in
+ * document order while the attributes are laid out, and the filled slots are then
+ * renumbered `0…n-1` before they are emitted. Without that last step a removal
+ * left the numbering sparse — `[A, B, Spacer, C] → [A]` emitted `0, 2` — and
+ * nothing upstream renumbers (`document_block.rb` has no callback), so the gaps
+ * accumulated save after save.
  */
 export function buildBlocksAttributes(
 	current: ApexBlockRow[],
 	desired: DesiredBlock[]
 ): Record<string, unknown>[] {
-	const isEditable = (row: ApexBlockRow) =>
-		row.blockableType === BLOCK_TYPE_RICH_TEXT || row.blockableType === BLOCK_TYPE_QUOTE;
+	const isEditable = isEditableRow;
 	const ordered = [...current].sort((a, b) => a.position - b.position);
 	const editable = ordered.filter(isEditable);
 	const byId = new Map(editable.map((row) => [row.id, row]));
 	const kept = new Set<string>();
 
 	// POSITIONS ARE ASSIGNED ACROSS EVERY BLOCK, IN DOCUMENT ORDER. A block the
-	// editor is not shown (a story's gallery image) keeps its SLOT — the index it
-	// held among all blocks — and the editor's blocks fill the remaining slots in
-	// the order the editor sent. Numbering only the editable blocks from 0 would
-	// leave the gallery block on its old number, so a reorder around it could land
-	// two blocks on one position and Apex would order them arbitrarily.
+	// editor is not shown (a `Spacer`, a `Video`, a legacy `Image`) keeps its SLOT —
+	// the index it held among all blocks — and the editor's blocks fill the
+	// remaining slots in the order the editor sent. Numbering only the editable
+	// blocks from 0 would leave the passthrough on its old number, so a reorder
+	// around it could land two blocks on one position and Apex would order them
+	// arbitrarily.
 	const slots = new Array<Record<string, unknown> | null>(ordered.length + desired.length).fill(
 		null
 	);
@@ -479,14 +753,14 @@ export function buildBlocksAttributes(
 		if (!isEditable(row)) slots[index] = { id: row.id, position: index };
 	});
 	const queue = desired.map((block) => {
-		const existing = block.id ? byId.get(block.id) : undefined;
-		// An id whose KIND changed is not an update: `blockable_type` is a different
-		// table. It becomes a create here and a destroy below.
-		if (existing && existing.blockableType === typeOf(block.kind)) {
+		const existing = matchingRow(byId, block);
+		if (existing) {
 			kept.add(existing.id);
 			return {
 				id: existing.id,
 				blockable_type: existing.blockableType,
+				// The INNER id. Omit it and Apex mints a fresh `blockable` row on every
+				// save, so the outer block id holds while the row underneath it churns.
 				blockable_attributes: { id: existing.blockableId, ...payloadOf(block) }
 			};
 		}
@@ -499,13 +773,21 @@ export function buildBlocksAttributes(
 		slot += 1;
 	}
 
+	// COMPACT. The slots carry document ORDER; their indices are only as dense as
+	// the removals left them. Renumbering here — passthrough rows included, since
+	// each already emits its own `{id, position}` row — is what keeps the stored
+	// positions `0…n-1` for ever.
+	const filled = slots.filter((entry): entry is Record<string, unknown> => Boolean(entry));
+	filled.forEach((entry, index) => {
+		entry.position = index;
+	});
+
 	// Kept and created blocks in position order, then the untouched blocks' own
-	// position rows (so a gallery block's number is stated, never assumed), then
+	// position rows (so a passthrough's number is stated, never assumed), then
 	// the destroys.
 	const attributes: Record<string, unknown>[] = [];
 	const passthrough: Record<string, unknown>[] = [];
-	for (const entry of slots) {
-		if (!entry) continue;
+	for (const entry of filled) {
 		if ('blockable_type' in entry) attributes.push(entry);
 		else passthrough.push(entry);
 	}
@@ -605,29 +887,110 @@ export async function computePostVersion(
 			references: summary.references,
 			taggings: summary.tags.map((tag) => ({ id: tag.id, tagId: tag.tagId }))
 		},
+		// Every editable payload of every kind. A divider resized from `medium` to
+		// `large`, or an image repointed at another gallery item, is a change another
+		// tab must be told about — the token has to move for both.
 		blocks: blocks.map((block) => ({
 			id: block.id,
 			kind: block.kind,
-			html: block.html ?? '',
-			quote: block.quote ?? '',
-			quotedBy: block.quotedBy ?? ''
+			html: block.kind === 'rich_text' ? block.html : '',
+			quote: block.kind === 'quote' ? block.quote : '',
+			quotedBy: block.kind === 'quote' ? block.quotedBy : '',
+			dividerKind: block.kind === 'divider' ? block.dividerKind : '',
+			galleryItemId: block.kind === 'image' ? block.galleryItemId : null
 		}))
 	};
 	const canonical = JSON.stringify(canonicalize(projection));
 	return toHex(await crypto.subtle.digest('SHA-256', encoder.encode(canonical)));
 }
 
-/** The whole post the editor opens, its guard token, and the reference targets its pickers need. */
+/**
+ * The BODY's own version — a hash over the document rows as Apex holds them:
+ * outer block id, `blockable_type`, position, inner `blockable.id` and the
+ * editable payload.
+ *
+ * WHY IT EXISTS. `savePost` runs the composite stale check ONCE, before its
+ * writes; `handleSavePostBody` then reads the current rows fresh and `_destroy`s
+ * every EDITABLE row absent from what the editor sent. Tab A passes its check;
+ * Tab B adds a divider; A's body save reads B's divider as current, does not find
+ * it in A's desired list, and destroys it — silently, with a 200. That race used
+ * to be confined to rich text and quotes; four editable kinds widen it to blocks
+ * that were safe precisely because they were passthroughs.
+ *
+ * So the editor carries the version it LOADED and sends it with the body, and
+ * this operation recomputes it from the rows it has just read: a mismatch is
+ * `409 stale` with no PATCH.
+ *
+ * WHAT STAYS OPEN, deliberately: the window between this read and the PATCH
+ * inside one request. Closing that needs a compare-and-set on the document, which
+ * Apex does not offer — `PATCH /cms/documents/:id` takes no version, no ETag and
+ * no `lock_version`. The check narrows the race from "since you opened the
+ * editor" to "since this request started"; it does not remove it.
+ *
+ * Passthrough rows are hashed too (by id, type and position, with a null
+ * payload): a `Spacer` inserted between the load and the save moves the token,
+ * which is right — the save is about to renumber it.
+ */
+export async function computeBodyVersion(rows: Record<string, unknown>[]): Promise<string> {
+	const projection = [...rows]
+		.sort((a, b) => Number(a.position ?? 0) - Number(b.position ?? 0))
+		.map((row) => {
+			const blockable = isRecord(row.blockable) ? row.blockable : null;
+			const type = cleanString(row.blockable_type);
+			let payload: unknown = null;
+			if (type === BLOCK_TYPE_RICH_TEXT) payload = cleanString(blockable?.content_html);
+			else if (type === BLOCK_TYPE_QUOTE) {
+				payload = {
+					quote: cleanString(blockable?.quote),
+					quotedBy: cleanString(blockable?.quoted_by)
+				};
+			} else if (type === BLOCK_TYPE_DIVIDER) payload = cleanString(blockable?.kind);
+			else if (type === BLOCK_TYPE_GALLERY_ITEM) {
+				payload = cleanString(blockable?.gallery_item_id) || null;
+			}
+			return {
+				id: cleanString(row.id),
+				type,
+				position: Number(row.position ?? 0),
+				blockableId: blockable ? cleanString(blockable.id) : '',
+				payload
+			};
+		});
+	const canonical = JSON.stringify(canonicalize(projection));
+	return toHex(await crypto.subtle.digest('SHA-256', encoder.encode(canonical)));
+}
+
+/** The post an editor opens: the record, both guard tokens, and the pickers' targets. */
+export interface PostLoad {
+	ok: true;
+	post: AdminPost;
+	version: string;
+	bodyVersion: string;
+	referenceTargets: Record<string, AdminRecord[]>;
+}
+
+/**
+ * A load that FAILED for a reason that is not "there is no such post".
+ *
+ * The distinction is the whole point: `null` means the scoped view found nothing
+ * — a deleted post, or one of another schema — and is a 404. A typed failure means
+ * a record that exists could not be READ, and is a 502. Collapsing the two was
+ * how an unreadable document became a 404, and a 404 is what makes an editor's
+ * Reload build a draft out of `undefined`.
+ */
+export interface PostLoadFailure {
+	ok: false;
+	reason: 'document-unreadable' | 'reference-targets-unreadable';
+}
+
+export type PostLoadResult = PostLoad | PostLoadFailure | null;
+
 export async function buildPostLoad(
 	contract: ContentContract,
 	apex: ApexAdminClient,
 	slug: string,
 	postId: string
-): Promise<{
-	post: AdminPost;
-	version: string;
-	referenceTargets: Record<string, AdminRecord[]>;
-} | null> {
+): Promise<PostLoadResult> {
 	const view = await loadPostView(apex, slug, postId);
 	if (!view) return null;
 	const ids = readPostIds(view);
@@ -636,11 +999,14 @@ export async function buildPostLoad(
 		readDocumentBlocks(apex, ids.documentId),
 		loadReferenceTargets(contract, apex, slug)
 	]);
-	if (!targets.ok) return null;
+	if (apexBlocks === null) return { ok: false, reason: 'document-unreadable' };
+	if (!targets.ok) return { ok: false, reason: 'reference-targets-unreadable' };
 	const blocks = normalizeBlocks(apexBlocks);
 	return {
+		ok: true,
 		post: summarizePost(contract, slug, view, archetype, blocks),
 		version: await computePostVersion(view, archetype, blocks, contract, slug),
+		bodyVersion: await computeBodyVersion(apexBlocks),
 		referenceTargets: targets.targets
 	};
 }

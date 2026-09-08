@@ -174,7 +174,29 @@ export async function handleUpdatePostArchetype(
 
 	// Re-read: the join-row ids the browser must diff against next time are newly
 	// minted, and a 200 from this surface is not evidence the reference moved.
+	//
+	// The same rule as the fields stage's (`update-post.ts`): the archetype write has
+	// LANDED, so a failed read back is `ok: true, unread: true` with an `accepted`
+	// row saying so — not a 502 that tells an editor nothing was saved over
+	// references that were. The join-row ids are diffed against a FRESH read on the
+	// next save, so a retry cannot double them.
 	const loaded = await buildPostLoad(contract, guard.apex, params.schema, ids.postId);
-	if (!loaded) return bffError(502, 'unexpected upstream shape');
-	return noStoreJson({ ok: true, post: loaded.post, version: loaded.version });
+	if (!loaded || loaded.ok !== true) {
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'accepted',
+			detail: {
+				schema: params.schema,
+				postId: ids.postId,
+				unread: true,
+				reason: loaded ? loaded.reason : 'post-archetype-read-failed'
+			}
+		});
+		return noStoreJson({ ok: true, unread: true });
+	}
+	return noStoreJson({
+		ok: true,
+		post: loaded.post,
+		version: loaded.version,
+		bodyVersion: loaded.bodyVersion
+	});
 }

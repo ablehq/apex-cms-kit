@@ -34,6 +34,19 @@ export const STALE_MESSAGE =
 	'This was changed somewhere else since you opened it. Reload to get the latest version, then re-apply your changes.';
 
 /**
+ * What the screen says when the body write may have LANDED and could not be read
+ * back (`body-written-unread`, `save-post-body.ts`).
+ *
+ * It has to say Reload rather than Retry, and it has to say what was not saved.
+ * Retrying resends every block with the id it had when the editor loaded — and a
+ * block created by the uncertain write now HAS an id the browser has never seen,
+ * so the retry appends a second copy of it. The stages after the body (references,
+ * tags, status) never ran.
+ */
+export const BODY_UNREAD_MESSAGE =
+	'The body may have been saved but could not be read back. Reload before editing further — the references and tags you changed after the body were not saved and must be re-applied.';
+
+/**
  * @param {string} stage @param {any} res
  */
 function messageFor(stage, res) {
@@ -52,6 +65,11 @@ function messageFor(stage, res) {
 		return 'Saving failed. Nothing after it was saved — Save again to retry.';
 	}
 	if (stage === 'body') {
+		if (res?.code === 'body-written-unread') return BODY_UNREAD_MESSAGE;
+		if (status === 409) return STALE_MESSAGE;
+		if (res?.code === 'unknown-image' || res?.error === 'unknown-image') {
+			return 'One of the pictures in the body is not in this workspace’s image library. Choose it again from the picker, then Save.';
+		}
 		return 'The body could not be saved. Your field edits were saved; Save again to retry.';
 	}
 	if (stage === 'archetype') {
@@ -70,7 +88,7 @@ function messageFor(stage, res) {
  * @typedef {{
  *   readPostVersion: (slug: string, id: string) => Promise<{ version?: unknown } | null>,
  *   updatePost: (slug: string, id: string, patch: unknown) => Promise<any>,
- *   savePostBody: (slug: string, id: string, blocks: unknown[]) => Promise<any>,
+ *   savePostBody: (slug: string, id: string, blocks: unknown[], bodyVersion: string) => Promise<any>,
  *   updatePostArchetype: (slug: string, id: string, patch: unknown) => Promise<any>,
  *   setPostTags: (slug: string, id: string, tagIds: string[]) => Promise<any>,
  *   changePostStatus: (slug: string, id: string, statusEvent: string) => Promise<any>,
@@ -80,7 +98,7 @@ function messageFor(stage, res) {
  * @param {PostDraft} draft
  * @param {PostClient} client the ONLY thing that touches the network
  * @param {{ statusEvent?: 'publish' | 'unpublish' | null }} [options]
- * @returns {Promise<{ok: boolean, stage?: string, status?: number, stale?: boolean, message?: string, refreshed?: boolean}>}
+ * @returns {Promise<{ok: boolean, stage?: string, status?: number, code?: string, stale?: boolean, message?: string, refreshed?: boolean}>}
  */
 export async function savePost(draft, client, options = {}) {
 	const { statusEvent } = options;
@@ -115,17 +133,28 @@ export async function savePost(draft, client, options = {}) {
 		}
 	}
 
-	// 3. The body — the whole document, in order.
+	// 3. The body — the whole document, in order, with the DOCUMENT's own token so a
+	// block another tab added since this editor loaded is not destroyed by this save.
 	if (draft.bodyDirty) {
-		const res = await client.savePostBody(slug, id, draft.blocks);
+		const res = await client.savePostBody(slug, id, draft.blocks, draft.bodyVersion);
 		if (!res.ok) {
+			// A write that MAY have landed is not an ordinary failure: the screen must
+			// offer Reload, because a retry would resend `id: null` blocks that now exist
+			// and append a second copy of each. `409` is the interleaved-save refusal —
+			// nothing was written, and Reload is right there too.
+			const unread = res.code === 'body-written-unread';
 			return {
 				ok: false,
 				stage: 'body',
 				status: res.status,
+				code: res.code,
+				stale: unread || res.status === 409,
 				message: messageFor('body', res)
 			};
 		}
+		// Adopt the document's new token, so a second save in the same session is not
+		// refused as stale by the write this one just made.
+		if (typeof res.bodyVersion === 'string' && res.bodyVersion) draft.bodyVersion = res.bodyVersion;
 	}
 
 	// 4. The archetype half — primitives and references.
@@ -168,10 +197,12 @@ export async function savePost(draft, client, options = {}) {
 		}
 	}
 
-	// 7. Re-baseline.
+	// 7. Re-baseline. `refreshed: false` means every write landed but the draft is now
+	// behind what is stored — the screen must treat it like `stale` and offer Reload,
+	// not present the old values as current.
 	try {
 		const fresh = await client.getPost(slug, id);
-		reconcilePost(draft, fresh.post, fresh.version);
+		reconcilePost(draft, fresh.post, fresh.version, fresh.bodyVersion);
 	} catch {
 		return { ok: true, refreshed: false };
 	}

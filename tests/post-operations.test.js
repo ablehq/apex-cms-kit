@@ -6,8 +6,11 @@ import {
 	apexBlockRows,
 	apexValidationErrors,
 	buildBlocksAttributes,
+	changedImageBlocks,
+	computeBodyVersion,
 	computePostVersion,
 	coverAttributes,
+	isCalendarDate,
 	listAllPages,
 	metaAttributes,
 	normalizeBlocks,
@@ -17,12 +20,14 @@ import {
 	savePostBodySchema,
 	summarizePost
 } from '../src/server/bff/operations/post-shape.ts';
+import { handleSavePostBody } from '../src/server/bff/operations/save-post-body.ts';
+import { createPostDraft, setPostBlocks } from '../src/admin/post-draft.js';
 import { createPostBodySchema } from '../src/server/bff/operations/create-post.ts';
 import {
 	handleUpdatePost,
 	updatePostBodySchema
 } from '../src/server/bff/operations/update-post.ts';
-import { handleGetPost } from '../src/server/bff/operations/get-post.ts';
+import { handleGetPost, handleReadPostVersion } from '../src/server/bff/operations/get-post.ts';
 import { handleCreatePost } from '../src/server/bff/operations/create-post.ts';
 import { createMigratedDatabase } from './harness/d1.ts';
 import { handleDeletePost } from '../src/server/bff/operations/delete-post.ts';
@@ -48,11 +53,18 @@ import { createMemorySessionStore } from './harness/session-store.ts';
 const RICH = 'Cms::DocumentBlock::RichText';
 const QUOTE = 'Cms::DocumentBlock::Quote';
 const GALLERY = 'Cms::DocumentBlock::GalleryItem';
+const DIVIDER = 'Cms::DocumentBlock::Divider';
+// The Disk-SAFE passthrough. `Video` and the legacy `Image` serialise `file … :url`
+// and raise inside Apex on Disk storage, so `Spacer` is the block a real-Apex test
+// can insert beside an editable one without setting the trap off.
+const SPACER = 'Cms::DocumentBlock::Spacer';
 
 const uuid = (n) => `${`${n}`.repeat(8)}-1111-2222-3333-444444444444`.slice(0, 36);
 const ID_A = 'aaaaaaaa-1111-2222-3333-444444444444';
 const ID_B = 'bbbbbbbb-1111-2222-3333-444444444444';
 const ID_C = 'cccccccc-1111-2222-3333-444444444444';
+const ID_D = 'dddddddd-aaaa-2222-3333-444444444444';
+const ID_E = 'eeeeeeee-aaaa-2222-3333-444444444444';
 const POST = 'dddddddd-1111-2222-3333-444444444444';
 const ARCH = 'eeeeeeee-1111-2222-3333-444444444444';
 const DOC = 'ffffffff-1111-2222-3333-444444444444';
@@ -60,6 +72,11 @@ const FA1 = '11111111-1111-2222-3333-444444444444';
 const FA2 = '22222222-1111-2222-3333-444444444444';
 const IMG1 = '33333333-1111-2222-3333-444444444444';
 const IMG2 = '44444444-1111-2222-3333-444444444444';
+// A real gallery item that is NOT in the images gallery — the shape `shared_gallery_item.rb`
+// happily accepts as a cover, and `gallery_item_id` happily stores on a block.
+const VIDEO_ITEM = '55555555-1111-2222-3333-444444444444';
+const GALLERY_ID = '66666666-1111-2222-3333-444444444444';
+const VIDEO_GALLERY_ID = '77777777-1111-2222-3333-444444444444';
 
 /** A two-post-schema content model: `story` (kind + author/focus_area/partner) and `update`. */
 const contract = {
@@ -123,6 +140,12 @@ const contract = {
 			: { countable: [], uncounted: [] }
 };
 
+/**
+ * The shared document fixture: three EDITABLE blocks, one of each of the kinds
+ * whose payload differs. The GalleryItem at `ID_C` used to be here as the block
+ * the editor was NOT shown; it is editable now, so the preservation property moved
+ * to `apexBlocksWithSpacer()`.
+ */
 function apexBlocks() {
 	return [
 		{
@@ -142,6 +165,25 @@ function apexBlocks() {
 			position: 2,
 			blockable_type: GALLERY,
 			blockable: { id: uuid(7), gallery_item_id: IMG1 }
+		}
+	];
+}
+
+/** The same document with a PASSTHROUGH `Spacer` in the middle — what a save must never touch. */
+function apexBlocksWithSpacer() {
+	return [
+		{
+			id: ID_A,
+			position: 0,
+			blockable_type: RICH,
+			blockable: { id: uuid(5), content_html: '<p>One.</p>' }
+		},
+		{ id: ID_D, position: 1, blockable_type: SPACER, blockable: { id: uuid(4), kind: 'small' } },
+		{
+			id: ID_B,
+			position: 2,
+			blockable_type: QUOTE,
+			blockable: { id: uuid(6), quote: 'Q.', quoted_by: 'W' }
 		}
 	];
 }
@@ -202,12 +244,12 @@ describe('post-shape — the schema gate', () => {
 });
 
 describe('post body — the reconciliation, and what it never destroys', () => {
-	it('keeps an unchanged block by id rather than appending a copy', () => {
+	it('keeps an unchanged block of every editable kind by id rather than appending a copy', () => {
 		const attributes = buildBlocksAttributes(apexBlockRows(apexBlocks()), [
 			{ id: ID_A, kind: 'rich_text', html: '<p>One.</p>' },
-			{ id: ID_B, kind: 'quote', quote: 'Q.', quotedBy: 'W' }
+			{ id: ID_B, kind: 'quote', quote: 'Q.', quotedBy: 'W' },
+			{ id: ID_C, kind: 'image', galleryItemId: IMG1 }
 		]);
-		// Two editable rows by id, plus the gallery block's position-only row.
 		assert.equal(attributes.length, 3);
 		assert.ok(attributes.every((row) => row.id && !row._destroy));
 		assert.deepEqual(
@@ -218,13 +260,21 @@ describe('post body — the reconciliation, and what it never destroys', () => {
 				[ID_C, 2]
 			]
 		);
+		// THE INNER ID travels on every one of them. Omit it and Apex mints a fresh
+		// `blockable` row per save: the outer id holds while the row under it churns.
+		assert.deepEqual(
+			attributes.map((row) => row.blockable_attributes.id),
+			[uuid(5), uuid(6), uuid(7)]
+		);
+		assert.deepEqual(attributes[2].blockable_attributes, { id: uuid(7), gallery_item_id: IMG1 });
 	});
 
-	it('NEVER destroys a GalleryItem block — a story body the editor was not shown', () => {
-		// The editor round-trips only what `normalizeBlocks` handed it; the gallery
-		// block is not in that list, and a save that did not mention it must not
-		// delete it. This is the block Godrej's story bodies carry.
-		const attributes = buildBlocksAttributes(apexBlockRows(apexBlocks()), []);
+	it('NEVER destroys a passthrough block — a Spacer the editor was not shown', () => {
+		// The editor round-trips only what `normalizeBlocks` handed it. `Spacer` is not
+		// in that list, and a save that did not mention it must not delete it. Since the
+		// four editable kinds now include `image`, this is the only remaining exercise
+		// of the untouched-slot path.
+		const attributes = buildBlocksAttributes(apexBlockRows(apexBlocksWithSpacer()), []);
 		assert.deepEqual(
 			attributes
 				.filter((row) => row._destroy)
@@ -232,34 +282,20 @@ describe('post body — the reconciliation, and what it never destroys', () => {
 				.sort(),
 			[ID_A, ID_B].sort()
 		);
-		const gallery = attributes.find((row) => row.id === ID_C);
-		assert.ok(gallery && !gallery._destroy, 'the gallery block survives');
-		assert.deepEqual(gallery, { id: ID_C, position: 2 }, 'and only its position is restated');
+		const spacer = attributes.find((row) => row.id === ID_D);
+		assert.ok(spacer && !spacer._destroy, 'the spacer survives');
+		// …and its position is COMPACTED to 0, because it is the only row left. Leaving
+		// it on 1 is the sparse numbering nothing upstream ever heals.
+		assert.deepEqual(spacer, { id: ID_D, position: 0 }, 'only its position is restated');
 	});
 
-	it('numbers positions across ALL blocks in document order — a gallery block keeps its slot', () => {
-		// Gallery block in the MIDDLE: [rich A @0, gallery C @1, quote B @2]. The editor
-		// swaps its two blocks. Numbering only the editable blocks from 0 would put B
-		// on 0 and A on 1 while the gallery stayed on 1 — a collision Apex resolves
-		// arbitrarily. Every block gets a distinct slot instead.
-		const current = apexBlockRows([
-			{
-				id: ID_A,
-				position: 0,
-				blockable_type: RICH,
-				blockable: { id: uuid(5), content_html: '<p>A</p>' }
-			},
-			{ id: ID_C, position: 1, blockable_type: GALLERY, blockable: { id: uuid(7) } },
-			{
-				id: ID_B,
-				position: 2,
-				blockable_type: QUOTE,
-				blockable: { id: uuid(6), quote: 'Q', quoted_by: 'W' }
-			}
-		]);
-		const attributes = buildBlocksAttributes(current, [
-			{ id: ID_B, kind: 'quote', quote: 'Q', quotedBy: 'W' },
-			{ id: ID_A, kind: 'rich_text', html: '<p>A</p>' },
+	it('numbers positions across ALL blocks in document order — a passthrough keeps its slot', () => {
+		// Spacer in the MIDDLE: [rich A @0, spacer @1, quote B @2]. The editor swaps its
+		// two blocks. Numbering only the editable blocks from 0 would put B on 0 and A on
+		// 1 while the spacer stayed on 1 — a collision Apex resolves arbitrarily.
+		const attributes = buildBlocksAttributes(apexBlockRows(apexBlocksWithSpacer()), [
+			{ id: ID_B, kind: 'quote', quote: 'Q.', quotedBy: 'W' },
+			{ id: ID_A, kind: 'rich_text', html: '<p>One.</p>' },
 			{ id: null, kind: 'rich_text', html: '<p>new</p>' }
 		]);
 		const positions = attributes
@@ -268,31 +304,218 @@ describe('post body — the reconciliation, and what it never destroys', () => {
 			.sort((a, b) => a[1] - b[1]);
 		assert.deepEqual(positions, [
 			[ID_B, 0],
-			[ID_C, 1],
+			[ID_D, 1],
 			[ID_A, 2],
 			['new', 3]
 		]);
-		assert.equal(
-			new Set(positions.map(([, p]) => p)).size,
-			positions.length,
-			'no two blocks share a position'
-		);
 		assert.ok(!attributes.some((row) => row._destroy), 'nothing destroyed');
 	});
 
-	it('normalizes the two editable kinds and drops the gallery block from the editor', () => {
+	it('compacts positions to 0…n-1 after removals around a passthrough', () => {
+		// [A, B, Spacer, C] → keep A only. The slot algorithm alone emits `0, 2`; nothing
+		// upstream renumbers (`document_block.rb` has no callback), so the gap is
+		// permanent and the next removal widens it.
+		const rows = apexBlockRows([
+			{ id: ID_A, position: 0, blockable_type: RICH, blockable: { id: uuid(5) } },
+			{ id: ID_B, position: 1, blockable_type: QUOTE, blockable: { id: uuid(6) } },
+			{ id: ID_D, position: 2, blockable_type: SPACER, blockable: { id: uuid(4) } },
+			{ id: ID_C, position: 3, blockable_type: GALLERY, blockable: { id: uuid(7) } }
+		]);
+		const attributes = buildBlocksAttributes(rows, [
+			{ id: ID_A, kind: 'rich_text', html: '<p>One.</p>' }
+		]);
 		assert.deepEqual(
-			normalizeBlocks(apexBlocks()).map((block) => block.kind),
-			['rich_text', 'quote']
+			attributes
+				.filter((row) => !row._destroy)
+				.map((row) => [row.id, row.position])
+				.sort((a, b) => a[1] - b[1]),
+			[
+				[ID_A, 0],
+				[ID_D, 1]
+			],
+			'contiguous BY VALUE, not merely unique'
+		);
+
+		// A TRAILING passthrough, and everything before it removed.
+		const trailing = buildBlocksAttributes(
+			apexBlockRows([
+				{ id: ID_A, position: 0, blockable_type: RICH, blockable: { id: uuid(5) } },
+				{ id: ID_B, position: 1, blockable_type: QUOTE, blockable: { id: uuid(6) } },
+				{ id: ID_D, position: 2, blockable_type: SPACER, blockable: { id: uuid(4) } }
+			]),
+			[]
+		);
+		assert.deepEqual(
+			trailing.filter((row) => !row._destroy),
+			[{ id: ID_D, position: 0 }]
 		);
 	});
 
-	it('turns a changed KIND into a create plus a destroy', () => {
+	it('normalizes the four editable kinds and drops the rest', () => {
+		assert.deepEqual(
+			normalizeBlocks([
+				...apexBlocks(),
+				{
+					id: ID_D,
+					position: 3,
+					blockable_type: DIVIDER,
+					blockable: { id: uuid(4), kind: 'large' }
+				},
+				{
+					id: ID_E,
+					position: 4,
+					blockable_type: SPACER,
+					blockable: { id: uuid(3), kind: 'small' }
+				},
+				{ id: uuid(2), position: 5, blockable_type: 'Cms::DocumentBlock::Video', blockable: {} },
+				// The LEGACY image block — its own `Medium`, not a GalleryItem. A passthrough.
+				{ id: uuid(1), position: 6, blockable_type: 'Cms::DocumentBlock::Image', blockable: {} }
+			]).map((block) => block.kind),
+			['rich_text', 'quote', 'image', 'divider']
+		);
+		assert.deepEqual(normalizeBlocks(apexBlocks())[2], {
+			id: ID_C,
+			kind: 'image',
+			galleryItemId: IMG1
+		});
+	});
+
+	it('a divider with no stored kind reads as medium; the three real kinds read as themselves', () => {
+		const read = (kind) =>
+			normalizeBlocks([
+				{ id: ID_D, position: 0, blockable_type: DIVIDER, blockable: { id: uuid(4), kind } }
+			])[0].dividerKind;
+		assert.equal(read('small'), 'small');
+		assert.equal(read('medium'), 'medium');
+		assert.equal(read('large'), 'large');
+		assert.equal(read(null), 'medium', 'kind is allow_nil upstream');
+		assert.equal(read('enormous'), 'medium', 'and unvalidated values read as the default too');
+	});
+
+	it('a GalleryItem row with a NULL item reads as an image block with no picture', () => {
+		assert.deepEqual(
+			normalizeBlocks([
+				{
+					id: ID_C,
+					position: 0,
+					blockable_type: GALLERY,
+					blockable: { id: uuid(7), gallery_item_id: null }
+				}
+			]),
+			[{ id: ID_C, kind: 'image', galleryItemId: null }]
+		);
+	});
+
+	it('writes a divider as `kind` and an image as `gallery_item_id` — the permitted keys', () => {
+		const created = buildBlocksAttributes(
+			[],
+			[
+				{ id: null, kind: 'divider', dividerKind: 'large' },
+				{ id: null, kind: 'image', galleryItemId: IMG2 }
+			]
+		);
+		assert.deepEqual(created, [
+			{ blockable_type: DIVIDER, blockable_attributes: { kind: 'large' }, position: 0 },
+			{ blockable_type: GALLERY, blockable_attributes: { gallery_item_id: IMG2 }, position: 1 }
+		]);
+	});
+
+	it('updates a divider’s kind and an image’s item IN PLACE, keeping both ids', () => {
+		const rows = apexBlockRows([
+			{ id: ID_D, position: 0, blockable_type: DIVIDER, blockable: { id: uuid(4), kind: 'small' } },
+			{
+				id: ID_C,
+				position: 1,
+				blockable_type: GALLERY,
+				blockable: { id: uuid(7), gallery_item_id: IMG1 }
+			}
+		]);
+		const attributes = buildBlocksAttributes(rows, [
+			{ id: ID_D, kind: 'divider', dividerKind: 'large' },
+			{ id: ID_C, kind: 'image', galleryItemId: IMG2 }
+		]);
+		assert.deepEqual(attributes, [
+			{
+				id: ID_D,
+				blockable_type: DIVIDER,
+				blockable_attributes: { id: uuid(4), kind: 'large' },
+				position: 0
+			},
+			{
+				id: ID_C,
+				blockable_type: GALLERY,
+				blockable_attributes: { id: uuid(7), gallery_item_id: IMG2 },
+				position: 1
+			}
+		]);
+	});
+
+	it('a stored NULL gallery_item_id round-trips on an unchanged block, both ids intact', () => {
+		// The column is nullable and the association optional, so a GalleryItem block
+		// with no item can exist upstream. Under a strict non-null schema it could not be
+		// read back and re-sent, and once the kind is editable, omitting it destroys it.
+		const rows = apexBlockRows([
+			{
+				id: ID_C,
+				position: 0,
+				blockable_type: GALLERY,
+				blockable: { id: uuid(7), gallery_item_id: null }
+			},
+			{
+				id: ID_A,
+				position: 1,
+				blockable_type: RICH,
+				blockable: { id: uuid(5), content_html: '<p>x</p>' }
+			}
+		]);
+		const attributes = buildBlocksAttributes(rows, [
+			...normalizeBlocks([
+				{
+					id: ID_C,
+					position: 0,
+					blockable_type: GALLERY,
+					blockable: { id: uuid(7), gallery_item_id: null }
+				}
+			]),
+			{ id: ID_A, kind: 'rich_text', html: '<p>edited</p>' }
+		]);
+		assert.deepEqual(attributes[0], {
+			id: ID_C,
+			blockable_type: GALLERY,
+			blockable_attributes: { id: uuid(7), gallery_item_id: null },
+			position: 0
+		});
+		// …and it is NOT a changed image block, so it costs no gallery read.
+		assert.deepEqual(
+			changedImageBlocks(rows, [
+				{ id: ID_C, kind: 'image', galleryItemId: null },
+				{ id: ID_A, kind: 'rich_text', html: '<p>edited</p>' }
+			]),
+			[]
+		);
+		// Repairing it through the picker IS a change.
+		assert.deepEqual(changedImageBlocks(rows, [{ id: ID_C, kind: 'image', galleryItemId: IMG1 }]), [
+			{ index: 0, galleryItemId: IMG1 }
+		]);
+	});
+
+	it('turns a changed KIND into a create plus a destroy, across all four kinds', () => {
 		const attributes = buildBlocksAttributes(apexBlockRows(apexBlocks()), [
-			{ id: ID_A, kind: 'quote', quote: 'Now a quotation.', quotedBy: '' }
+			{ id: ID_A, kind: 'quote', quote: 'Now a quotation.', quotedBy: '' },
+			{ id: ID_C, kind: 'divider', dividerKind: 'small' }
 		]);
 		assert.ok(attributes.some((row) => row._destroy && row.id === ID_A));
+		assert.ok(attributes.some((row) => row._destroy && row.id === ID_C));
 		assert.ok(attributes.some((row) => !row.id && row.blockable_type === QUOTE));
+		assert.ok(attributes.some((row) => !row.id && row.blockable_type === DIVIDER));
+		// A kind change is a create, so it is a CHANGED image block even when the id is
+		// carried over — otherwise the new GalleryItem row would skip the gallery check.
+		assert.deepEqual(
+			changedImageBlocks(apexBlockRows(apexBlocks()), [
+				{ id: ID_A, kind: 'image', galleryItemId: IMG1 }
+			]),
+			[{ index: 0, galleryItemId: IMG1 }]
+		);
 	});
 
 	it('sanitizes on the way in and the way out', () => {
@@ -312,9 +535,77 @@ describe('post body — the reconciliation, and what it never destroys', () => {
 		assert.ok(!blocks[0].html.includes('onclick'));
 	});
 
-	it('body: a block is one of two kinds and carries nothing else', () => {
-		assert.ok(savePostBodySchema.safeParse({ blocks: [] }).success);
-		assert.ok(!savePostBodySchema.safeParse({ blocks: [{ kind: 'image', url: 'x' }] }).success);
+	it('body: a block is one of FOUR kinds, each closed, and the version key is required', () => {
+		const ok = (blocks) => savePostBodySchema.safeParse({ blocks, bodyVersion: 'v' }).success;
+		assert.ok(ok([]));
+		assert.ok(ok([{ kind: 'divider', dividerKind: 'small' }]));
+		assert.ok(ok([{ kind: 'image', galleryItemId: IMG1 }]));
+		assert.ok(ok([{ kind: 'image', galleryItemId: null }]));
+		// `url` is not a key of the image block, and `galleryItemId` is not optional.
+		assert.ok(!ok([{ kind: 'image', url: 'x' }]));
+		assert.ok(!ok([{ kind: 'image', galleryItemId: IMG1, caption: 'read-only' }]));
+		assert.ok(!ok([{ kind: 'divider' }]), 'a divider always names its size');
+		assert.ok(!ok([{ kind: 'divider', dividerKind: 'enormous' }]));
+		assert.ok(!ok([{ kind: 'quote', html: '<p>x</p>' }]), 'kinds do not share keys');
+		assert.ok(!ok([{ kind: 'spacer' }]), 'a passthrough kind is not authorable');
+		assert.ok(!savePostBodySchema.safeParse({ blocks: [] }).success, 'bodyVersion is required');
+		assert.ok(
+			!savePostBodySchema.safeParse({ blocks: [], bodyVersion: '' }).success,
+			'and may not be empty'
+		);
+	});
+
+	it('the ROUND TRIP: what the server hands out parses when it is handed straight back', async () => {
+		// "Outbound shape = inbound shape" is what makes the draft able to hold the
+		// server's blocks verbatim and send them verbatim into a `.strict()` schema. A
+		// read-only convenience key added to the outbound block would break this.
+		const rows = [
+			...apexBlocks(),
+			{ id: ID_D, position: 3, blockable_type: DIVIDER, blockable: { id: uuid(4), kind: 'large' } }
+		];
+		const blocks = normalizeBlocks(rows);
+		const draft = createPostDraft('story', { id: POST, blocks }, 'v', contract, 'bv');
+		setPostBlocks(draft, draft.blocks);
+		const parsed = savePostBodySchema.safeParse({
+			blocks: draft.blocks,
+			bodyVersion: draft.bodyVersion
+		});
+		assert.ok(parsed.success, JSON.stringify(parsed.error?.issues));
+		assert.deepEqual(parsed.data.blocks, blocks);
+	});
+
+	it('the body version moves for a divider’s size and an image’s item, and only for a real change', async () => {
+		const base = await computeBodyVersion(apexBlocks());
+		assert.equal(await computeBodyVersion(apexBlocks()), base, 'stable across identical reads');
+		assert.equal(
+			await computeBodyVersion([...apexBlocks()].reverse()),
+			base,
+			'and across key/row order, because it sorts by position'
+		);
+		const repointed = apexBlocks();
+		repointed[2].blockable.gallery_item_id = IMG2;
+		assert.notEqual(await computeBodyVersion(repointed), base);
+		const resized = [
+			{ id: ID_D, position: 0, blockable_type: DIVIDER, blockable: { id: uuid(4), kind: 'small' } }
+		];
+		const resizedLarge = [
+			{ id: ID_D, position: 0, blockable_type: DIVIDER, blockable: { id: uuid(4), kind: 'large' } }
+		];
+		assert.notEqual(await computeBodyVersion(resized), await computeBodyVersion(resizedLarge));
+		// A PASSTHROUGH row appearing moves it too — the save is about to renumber it.
+		assert.notEqual(await computeBodyVersion(apexBlocksWithSpacer()), base);
+	});
+
+	it('the composite version moves for a divider’s size and an image’s item', async () => {
+		const version = (blocks) => computePostVersion(view(), archetype(), blocks, contract, 'story');
+		const base = await version(normalizeBlocks(apexBlocks()));
+		const repointed = apexBlocks();
+		repointed[2].blockable.gallery_item_id = IMG2;
+		assert.notEqual(await version(normalizeBlocks(repointed)), base);
+		assert.notEqual(
+			await version([{ id: ID_D, kind: 'divider', dividerKind: 'small' }]),
+			await version([{ id: ID_D, kind: 'divider', dividerKind: 'large' }])
+		);
 	});
 });
 
@@ -499,7 +790,8 @@ const CSRF = 'csrf-posts';
  * found under `story` and NOT under `update`. Every call is recorded so a refusal
  * can be proved to have written nothing.
  */
-function apexStub(calls, options = {}) {
+function apexStub(calls, options = {}, stored = {}) {
+	let documentWritten = false;
 	return {
 		async listPosts(slug, query) {
 			calls.push(['listPosts', slug, query]);
@@ -522,9 +814,79 @@ function apexStub(calls, options = {}) {
 			calls.push(['getPostArchetype', slug, id]);
 			return { ok: true, status: 200, body: { data: archetype() } };
 		},
+		/**
+		 * `documentStatus` drives the failure cases: a non-2xx read, and `'throw'` for a
+		 * transport fault. `documentReads` lets one test answer DIFFERENT rows on the
+		 * second read, which is the interleaved save.
+		 */
 		async getDocument(id) {
 			calls.push(['getDocument', id]);
-			return { ok: true, status: 200, body: { data: { id, blocks: apexBlocks() } } };
+			const seen = calls.filter(([name]) => name === 'getDocument').length;
+			if (options.documentStatus === 'throw') throw new TypeError('network');
+			if (typeof options.documentStatus === 'number' && options.documentStatus >= 400) {
+				return { ok: false, status: options.documentStatus, body: null };
+			}
+			if (options.documentStatusAfterWrite && documentWritten) {
+				if (options.documentStatusAfterWrite === 'throw') throw new TypeError('network');
+				return { ok: false, status: options.documentStatusAfterWrite, body: null };
+			}
+			const rows = options.documentReads
+				? (options.documentReads[seen - 1] ?? options.documentReads.at(-1))
+				: (options.blocks ?? apexBlocks());
+			return { ok: true, status: 200, body: { data: { id, blocks: rows } } };
+		},
+		/**
+		 * A PATCH double that MUTATES its stored rows BEFORE it answers, so a test can
+		 * prove what a failing write left behind. Rails commits at `resource.update` and
+		 * can still raise while rendering — a 500 is not evidence that nothing landed.
+		 */
+		async updateDocumentBlocks(id, attributes) {
+			calls.push(['updateDocumentBlocks', id, attributes]);
+			documentWritten = true;
+			stored.documentBlocks = attributes;
+			if (options.patchStatus === 'throw') throw new TypeError('network');
+			if (typeof options.patchStatus === 'number' && options.patchStatus >= 400) {
+				return { ok: false, status: options.patchStatus, body: null };
+			}
+			return { ok: true, status: 200, body: { data: { id } } };
+		},
+		async readCmsConfig() {
+			calls.push(['readCmsConfig']);
+			if (options.galleryStatus && options.galleryStatus >= 400) {
+				return { ok: false, status: options.galleryStatus, body: null };
+			}
+			return {
+				ok: true,
+				status: 200,
+				body: {
+					data: {
+						asset_library: [
+							{ gallery: { id: GALLERY_ID, name: 'images' } },
+							{ gallery: { id: VIDEO_GALLERY_ID, name: 'videos' } }
+						]
+					}
+				}
+			};
+		},
+		async listGalleryItems(galleryId) {
+			calls.push(['listGalleryItems', galleryId]);
+			if (options.itemsStatus && options.itemsStatus >= 400) {
+				return { ok: false, status: options.itemsStatus, body: null };
+			}
+			const members = options.galleryMembers ?? [IMG1, IMG2];
+			return {
+				ok: true,
+				status: 200,
+				body: {
+					data: members.map((id, index) => ({
+						id,
+						gallery_id: galleryId,
+						position: index,
+						created_at: `2026-09-0${index + 1}T00:00:00Z`
+					})),
+					pagination: { total_count: members.length, current_page: 1, total_pages: 1 }
+				}
+			};
 		},
 		async listContentLibrary(slug) {
 			calls.push(['listContentLibrary', slug]);
@@ -557,6 +919,17 @@ function apexStub(calls, options = {}) {
 		},
 		async updatePostFields(id, fields) {
 			calls.push(['updatePostFields', id, fields]);
+			if (options.updatePostFieldsStatus === 422) {
+				return {
+					ok: false,
+					status: 422,
+					body: {
+						data: [
+							{ attribute_name: 'shared_gallery_items.gallery_item', messages: ['must exist'] }
+						]
+					}
+				};
+			}
 			return { ok: true, status: 200, body: { data: { id } } };
 		},
 		async deletePost(slug, id) {
@@ -574,7 +947,7 @@ function apexStub(calls, options = {}) {
 	};
 }
 
-function ctxWith(calls, options, db) {
+function ctxWith(calls, options = {}, db) {
 	return {
 		...(db ? { db } : {}),
 		allowedOrigins: parseAllowedOrigins(ORIGIN),
@@ -592,7 +965,7 @@ function ctxWith(calls, options, db) {
 			},
 			async revoke() {}
 		},
-		createApexClient: () => apexStub(calls, options),
+		createApexClient: () => apexStub(calls, options, (options.stored ??= {})),
 		contract
 	};
 }
@@ -1068,16 +1441,26 @@ describe('create — the audit row may not contradict the response', () => {
 		assert.equal(audit[0].detail.returnedId, 'yes');
 	});
 
-	it('a failed post-create RE-READ stays accepted AND records the read failure', async () => {
-		// The post exists and this operation can name it, so the acceptance is true.
-		// Without the second row the log would say a create succeeded and be silent
-		// about the 502 the editor was actually sent.
+	it('a failed post-create RE-READ is 201 `unread`, not 502 — the post exists', async () => {
+		// The post exists and this operation can NAME it, so the acceptance is true and
+		// so is the 201. Answering 502 sent a minted post back as an error: the "New …"
+		// dialog offered the same slug again and the second attempt was `409 slug-taken`
+		// for a post the editor could not see.
 		const { res, audit } = await create({ createdPostId: OTHER_POST });
-		assert.equal(res.status, 502);
+		assert.equal(res.status, 201);
+		const body = await res.json();
+		assert.equal(body.ok, true);
+		assert.equal(body.unread, true);
+		assert.equal(body.post.id, OTHER_POST, 'the list screen reads result.post.id');
+		assert.equal(body.post.archetypeId, ARCH);
+		assert.equal(body.post.status, 'draft');
+		assert.ok(!('version' in body), 'no version is offered for a record nobody could read');
+		// Two rows: the create landed, and the degraded answer is not silent.
 		assert.equal(audit.length, 2);
 		assert.equal(audit[0].outcome, 'accepted');
 		assert.equal(audit[0].detail.postId, OTHER_POST);
-		assert.equal(audit[1].outcome, 'apex_error');
+		assert.equal(audit[1].outcome, 'accepted');
+		assert.equal(audit[1].detail.unread, true);
 		assert.equal(audit[1].detail.reason, 'post-create-read-failed');
 		assert.equal(audit[1].detail.postId, OTHER_POST);
 	});
@@ -1089,5 +1472,434 @@ describe('create — the audit row may not contradict the response', () => {
 		assert.equal(audit[0].outcome, 'accepted');
 		assert.equal(audit[0].detail.postId, POST);
 		assert.ok(!('reason' in audit[0].detail));
+	});
+});
+
+/**
+ * The body save END TO END, through the real operation with a recording Apex.
+ *
+ * Everything here is about a failure the old code could not express: a read that
+ * failed and was reported as "the document is empty", and a write that landed and
+ * was reported as "nothing was saved".
+ */
+describe('save-post-body — a failed read, and a write that may have landed', () => {
+	const bodyRequest = (body, session) =>
+		request(`/api/admin/posts/story/${POST}/body`, 'PUT', body, session);
+
+	async function saveBody(options, blocks, bodyVersionOverride) {
+		const calls = [];
+		const db = await createMigratedDatabase();
+		const ctx = ctxWith(calls, options, db);
+		const session = await signIn(ctx);
+		const bodyVersion =
+			bodyVersionOverride ?? (await computeBodyVersion(options.blocks ?? apexBlocks()));
+		const res = await handleSavePostBody(bodyRequest({ blocks, bodyVersion }, session), ctx, {
+			schema: 'story',
+			postId: POST
+		});
+		const { results } = await db.prepare('SELECT outcome, detail FROM bff_audit_log').bind().all();
+		db.close();
+		return {
+			res,
+			calls,
+			audit: results.map((row) => ({ outcome: row.outcome, detail: JSON.parse(row.detail) })),
+			stored: options.stored ?? {}
+		};
+	}
+
+	const KEEP = [
+		{ id: ID_A, kind: 'rich_text', html: '<p>One.</p>' },
+		{ id: ID_B, kind: 'quote', quote: 'Q.', quotedBy: 'W' },
+		{ id: ID_C, kind: 'image', galleryItemId: IMG1 }
+	];
+
+	it('(a) the pre-write read fails → 502 BEFORE any PATCH, and the document is untouched', async () => {
+		// THE DEFECT THIS PHASE EXISTS FOR. `readDocumentBlocks` answered `[]` on a
+		// failed read; the diff then saw an empty document, every block became an id-less
+		// CREATE, the body DOUBLED, and the editor was told 200.
+		const { res, calls, audit } = await saveBody({ documentStatus: 500, stored: {} }, KEEP);
+		assert.equal(res.status, 502);
+		assert.deepEqual(await res.json(), { error: 'upstream error' });
+		assert.equal(
+			calls.filter(([name]) => name === 'updateDocumentBlocks').length,
+			0,
+			'ZERO PATCHes'
+		);
+		assert.equal(audit.length, 1);
+		assert.equal(audit[0].outcome, 'rejected', 'nothing reached Apex, so a rejection is honest');
+		assert.match(audit[0].detail.reason, /document unreadable/u);
+	});
+
+	it('(a′) a transport THROW on the pre-write read is the same 502, not a 500', async () => {
+		const { res, calls } = await saveBody({ documentStatus: 'throw', stored: {} }, KEEP);
+		assert.equal(res.status, 502);
+		assert.equal(calls.filter(([name]) => name === 'updateDocumentBlocks').length, 0);
+	});
+
+	it('(b) PATCH 200 then a failed re-read → `body-written-unread`, ONE patch, audited accepted', async () => {
+		const { res, calls, audit } = await saveBody({ documentStatusAfterWrite: 500, stored: {} }, [
+			...KEEP,
+			{ id: null, kind: 'divider', dividerKind: 'large' }
+		]);
+		assert.equal(res.status, 502);
+		assert.deepEqual(await res.json(), {
+			error: 'body-written-unread',
+			code: 'body-written-unread'
+		});
+		assert.equal(calls.filter(([name]) => name === 'updateDocumentBlocks').length, 1);
+		assert.equal(audit.length, 1);
+		assert.equal(audit[0].outcome, 'accepted', 'a write that may have landed is not a rejection');
+		assert.equal(audit[0].detail.unread, true);
+		assert.equal(audit[0].detail.apexStatus, 200);
+	});
+
+	it('(b′) a PATCH that MUTATES its rows and then answers 500 is write-uncertain', async () => {
+		// Rails commits at `resource.update` and can raise while RENDERING the response
+		// — exactly what the Disk-service trap does. The double writes first, then fails.
+		const { res, calls, audit, stored } = await saveBody({ patchStatus: 500, stored: {} }, [
+			...KEEP,
+			{ id: null, kind: 'divider', dividerKind: 'small' }
+		]);
+		assert.equal(res.status, 502);
+		assert.equal((await res.json()).code, 'body-written-unread');
+		assert.equal(calls.filter(([name]) => name === 'updateDocumentBlocks').length, 1);
+		// The double's own rows prove the write landed even though the answer was 500.
+		assert.ok(stored.documentBlocks, 'the PATCH stored its attributes before failing');
+		assert.ok(
+			stored.documentBlocks.some((row) => row.blockable_type === DIVIDER),
+			'including the new divider'
+		);
+		assert.equal(audit[0].outcome, 'accepted');
+		assert.equal(audit[0].detail.unread, true);
+		assert.equal(audit[0].detail.apexStatus, 500);
+	});
+
+	it('(b″) a PATCH that THROWS is write-uncertain too — the request left the process', async () => {
+		const { res, audit } = await saveBody({ patchStatus: 'throw', stored: {} }, [
+			...KEEP,
+			{ id: null, kind: 'rich_text', html: '<p>new</p>' }
+		]);
+		assert.equal(res.status, 502);
+		assert.equal((await res.json()).code, 'body-written-unread');
+		assert.equal(audit[0].outcome, 'accepted');
+		assert.equal(audit[0].detail.unread, true);
+	});
+
+	it('a 4xx from the PATCH is an ORDINARY failure — Apex validates before it commits', async () => {
+		const { res, audit } = await saveBody({ patchStatus: 422, stored: {} }, [
+			...KEEP,
+			{ id: null, kind: 'rich_text', html: '<p>new</p>' }
+		]);
+		assert.equal(res.status, 502);
+		assert.deepEqual(await res.json(), { error: 'upstream error' });
+		assert.equal(audit[0].outcome, 'apex_error');
+		assert.ok(!('unread' in audit[0].detail));
+	});
+
+	it('the happy path answers the new blocks AND the document’s new version', async () => {
+		const { res, calls } = await saveBody({ stored: {} }, [
+			...KEEP,
+			{ id: null, kind: 'rich_text', html: '<p>new</p>' }
+		]);
+		assert.equal(res.status, 200);
+		const body = await res.json();
+		assert.equal(body.ok, true);
+		assert.equal(body.bodyVersion, await computeBodyVersion(apexBlocks()));
+		assert.deepEqual(
+			body.blocks.map((block) => block.kind),
+			['rich_text', 'quote', 'image']
+		);
+		assert.equal(calls.filter(([name]) => name === 'updateDocumentBlocks').length, 1);
+	});
+
+	// ── The interleaved-save guard ──────────────────────────────────────────────
+	it('a block added between the load and the save → 409, NO patch, nothing destroyed', async () => {
+		// Tab A loads; tab B adds a divider; A saves a body that does not mention it.
+		// Without the check, A's save `_destroy`s B's divider with a 200.
+		const withDivider = [
+			...apexBlocks(),
+			{ id: ID_D, position: 3, blockable_type: DIVIDER, blockable: { id: uuid(4), kind: 'large' } }
+		];
+		const { res, calls, audit } = await saveBody(
+			{ blocks: withDivider, stored: {} },
+			KEEP,
+			await computeBodyVersion(apexBlocks())
+		);
+		assert.equal(res.status, 409);
+		assert.deepEqual(await res.json(), { error: 'stale' });
+		assert.equal(calls.filter(([name]) => name === 'updateDocumentBlocks').length, 0);
+		assert.equal(audit[0].outcome, 'rejected');
+	});
+
+	it('a block DELETED between the load and the save is refused the same way', async () => {
+		const { res, calls } = await saveBody(
+			{ blocks: apexBlocks().slice(0, 2), stored: {} },
+			KEEP,
+			await computeBodyVersion(apexBlocks())
+		);
+		assert.equal(res.status, 409);
+		assert.equal(calls.filter(([name]) => name === 'updateDocumentBlocks').length, 0);
+	});
+
+	it('an unchanged document proceeds — the control that keeps the guard from refusing everything', async () => {
+		const { res } = await saveBody({ stored: {} }, [
+			...KEEP,
+			{ id: null, kind: 'divider', dividerKind: 'medium' }
+		]);
+		assert.equal(res.status, 200);
+	});
+
+	// ── Gallery membership ──────────────────────────────────────────────────────
+	it('an image block naming an id outside the images gallery → 400, NO patch', async () => {
+		for (const stranger of [VIDEO_ITEM, uuid(9)]) {
+			const { res, calls, audit } = await saveBody({ stored: {} }, [
+				{ id: ID_A, kind: 'rich_text', html: '<p>One.</p>' },
+				{ id: ID_B, kind: 'quote', quote: 'Q.', quotedBy: 'W' },
+				{ id: ID_C, kind: 'image', galleryItemId: stranger }
+			]);
+			assert.equal(res.status, 400);
+			assert.deepEqual(await res.json(), { error: 'unknown-image' });
+			assert.equal(calls.filter(([name]) => name === 'updateDocumentBlocks').length, 0);
+			// The audit row NAMES the block; the wire body stays opaque.
+			assert.match(audit[0].detail.reason, /blocks\[2\]\.galleryItemId/u);
+		}
+	});
+
+	it('a NEW image block with a null item is refused by name — null round-trips, it does not create', async () => {
+		const { res, calls, audit } = await saveBody({ stored: {} }, [
+			...KEEP,
+			{ id: null, kind: 'image', galleryItemId: null }
+		]);
+		assert.equal(res.status, 400);
+		assert.deepEqual(await res.json(), { error: 'unknown-image' });
+		assert.equal(calls.filter(([name]) => name === 'updateDocumentBlocks').length, 0);
+		assert.match(audit[0].detail.reason, /blocks\[3\]\.galleryItemId/u);
+	});
+
+	it('an UNREADABLE gallery is 502, never `unknown-image` — and writes nothing', async () => {
+		for (const options of [{ galleryStatus: 502 }, { itemsStatus: 500 }]) {
+			const { res, calls } = await saveBody({ ...options, stored: {} }, [
+				{ id: ID_C, kind: 'image', galleryItemId: IMG2 }
+			]);
+			assert.equal(res.status, 502);
+			assert.deepEqual(await res.json(), { error: 'upstream error' });
+			assert.equal(calls.filter(([name]) => name === 'updateDocumentBlocks').length, 0);
+		}
+	});
+
+	it('a save touching no image block performs NO gallery read; one that does, does', async () => {
+		// The counter has a POSITIVE control in the same test, so a permanently-zero
+		// count cannot pass.
+		const unchanged = await saveBody({ stored: {} }, [
+			{ id: ID_A, kind: 'rich_text', html: '<p>edited</p>' },
+			{ id: ID_B, kind: 'quote', quote: 'Q.', quotedBy: 'W' },
+			{ id: ID_C, kind: 'image', galleryItemId: IMG1 }
+		]);
+		assert.equal(unchanged.res.status, 200);
+		assert.equal(unchanged.calls.filter(([name]) => name === 'readCmsConfig').length, 0);
+		assert.equal(unchanged.calls.filter(([name]) => name === 'listGalleryItems').length, 0);
+
+		const changed = await saveBody({ stored: {} }, [
+			{ id: ID_A, kind: 'rich_text', html: '<p>One.</p>' },
+			{ id: ID_B, kind: 'quote', quote: 'Q.', quotedBy: 'W' },
+			{ id: ID_C, kind: 'image', galleryItemId: IMG2 }
+		]);
+		assert.equal(changed.res.status, 200);
+		assert.equal(changed.calls.filter(([name]) => name === 'readCmsConfig').length, 1, 'ONCE');
+		assert.equal(changed.calls.filter(([name]) => name === 'listGalleryItems').length, 1);
+	});
+
+	it('the gallery is read ONCE for a body full of new image blocks, not once per block', async () => {
+		const { res, calls } = await saveBody({ stored: {} }, [
+			...KEEP,
+			{ id: null, kind: 'image', galleryItemId: IMG2 },
+			{ id: null, kind: 'image', galleryItemId: IMG2 },
+			{ id: null, kind: 'image', galleryItemId: IMG1 }
+		]);
+		assert.equal(res.status, 200);
+		assert.equal(calls.filter(([name]) => name === 'listGalleryItems').length, 1);
+	});
+});
+
+describe('get-post — an unreadable document is 502, a missing post is 404', () => {
+	it('the load: 404 for no view, 502 for a document that will not read, never a 200', async () => {
+		const calls = [];
+		const missing = ctxWith(calls, {});
+		const session = await signIn(missing);
+		assert.equal(
+			(
+				await handleGetPost(
+					request(`/api/admin/posts/update/${POST}`, 'GET', undefined, session),
+					missing,
+					{ schema: 'update', postId: POST }
+				)
+			).status,
+			404
+		);
+
+		for (const documentStatus of [500, 'throw']) {
+			const ctx = ctxWith([], { documentStatus });
+			const s = await signIn(ctx);
+			const res = await handleGetPost(
+				request(`/api/admin/posts/story/${POST}`, 'GET', undefined, s),
+				ctx,
+				{ schema: 'story', postId: POST }
+			);
+			assert.equal(res.status, 502, `documentStatus=${documentStatus}`);
+			assert.deepEqual(await res.json(), { error: 'upstream error' });
+		}
+	});
+
+	it('the load carries the document’s own version beside the composite one', async () => {
+		const ctx = ctxWith([], {});
+		const session = await signIn(ctx);
+		const res = await handleGetPost(
+			request(`/api/admin/posts/story/${POST}`, 'GET', undefined, session),
+			ctx,
+			{ schema: 'story', postId: POST }
+		);
+		const body = await res.json();
+		assert.equal(body.bodyVersion, await computeBodyVersion(apexBlocks()));
+		assert.ok(body.version && body.version !== body.bodyVersion);
+	});
+
+	it('the version read: 502 for an unreadable document — not a token that agrees with `[]`', async () => {
+		// Hashing an empty read produced a token the NEXT save then agreed with, so the
+		// stale check passed and the body was diffed against nothing.
+		const ctx = ctxWith([], { documentStatus: 500 });
+		const session = await signIn(ctx);
+		const res = await handleReadPostVersion(
+			request(`/api/admin/posts/story/${POST}/version`, 'GET', undefined, session),
+			ctx,
+			{ schema: 'story', postId: POST }
+		);
+		assert.equal(res.status, 502);
+	});
+});
+
+describe('the cover is checked against the images gallery before it is written', () => {
+	async function setCover(coverId, options = {}) {
+		const calls = [];
+		const db = await createMigratedDatabase();
+		const ctx = ctxWith(
+			calls,
+			{
+				view: { shared_gallery_items: [{ id: uuid(4), gallery_item_id: IMG1, kind: 'cover' }] },
+				...options
+			},
+			db
+		);
+		const session = await signIn(ctx);
+		const res = await handleUpdatePost(
+			request(`/api/admin/posts/story/${POST}`, 'PATCH', { coverId }, session),
+			ctx,
+			{ schema: 'story', postId: POST }
+		);
+		const { results } = await db.prepare('SELECT outcome, detail FROM bff_audit_log').bind().all();
+		db.close();
+		return { res, calls, audit: results };
+	}
+
+	it('a WRONG-GALLERY item and a random uuid are both `400 unknown-image`, with no PATCH', async () => {
+		// `Cms::SharedGalleryItem` is five lines with no gallery scoping, so a videos
+		// item validates and becomes the cover with a 200 — a cover with no image in it.
+		for (const stranger of [VIDEO_ITEM, uuid(9)]) {
+			const { res, calls, audit } = await setCover(stranger);
+			assert.equal(res.status, 400);
+			assert.deepEqual(await res.json(), { error: 'unknown-image' });
+			assert.equal(calls.filter(([name]) => name === 'updatePostFields').length, 0);
+			assert.equal(audit[0].outcome, 'rejected');
+			assert.match(JSON.parse(audit[0].detail).reason, /coverId/u);
+		}
+	});
+
+	it('an unreadable gallery is 502 with no PATCH — unreadable is not absent', async () => {
+		const { res, calls } = await setCover(IMG2, { galleryStatus: 500 });
+		assert.equal(res.status, 502);
+		assert.deepEqual(await res.json(), { error: 'upstream error' });
+		assert.equal(calls.filter(([name]) => name === 'updatePostFields').length, 0);
+	});
+
+	it('the controls: a member is written, and the SAME cover costs no gallery read', async () => {
+		const good = await setCover(IMG2);
+		assert.equal(good.res.status, 200);
+		assert.deepEqual(good.calls.find(([name]) => name === 'updatePostFields')[2], {
+			shared_gallery_items_attributes: [{ id: uuid(4), gallery_item_id: IMG2, kind: 'cover' }]
+		});
+
+		const same = await setCover(IMG1);
+		assert.equal(same.res.status, 200);
+		assert.equal(same.calls.filter(([name]) => name === 'readCmsConfig').length, 0);
+
+		const cleared = await setCover(null);
+		assert.equal(cleared.res.status, 200);
+		assert.equal(cleared.calls.filter(([name]) => name === 'readCmsConfig').length, 0);
+		assert.deepEqual(cleared.calls.find(([name]) => name === 'updatePostFields')[2], {
+			shared_gallery_items_attributes: [{ id: uuid(4), _destroy: true }]
+		});
+	});
+
+	it('the race Apex still owns: a member deleted between the check and the write is `422 invalid`', async () => {
+		// The membership check is a read, and the write that follows is not atomic with
+		// it. The 422 path is therefore reachable — for this one window and no other.
+		const calls = [];
+		const ctx = ctxWith(calls, {
+			view: { shared_gallery_items: [] },
+			updatePostFieldsStatus: 422
+		});
+		const session = await signIn(ctx);
+		const res = await handleUpdatePost(
+			request(`/api/admin/posts/story/${POST}`, 'PATCH', { coverId: IMG2 }, session),
+			ctx,
+			{ schema: 'story', postId: POST }
+		);
+		assert.equal(res.status, 422);
+		const body = await res.json();
+		assert.equal(body.code, 'invalid');
+		assert.deepEqual(body.errors, [
+			{ attribute: 'shared_gallery_items.gallery_item', messages: ['must exist'] }
+		]);
+	});
+});
+
+describe('a published date must name a day that exists', () => {
+	it('the calendar judge', () => {
+		assert.ok(isCalendarDate(''));
+		assert.ok(isCalendarDate('2026-02-28'));
+		assert.ok(isCalendarDate('2024-02-29'), 'a leap day');
+		assert.ok(!isCalendarDate('2026-02-29'), 'and not in a common year');
+		assert.ok(!isCalendarDate('2026-13-45'));
+		assert.ok(!isCalendarDate('2026-02-30'));
+		assert.ok(!isCalendarDate('2026-00-10'));
+		assert.ok(!isCalendarDate('2026-04-31'));
+	});
+
+	it('both write schemas refuse it, and Apex is never asked', async () => {
+		for (const bad of ['2026-13-45', '2026-02-30', 'not-a-date']) {
+			assert.ok(!updatePostBodySchema.safeParse({ publishedDate: bad }).success, bad);
+			assert.ok(
+				!createPostBodySchema(contract, 'story').safeParse({
+					title: 'T',
+					slug: 't',
+					publishedDate: bad
+				}).success,
+				bad
+			);
+		}
+		assert.ok(updatePostBodySchema.safeParse({ publishedDate: '2026-02-28' }).success);
+		assert.ok(updatePostBodySchema.safeParse({ publishedDate: '' }).success, 'the clear');
+
+		// …and through the route: `400 invalid body`, nothing written.
+		const calls = [];
+		const ctx = ctxWith(calls, {});
+		const session = await signIn(ctx);
+		const res = await handleUpdatePost(
+			request(`/api/admin/posts/story/${POST}`, 'PATCH', { publishedDate: '2026-13-45' }, session),
+			ctx,
+			{ schema: 'story', postId: POST }
+		);
+		assert.equal(res.status, 400);
+		assert.deepEqual(await res.json(), { error: 'invalid body' });
+		assert.equal(calls.filter(([name]) => name === 'updatePostFields').length, 0);
 	});
 });

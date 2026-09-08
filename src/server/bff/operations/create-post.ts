@@ -14,7 +14,13 @@ import { createdIdOutcome, judgeCreatedId, shapeFaultDetail } from './created-id
 import { contractOf, noContractResponse } from '../content-contract-guard';
 import { toApexFields } from './update-record';
 import { primitiveFieldsShape } from './record-shape';
-import { buildPostLoad, postRouteMeta, postSchemaOf, rejectedWriteResponse } from './post-shape';
+import {
+	buildPostLoad,
+	postRouteMeta,
+	postSchemaOf,
+	publishedDateSchema,
+	rejectedWriteResponse
+} from './post-shape';
 import type { ContentContract } from '../content-contract';
 import type { BffContext } from '../context';
 
@@ -58,10 +64,9 @@ export function createPostBodySchema(contract: ContentContract, slug: string) {
 				.max(200)
 				.regex(/^[a-z0-9]+(?:[-_.][a-z0-9]+)*$/u),
 			summary: z.string().max(4000).optional(),
-			publishedDate: z
-				.string()
-				.regex(/^(?:\d{4}-\d{2}-\d{2})?$/u)
-				.optional(),
+			// The shape AND the calendar — `2026-13-45` passes a regex, reaches Apex,
+			// and is cast to `nil` with a 200 (`post.rb` validates nothing).
+			publishedDate: publishedDateSchema.optional(),
 			fields: z.object(fieldsShape).strict().optional()
 		})
 		.strict();
@@ -157,19 +162,44 @@ export async function handleCreatePost(
 	const postId = verdict.id;
 	if (postId === null) return bffError(502, 'unexpected upstream shape');
 
-	// Re-read through the one surface an editor's token can use, so what comes back
-	// is what the editor loads.
+	// Re-read through the schema-scoped surface, so what comes back is what the
+	// editor loads.
+	//
+	// THE POST EXISTS AND THIS OPERATION CAN NAME IT. So a failed read is not a
+	// failed create, and answering 502 was how a post that had been minted came back
+	// to the browser as an error — the "New …" dialog then offered the same slug
+	// again, and the second attempt was `409 slug-taken` for a post the editor could
+	// not see. `ok: true, unread: true` with the ids, and the editor's own load
+	// decides what happens next. The `accepted` row above stays true; this second row
+	// is what keeps the log from being silent about the degraded answer.
 	const loaded = await buildPostLoad(contract, guard.apex, params.schema, postId);
-	if (!loaded) {
-		// The post EXISTS and this operation can name it, so the `accepted` row above
-		// is true and stays. What must not happen is that the failure of the read that
-		// follows leaves no trace: without this row the log says a create succeeded and
-		// is silent about the 502 the editor was actually sent.
+	if (!loaded || loaded.ok !== true) {
 		await auditOutcome(ctx, meta, guard.actor, {
-			outcome: 'apex_error',
-			detail: { schema: params.schema, postId, reason: 'post-create-read-failed' }
+			outcome: 'accepted',
+			detail: {
+				schema: params.schema,
+				postId,
+				unread: true,
+				reason: loaded ? loaded.reason : 'post-create-read-failed'
+			}
 		});
-		return bffError(502, 'unexpected upstream shape');
+		return noStoreJson(
+			{
+				ok: true,
+				unread: true,
+				post: { id: postId, archetypeId: record ? cleanString(record.id) : '', status: 'draft' }
+			},
+			201
+		);
 	}
-	return noStoreJson({ ok: true, ...loaded }, 201);
+	return noStoreJson(
+		{
+			ok: true,
+			post: loaded.post,
+			version: loaded.version,
+			bodyVersion: loaded.bodyVersion,
+			referenceTargets: loaded.referenceTargets
+		},
+		201
+	);
 }

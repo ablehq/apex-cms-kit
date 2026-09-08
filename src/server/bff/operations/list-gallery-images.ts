@@ -195,6 +195,41 @@ export async function findImage(
 	);
 }
 
+/**
+ * Every member id of one gallery, resolved ONCE — the set a caller checks MANY
+ * ids against.
+ *
+ * `findImage` resolves the gallery per invocation, which is right for the image
+ * routes (one id, one request) and wrong for a post body: two hundred blocks
+ * would be two hundred `cms_config` reads and two hundred paginated walks of the
+ * gallery. This is the same rule with the read hoisted out — additive, so
+ * `findImage`, `readGalleryId` and every caller of theirs are untouched.
+ *
+ * THE SAME TWO CHECKS. The list is read with `q[gallery_id_eq]`, but a filter is a
+ * request and not a proof, so each row's OWN `gallery_id` must also equal the
+ * gallery id resolved by name; a row Apex returns from the wrong gallery is not a
+ * member whatever the filter did.
+ *
+ * `null` means the gallery could not be READ (`cms_config` or the item list
+ * failed) — an upstream fault, and distinct from an empty gallery (an empty set).
+ * A caller must not report the first as "unknown image": that would tell an editor
+ * their picture does not exist because Apex hiccuped.
+ */
+export async function loadGalleryMemberIds(
+	apex: ApexAdminClient,
+	gallery: string = 'images'
+): Promise<Set<string> | null> {
+	// No assets prefix: membership is about ids, and composing thumbnail URLs for a
+	// check nobody renders is work with no reader.
+	const loaded = await loadImagesGallery(apex, '', gallery);
+	if (!loaded) return null;
+	const members = new Set<string>();
+	for (const image of loaded.images) {
+		if (image.galleryId === loaded.galleryId) members.add(image.id);
+	}
+	return members;
+}
+
 export async function handleListImages(
 	request: Request,
 	ctx: BffContext,
