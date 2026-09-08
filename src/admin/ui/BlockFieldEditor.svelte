@@ -33,29 +33,53 @@
 	export let mediaUrl = () => null;
 	// DECLARED BEFORE the prop that defaults to it. A `const` in a Svelte <script> is
 	// in its temporal dead zone until its own line runs, and the default initializer
-	// below runs when a parent OMITS the prop — which GLC does. With the const further
-	// down the file this threw `Cannot access 'DELETE_MARKER' before initialization`
-	// and took out the whole block field editor. Godrej passes `emptyValue` explicitly,
-	// so it never hit it.
+	// below runs when a parent OMITS the prop — which, since the P5 fix pass, ALL
+	// THREE SITES do. With the const further down the file this threw `Cannot access
+	// 'DELETE_MARKER' before initialization` and took out the whole block field
+	// editor. It used to be reachable only from GLC, because Godrej and Poovayya
+	// passed `emptyValue` explicitly; now every mount runs this line.
 	/**
 	 * Apex's spelling for "clear this field", not ours: `PropertySetFormHelper`
 	 * merges a PATCH's `fields_data` into the stored property set and drops every
 	 * NIL attribute as "not supplied", so `null` is a silent no-op — Apex answers
 	 * 200 and keeps the old row. Only `"__delete__"` removes a row of any kind.
 	 *
-	 * The ports clear media with `''`, which is right for THEIR field: on Apex's
-	 * `media` kind a blank counts as an explicit clear. GLC's one media field is
-	 * `ref/model/Cms::GalleryItem`, a REFERENCE, and there `''` is validated like
-	 * any other id — measured against local Apex on 2026-08-31: `null` → 200 and
-	 * the logo survives, `''` → 422 "Logo does not exist in model
-	 * Cms::GalleryItem", `"__delete__"` → 200 and the key is gone.
+	 * `emptyValue` reaches EXACTLY ONE call site: the Remove button inside the
+	 * `ref/model/Cms::GalleryItem` branch below. So the only field kind it can ever
+	 * be sent on is a REFERENCE, and there `''` is validated like any other id and
+	 * fails. Measured against local Apex on THREE surfaces, all three sites' own:
+	 *
+	 *   GLC `pages.logo`, record route (2026-08-31)  `null` → 200, the logo
+	 *     survives · `''` → 422 "Logo does not exist in model Cms::GalleryItem" ·
+	 *     `"__delete__"` → 200 and the key is gone.
+	 *   Poovayya `practice_area.image` and Godrej `team_member.image`, record route
+	 *     (2026-09-08)  `''` → 422 and THE OLD ID SURVIVES · `"__delete__"` → 200,
+	 *     the key is removed from `primitives` and the archetype ITEM ROW SURVIVES
+	 *     with `fields_data: {}`.
+	 *   An `image-block` entity's `image`, entities endpoint (2026-09-08)  `''` →
+	 *     422 "Image does not exist in model Cms::GalleryItem" and the old id
+	 *     survives · `"__delete__"` → 200 and `fields_data` is `{}`.
+	 *
+	 * An earlier version of this block said a site whose fields are archetype
+	 * primitives should pass `''`, and that the marker "destroys the item row and
+	 * strands the old value in `archetype.primitives`". Both of those were inherited,
+	 * not measured, and the third and second lines above are what actually happens:
+	 * the marker removes the KEY and keeps the row. Poovayya and Godrej both passed
+	 * `''` on that reasoning, which made Remove a 422 on every media field on both
+	 * sites; the P5 fix pass dropped it from both.
 	 */
 	const DELETE_MARKER = '__delete__';
 
 	/**
 	 * What Remove emits on a media field. Apex's delete marker by default — the one
-	 * spelling that clears a value rather than being merged away as "no change". A
-	 * site whose fields are archetype primitives passes `''`.
+	 * spelling that clears a value rather than being merged away as "no change".
+	 *
+	 * NO SITE OVERRIDES THIS, and after the measurements above none should: the prop
+	 * only ever reaches a `ref/model/…` field, and on every such field on every
+	 * tenant `''` is a 422. It stays a prop rather than a constant because Apex has a
+	 * `media` field kind too, on which a blank IS an explicit clear — no schema on
+	 * these three sites declares one, and a site that does can say so here rather
+	 * than fork the component.
 	 * @type {string}
 	 */
 	export let emptyValue = DELETE_MARKER;
@@ -86,13 +110,10 @@
 	const MACHINE = /(^|_)(anchor_id|href|url|key|slug|id|refs|count)$/u;
 
 	/**
-	 * One field's stored value. `fields_data` is Apex-validated JSON, so what a key
-	 * holds depends on the field's validator kind; each control below narrows it.
-	 * @param {string} name
-	 * @returns {unknown}
-	 */
-	/**
 	 * ONE FIELD'S CURRENT VALUE — and it takes the BAG AS AN ARGUMENT, deliberately.
+	 *
+	 * `fields_data` is Apex-validated JSON, so what a key holds depends on the field's
+	 * validator kind; each control below narrows it.
 	 *
 	 * It used to close over `fieldsData` and take only the name. Svelte's legacy
 	 * compiler works out a template expression's dependencies from the identifiers IN
