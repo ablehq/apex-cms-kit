@@ -123,37 +123,28 @@ export function richTextHtml(value) {
 }
 
 /**
- * Editable plain text from a stored rich-text value (or a bare string).
+ * ── `richTextPlainText` WAS HERE, AND IS DELIBERATELY GONE (codex P5 fix 4, item 6)
  *
- * It USED to be what built the Quill delta below, which is why it is exported
- * under a name of its own rather than inlined — and why that delta carried no
- * formatting. `htmlToDelta` took that job; this is now the plain-text READING of a
- * stored value, kept exported because the package's export map is a total wildcard
- * over `src/`, so removing it is a breaking change for a function nothing is
- * broken by. NOT called `richTextToPlainText`: that name was renamed away in
- * `sanitize/html.js` to `plainTextForAttribute`, which carries a "SAFE SINK ONLY —
- * must NEVER feed `{@html}`" warning, and reusing it here for a different contract
- * is how two functions end up confused for one.
+ * A regex tag-stripper: `</li>` and friends to a newline, every remaining tag
+ * deleted, six references decoded, the result trimmed. It was what built the Quill
+ * delta before `htmlToDelta` existed, which is exactly why that delta carried no
+ * formatting.
  *
- * @param {unknown} value
- * @returns {string}
+ * The previous pass kept it exported and gave a reason: "the export map is a total
+ * wildcard over `src/`, so removing it is a breaking change." THAT REASON WAS
+ * FALSE, and checking it is what settled this. `richTextPlainText` DID NOT EXIST at
+ * `79a45fc`, the revision all three sites currently pin — only `plainToRichText`
+ * did. It was added in this same unpublished range. Deleting it therefore removes
+ * something no consumer has ever been able to import, which is not a breaking
+ * change in any sense; keeping it would have published a permanent public API by
+ * accident, on the strength of a fact nobody checked.
+ *
+ * Nothing referenced it: not the kit's `src/`, not Poovayya, Godrej or GLC — only
+ * this module's own tests. And it was strictly worse than what replaced it (its
+ * `</li>` → newline pass runs a NESTED list's two items together, where the delta
+ * puts them on two lines), so leaving it beside `htmlToDelta` was an invitation to
+ * reach for the lossier of two functions that answer the same question.
  */
-export function richTextPlainText(value) {
-	const read = richTextHtml(value);
-	const html = read.ok ? read.html : '';
-	if (!html) return '';
-	if (!HTML_TAG.test(html)) return html;
-	return html
-		.replace(/<\/(?:p|div|li|h[1-6])>/giu, '\n')
-		.replace(/<br\s*\/?>/giu, '\n')
-		.replace(/<[^>]+>/gu, '')
-		.replace(/&nbsp;/giu, ' ')
-		.replace(/&amp;/giu, '&')
-		.replace(/&lt;/giu, '<')
-		.replace(/&gt;/giu, '>')
-		.replace(/\n{3,}/gu, '\n\n')
-		.trim();
-}
 
 /**
  * Wrap edited HTML (or plain text) back into a stored rich-text value.

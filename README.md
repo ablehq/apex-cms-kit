@@ -52,6 +52,35 @@ Cookies are `apex_admin_session` and `apex_bff_csrf` on every site.
     npm test        # node --test over tests/
     npm run check   # tsc
 
+## The export map is a wildcard, and that is the decision
+
+`package.json`'s `exports` maps `./*.js`, `./*.ts`, `./*.svelte`, `./*.css` and a bare
+`./*` straight onto `src/`. **Every module under `src/` is therefore importable, and
+that is deliberate rather than an oversight** (codex's P5 fix 4, item 6, asked for the
+question to be settled either way).
+
+Blocking "internal" subpaths was the alternative and it is the wrong shape here:
+
+- the wildcard _is_ the delivery mechanism. The three sites already import about forty
+  subpaths directly — `server/bff/reject`, `admin/save-page.js`, `sanitize/html.js`
+  and so on — and there is no `index` re-export surface for them to go through;
+- what counts as internal does not hold still. `server/bff/operations/created-id` was
+  written as a private helper for four handlers in one pass and is imported by
+  gospel-life-church's own tag handler in the next, precisely so the two copies cannot
+  drift on the same rule;
+- a denylist has the same failure mode as the accident it fixes. Every new file would
+  need an entry and forgetting one is exactly how something becomes public by default.
+
+What makes that affordable is what this package is: a workspace-local source package
+consumed by three first-party repositories pinned to a SHA, not a semver'd library with
+unknown users. A removal is not a silent break — it is a build failure in three repos
+in the same workspace, before anything is published anywhere.
+
+The boundary that actually governs what belongs here is the kit-boundary ruling
+(mechanics and field editors in the kit; screens, shell, CSS and navigation per site),
+not the export map. So: **treat everything under `src/` as supported**, and remove or
+rename a module only with the three consumers' builds run.
+
 ## Naming modules
 
 No module under `src/` may have a basename ending in `ts` or `js` (before its

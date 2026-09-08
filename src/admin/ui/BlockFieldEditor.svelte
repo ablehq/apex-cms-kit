@@ -103,9 +103,18 @@
 	 * rich-text value that has NONE (a Poovayya archetype primitive is stored
 	 * `editor: null`). A stored non-empty name always wins over it.
 	 *
-	 * Per SITE. GLC's page fields are tiptap — which is this default, so GLC needs no
-	 * change — while Godrej's and Poovayya's stored values are quilljs with populated
-	 * Quill deltas, and both pass `defaultEditor="quilljs"`.
+	 * Per SITE, and ALL THREE SITES NOW PASS `quilljs`. This used to say "GLC's page
+	 * fields are tiptap — which is this default, so GLC needs no change", and that was
+	 * backwards: live Apex holds 19 `quilljs` values to 1 `tiptap` on GLC, and the one
+	 * tiptap value carries `content: {}`, so it is the flattening defect's footprint
+	 * rather than evidence of a dialect (Opus review of fix pass 3, finding 2).
+	 *
+	 * The default stays `'tiptap'` because that is what this component did before the
+	 * option existed, so a site that passes nothing is unchanged — but no site in this
+	 * ecosystem should be taking it. Nothing anywhere reads a tiptap `content`: Apex's
+	 * CMS ignores the editor name entirely, always mounts Quill and always
+	 * `setContents(parsedValue.content)`, so a `{}` blanks the editor and its
+	 * `text-change` writes the emptiness back into `html`.
 	 * @type {string}
 	 */
 	export let defaultEditor = 'tiptap';

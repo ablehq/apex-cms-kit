@@ -10,6 +10,7 @@ import {
 	unwrapArchetypeRecord
 } from '../archetype-record';
 import { contractOf, noContractResponse } from '../content-contract-guard';
+import { judgeCreatedId, shapeFaultDetail } from './created-id';
 import { loadPostView, postIdSchema, postRouteMeta, postSchemaOf, readPostIds } from './post-shape';
 import type { ApexAdminClient } from '../apex-admin-client';
 import type { BffContext } from '../context';
@@ -297,27 +298,80 @@ export async function handleCreateTag(request: Request, ctx: BffContext): Promis
 
 	const apexResponse = await guard.apex.createTag(name);
 
+	/**
+	 * THE VERDICT, TAKEN BEFORE THE AUDIT ROW IS WRITTEN — and the 422 adoption is
+	 * PART of the verdict, not a recovery after it.
+	 *
+	 * This is the fifth 2xx-create in this BFF, and it kept the contradiction the
+	 * other four were fixed for (codex P5 fix 4, item 2). It wrote `accepted` for ANY
+	 * 2xx and for ANY 422, and only afterwards decided whether it could name a tag —
+	 * so a 2xx whose body had no usable id was logged as an ACCEPTANCE and answered
+	 * 502, and a 422 whose re-read found nothing to adopt was logged as an ACCEPTANCE
+	 * and answered 422. An audit row that contradicts the response is worse than no
+	 * row: it is the row an operator would trust. `created-id.ts` carries the shared
+	 * rule and the reasoning.
+	 *
+	 * On a 422 the question this request actually ends on is "is there now a tag by
+	 * this name that we can name?", and nothing answers that until the re-read has
+	 * run. So the adoption happens first and the audit reports what it found.
+	 */
+	const record = apexResponse.ok ? unwrapArchetypeRecord(apexResponse.body) : null;
+	const verdict = judgeCreatedId(apexResponse.ok, record?.id, 'tag');
+	const returnedName = cleanString(record?.name);
+
+	/**
+	 * A 2xx that named a DIFFERENT WORD is as unusable as one that named nothing.
+	 * The picker is about to show the typed word as selected, and the id underneath
+	 * it would belong to another tag — every record tagged from that session would
+	 * carry the wrong word. `judgeCreatedId` cannot see this, because the name is
+	 * this create's second output and it only judges the first.
+	 *
+	 * Measured on local Apex before making it fatal: `POST /tags` echoes `name`
+	 * VERBATIM — case, inner spaces and even the leading/trailing ones a caller
+	 * sends (the body schema has already trimmed by then). So a mismatch is a real
+	 * upstream-shape fault and not this handler misreading a normalisation.
+	 */
+	const wrongName = verdict.id !== null && returnedName !== name;
+
+	// The race the list above cannot close: another editor created it between the
+	// read and the write. Re-read and adopt rather than showing a validation error.
+	// Exact match first; the case-insensitive fallback is only reached once Apex has
+	// TOLD us a colliding row exists and the only question left is which one.
+	let adopted: AdminTagRecord | null = null;
+	if (!apexResponse.ok && apexResponse.status === 422) {
+		const refreshed = await readTagVocabulary(guard.apex);
+		adopted =
+			refreshed?.find((tag) => tag.name === name) ??
+			refreshed?.find((tag) => tag.name.toLowerCase() === name.toLowerCase()) ??
+			null;
+	}
+
+	const created =
+		apexResponse.ok && verdict.id !== null && !wrongName
+			? { id: verdict.id, name: returnedName }
+			: null;
+
 	await auditOutcome(ctx, meta, guard.actor, {
-		outcome: apexResponse.ok || apexResponse.status === 422 ? 'accepted' : 'apex_error',
-		detail: { apexStatus: apexResponse.status }
+		// `accepted` means one thing only: this request ended holding a tag it can
+		// name — either the one Apex just created, or the one the 422 pointed at.
+		// A 2xx it cannot name is `upstream_shape_error` (a row almost certainly
+		// exists and nothing can point at it); anything else is `apex_error`.
+		outcome:
+			created || adopted ? 'accepted' : apexResponse.ok ? 'upstream_shape_error' : 'apex_error',
+		detail: {
+			name,
+			tagId: created?.id ?? adopted?.id ?? null,
+			...(apexResponse.status === 422 ? { adopted: adopted !== null } : {}),
+			...(wrongName
+				? { reason: 'unexpected-tag-name', returnedName: returnedName.slice(0, 120) }
+				: shapeFaultDetail(verdict)),
+			apexStatus: apexResponse.status
+		}
 	});
 
-	if (apexResponse.ok) {
-		const record = unwrapArchetypeRecord(apexResponse.body);
-		const created = { id: cleanString(record?.id), name: cleanString(record?.name) };
-		if (!created.id || !created.name) return bffError(502, 'unexpected upstream shape');
-		return noStoreJson({ ok: true, tag: created, created: true }, 201);
-	}
-
-	if (apexResponse.status === 422) {
-		// The race the list above cannot close: another editor created it between the
-		// read and the write. Re-read and adopt rather than showing a validation error.
-		const refreshed = await readTagVocabulary(guard.apex);
-		const adopted =
-			refreshed?.find((tag) => tag.name === name) ??
-			refreshed?.find((tag) => tag.name.toLowerCase() === name.toLowerCase());
-		if (adopted) return noStoreJson({ ok: true, tag: adopted, created: false });
-	}
+	if (created) return noStoreJson({ ok: true, tag: created, created: true }, 201);
+	if (adopted) return noStoreJson({ ok: true, tag: adopted, created: false });
+	if (apexResponse.ok) return bffError(502, 'unexpected upstream shape');
 
 	const status =
 		apexResponse.status >= 400 && apexResponse.status < 500 ? apexResponse.status : 502;

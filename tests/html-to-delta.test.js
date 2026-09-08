@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { htmlToDelta } from '../src/admin/html-to-delta.js';
-import { plainToRichText, richTextPlainText } from '../src/admin/rich-text.js';
+import { decodeReferences, isSafeUrl } from '../src/sanitize/html.js';
+import { isSafeUrlValue, sanitizeWriteHtml } from '../src/sanitize/write-boundary';
+import { plainToRichText } from '../src/admin/rich-text.js';
 
 /**
  * P5 fix 3, item 1: A RICH-TEXT EDIT IN THE NEW ADMIN MUST NOT DESTROY FORMATTING
@@ -325,10 +327,32 @@ describe('htmlToDelta: the document structure a contenteditable produces', () =>
 
 	it('character references are decoded, including the &nbsp; a contenteditable writes', () => {
 		assert.deepEqual(htmlToDelta('<p>a &amp; b &lt; c</p>'), { ops: [{ insert: 'a & b < c\n' }] });
-		assert.deepEqual(htmlToDelta('<p>a&nbsp;b</p>'), { ops: [{ insert: 'a b\n' }] });
+		assert.deepEqual(htmlToDelta('<p>a&nbsp;b</p>'), { ops: [{ insert: 'a\u00a0b\n' }] });
 		assert.deepEqual(htmlToDelta('<p>&#65;&#x42;</p>'), { ops: [{ insert: 'AB\n' }] });
-		// A reference outside the set stays literal rather than becoming a guess.
-		assert.deepEqual(htmlToDelta('<p>&copy;</p>'), { ops: [{ insert: '&copy;\n' }] });
+		// The Latin-1 block and the punctuation names a paste leaves behind, which the
+		// six-entry set used to leave as literal text (codex P5 fix 4, item 5). Literal
+		// was not the harmless outcome it was described as: the delta's text goes back
+		// through Quill, which escapes a bare `&`, so `&copy;` became `&amp;copy;` in
+		// the stored html on the CMS's next save — and again on the one after that.
+		assert.deepEqual(htmlToDelta('<p>&copy; &eacute; &mdash; &hellip;</p>'), {
+			ops: [{ insert: '\u00a9 \u00e9 \u2014 \u2026\n' }]
+		});
+		// Case is significant: these are two different characters.
+		assert.deepEqual(htmlToDelta('<p>&Eacute;&eacute;</p>'), {
+			ops: [{ insert: '\u00c9\u00e9\n' }]
+		});
+		// The Latin-1 table is a contiguous block and is asserted as one, so a name in
+		// the wrong position shows up as a name in the wrong position.
+		assert.deepEqual(htmlToDelta('<p>&nbsp;|&yuml;|&Agrave;|&divide;</p>'), {
+			ops: [{ insert: '\u00a0|\u00ff|\u00c0|\u00f7\n' }]
+		});
+		// A numeric reference a browser decodes but the SANITIZER's narrow window
+		// cannot. Here there is nothing to fail closed about — the output is a delta,
+		// never markup — and leaving it literal is the same growing-`&amp;` corruption.
+		assert.deepEqual(htmlToDelta('<p>&#00000000106;</p>'), { ops: [{ insert: 'j\n' }] });
+		// STILL A SUBSET, and this is the case that says so out loud: a name outside it
+		// is left literal, which the docblock states rather than papering over.
+		assert.deepEqual(htmlToDelta('<p>&zeta;</p>'), { ops: [{ insert: '&zeta;\n' }] });
 	});
 
 	it('whitespace inside a block is content; whitespace between blocks is layout', () => {
@@ -342,6 +366,98 @@ describe('htmlToDelta: the document structure a contenteditable produces', () =>
 			{ insert: 'two' },
 			{ insert: '\n', attributes: { list: 'bullet' } }
 		]);
+	});
+
+	it('THE SPACE BETWEEN TWO FORMATTED RUNS AT THE DOCUMENT ROOT SURVIVES', () => {
+		/**
+		 * CODEX P5 FIX 4, ITEM 1 — the regression guard, and the reason the helper
+		 * below no longer strips whitespace.
+		 *
+		 * `htmlToDelta('<strong>a</strong> <em>b</em>')` returned
+		 * `[{insert:'a',bold},{insert:'b',italic},{insert:'\n'}]`. The space was GONE:
+		 * root-level whitespace was discarded whenever no block was open, and at the
+		 * document root none ever is. That shape is not exotic — it is what the kit's
+		 * own contenteditable holds before anything has wrapped the text in a `<p>`,
+		 * which is to say the first thing an editor types into an empty field. Inside
+		 * a `<p>` the identical markup was correct, which is exactly why 581 tests and
+		 * two reviews walked past it.
+		 *
+		 * Every expectation here was read off a real Quill 2.0.3 under jsdom via
+		 * `clipboard.convert` — Quill's OWN html→delta path, an oracle written by
+		 * someone else — and agrees with it character for character.
+		 */
+		assert.deepEqual(htmlToDelta('<strong>a</strong> <em>b</em>'), {
+			ops: [
+				{ insert: 'a', attributes: { bold: true } },
+				{ insert: ' ' },
+				{ insert: 'b', attributes: { italic: true } },
+				{ insert: '\n' }
+			]
+		});
+		// The same shape the kit's own five buttons produce, and a link pair.
+		assert.deepEqual(htmlToDelta('<b>bold</b> then <i>ital</i> then plain').ops, [
+			{ insert: 'bold', attributes: { bold: true } },
+			{ insert: ' then ' },
+			{ insert: 'ital', attributes: { italic: true } },
+			{ insert: ' then plain\n' }
+		]);
+		assert.deepEqual(
+			htmlToDelta('<a href="https://x.test/">one</a> and <a href="https://y.test/">two</a>').ops,
+			[
+				{ insert: 'one', attributes: { link: 'https://x.test/' } },
+				{ insert: ' and ' },
+				{ insert: 'two', attributes: { link: 'https://y.test/' } },
+				{ insert: '\n' }
+			]
+		);
+		// A non-breaking space is CONTENT, and survives as U+00A0 rather than as a
+		// plain space — Quill's own converter normalises it and is the lossier one.
+		assert.deepEqual(htmlToDelta('<b>a</b>&nbsp;<i>b</i>').ops[1], { insert: '\u00a0' });
+		// And the three cases the drop rule still has to drop, all measured against
+		// the same oracle: leading whitespace, whitespace between two blocks, and
+		// whitespace between two lists.
+		assert.deepEqual(htmlToDelta(' <b>a</b>'), {
+			ops: [{ insert: 'a', attributes: { bold: true } }, { insert: '\n' }]
+		});
+		assert.deepEqual(htmlToDelta('<p>a</p> <p>b</p>'), { ops: [{ insert: 'a\nb\n' }] });
+		assert.deepEqual(htmlToDelta('<ul><li>a</li></ul> <ul><li>b</li></ul>').ops, [
+			{ insert: 'a' },
+			{ insert: '\n', attributes: { list: 'bullet' } },
+			{ insert: 'b' },
+			{ insert: '\n', attributes: { list: 'bullet' } }
+		]);
+	});
+
+	it('a LINE BREAK in the source is layout — it never becomes a line in the delta', () => {
+		/**
+		 * The other half of the same rule, and the reason the fix is not simply "keep
+		 * every root-level space". In a delta a `\n` inside an `insert` is a LINE
+		 * TERMINATOR, so carrying a source newline through fabricates lines and leaves
+		 * the block attribute stranded on an empty one:
+		 *
+		 *   BEFORE: '<h2>\n  Heading\n</h2>'
+		 *        → [{insert:'\n  Heading\n'}, {insert:'\n', header:2}]
+		 *          — three lines, the text unstyled, the heading destroyed by its own
+		 *            indentation.
+		 *
+		 * A newline-bearing run of whitespace is therefore one space when content
+		 * follows it on the same line, and nothing otherwise. Spaces and tabs with no
+		 * newline in them are left alone, because `preserveWhitespace: true` means the
+		 * CMS really did store them. All four agree with `clipboard.convert` exactly.
+		 */
+		assert.deepEqual(htmlToDelta('<h2>\n  Heading\n</h2>'), {
+			ops: [{ insert: 'Heading' }, { insert: '\n', attributes: { header: 2 } }]
+		});
+		assert.deepEqual(htmlToDelta('<ul>\n  <li>\n    a\n  </li>\n</ul>'), {
+			ops: [{ insert: 'a' }, { insert: '\n', attributes: { list: 'bullet' } }]
+		});
+		assert.deepEqual(htmlToDelta('<div>\n  <b>x</b>\n</div>'), {
+			ops: [{ insert: 'x', attributes: { bold: true } }, { insert: '\n' }]
+		});
+		assert.deepEqual(htmlToDelta('<p>a\nb</p>'), { ops: [{ insert: 'a b\n' }] });
+		// The separator belongs to the GAP it was written in, not to what opens after
+		// it: unattributed here, not tucked inside the `<em>` as `<em> b</em>`.
+		assert.deepEqual(htmlToDelta('<b>a</b>\n<i>b</i>').ops[1], { insert: ' ' });
 	});
 
 	it('an unknown element is UNWRAPPED — its text survives, its attribute does not', () => {
@@ -372,52 +488,103 @@ describe('htmlToDelta: the document structure a contenteditable produces', () =>
 		assert.deepEqual(htmlToDelta('a<ul></ul>b'), { ops: [{ insert: 'a\nb\n' }] });
 	});
 
-	it('NO INPUT LOSES TEXT — the property, over the shapes the three tenants store', () => {
+	it('NO INPUT LOSES TEXT — the property, over the shapes the three tenants store, EXACTLY', () => {
 		/**
 		 * Run for real over every `rich_text` html on local Apex — 110 stored and
 		 * synthetic values across Poovayya, Godrej and GLC: nothing threw, and nothing
 		 * lost a character. The corpus below is the representative slice of that,
 		 * pinned here so the property is checked without a live account.
 		 *
-		 * It is the property that matters most: this conversion runs on every keystroke
-		 * and its output is stored. Losing an attribute we do not model is a formatting
-		 * change; losing TEXT is the failure this whole item is about, pointed the other
-		 * way.
+		 * ── WHY THE EXPECTATIONS ARE EXACT NOW (codex P5 fix 4, item 1) ───────────
+		 * This assertion used to read
+		 *
+		 *     const textOf = (value) => value.replace(/\s+/gu, '');
+		 *     assert.equal(textOf(deltaText), textOf(richTextPlainText(html)));
+		 *
+		 * — every space, tab and newline deleted from BOTH sides before comparing.
+		 * That is how a 581-test suite failed to notice that
+		 * `htmlToDelta('<strong>a</strong> <em>b</em>')` was joining two words:
+		 * the only thing it lost was whitespace, and whitespace was exactly what the
+		 * helper threw away. A test that deletes the class of value the code under test
+		 * mishandles is not a weak test, it is a blind one.
+		 *
+		 * It compared against `richTextPlainText`, too — a regex tag-stripper that
+		 * disagreed with the converter on line breaks, which is WHY the stripping was
+		 * introduced. So both halves are gone: the reference is now the measured text
+		 * itself, written out, one string per input, no normalisation of any kind.
+		 * Re-running the file against these un-stripped expectations moved exactly one
+		 * case beyond the trailing newline every entry gained — the NESTED LIST, where
+		 * the old reference said `'ab'` and the delta correctly says `'a\nb\n'`.
+		 *
+		 * Every value below was read off the converter AND cross-checked against a real
+		 * Quill 2.0.3's own `clipboard.convert` under jsdom — an independent html→delta
+		 * implementation. All but three agree character for character; those three are
+		 * named at the bottom, and in each the kit is the one that keeps more.
 		 */
 		const corpus = [
-			'<p>Aditya Poovayya is the founding partner of Poovayya &amp; Co.</p>',
-			'<h1>Excellence in Legal Practice</h1>',
-			'<p><span class="glc-dropcap">G</span>od is holy, and He can\u2019t tolerate sin.</p>',
-			'<p>We uphold the Solas:</p><ul><li>Sola Scriptura</li><li>Sola Fide</li></ul>',
-			'<blockquote>A quoted line</blockquote>',
-			'<p>a</p><p></p><p>b</p>',
-			'<p>a<br>b</p>',
-			'<div>one</div><div>two</div>',
-			'<p>5 &lt; 6 &amp; 7 &gt; 6</p>',
-			'<p>a\u00a0b</p>',
-			'<p><b>bold</b><i>italic</i><u>under</u><s>strike</s></p>',
-			'<ul><li>a<ul><li>b</li></ul></li></ul>',
-			'<p><a href="https://x.test/">link</a> and <a href="javascript:x">refused</a></p>',
-			'<p><!-- comment -->kept</p>',
-			'<p><span style="color:red">unknown tag</span></p>',
-			'<table><tr><td>cell</td></tr></table>',
-			'<p>unclosed',
-			'stray</p>',
-			'<p><b>crossed</p>',
-			'<p><ul><li>chrome nests badly</li></ul></p>'
+			[
+				'<p>Aditya Poovayya is the founding partner of Poovayya &amp; Co.</p>',
+				'Aditya Poovayya is the founding partner of Poovayya & Co.\n'
+			],
+			['<h1>Excellence in Legal Practice</h1>', 'Excellence in Legal Practice\n'],
+			[
+				'<p><span class="glc-dropcap">G</span>od is holy, and He can’t tolerate sin.</p>',
+				'God is holy, and He can’t tolerate sin.\n'
+			],
+			[
+				'<p>We uphold the Solas:</p><ul><li>Sola Scriptura</li><li>Sola Fide</li></ul>',
+				'We uphold the Solas:\nSola Scriptura\nSola Fide\n'
+			],
+			['<blockquote>A quoted line</blockquote>', 'A quoted line\n'],
+			['<p>a</p><p></p><p>b</p>', 'a\n\nb\n'],
+			['<p>a<br>b</p>', 'a\nb\n'],
+			['<div>one</div><div>two</div>', 'one\ntwo\n'],
+			['<p>5 &lt; 6 &amp; 7 &gt; 6</p>', '5 < 6 & 7 > 6\n'],
+			['<p>a\u00a0b</p>', 'a\u00a0b\n'],
+			['<p><b>bold</b><i>italic</i><u>under</u><s>strike</s></p>', 'bolditalicunderstrike\n'],
+			// The one the old helper was actively masking: two LINES, not two words.
+			['<ul><li>a<ul><li>b</li></ul></li></ul>', 'a\nb\n'],
+			[
+				'<p><a href="https://x.test/">link</a> and <a href="javascript:x">refused</a></p>',
+				'link and refused\n'
+			],
+			['<p><!-- comment -->kept</p>', 'kept\n'],
+			['<p><span style="color:red">unknown tag</span></p>', 'unknown tag\n'],
+			['<table><tr><td>cell</td></tr></table>', 'cell\n'],
+			['<p>unclosed', 'unclosed\n'],
+			['stray</p>', 'stray\n'],
+			['<p><b>crossed</p>', 'crossed\n'],
+			['<p><ul><li>chrome nests badly</li></ul></p>', 'chrome nests badly\n'],
+			// Formatted runs at the DOCUMENT ROOT — the shape item 1 was about, and the
+			// shape this corpus did not contain, which is the second reason it passed.
+			['<strong>a</strong> <em>b</em>', 'a b\n'],
+			['<b>bold</b> then <i>ital</i> then plain', 'bold then ital then plain\n'],
+			['<a href="https://x.test/">one</a> and <a href="https://y.test/">two</a>', 'one and two\n'],
+			['<b>a</b>&nbsp;<i>b</i>', 'a\u00a0b\n'],
+			['<u>u</u> <s>s</s> <code>c</code>', 'u s c\n'],
+			// Pretty-printed markup, which used to destroy the block it indented.
+			['<h2>\n  Heading\n</h2>', 'Heading\n'],
+			['<ul>\n  <li>\n    a\n  </li>\n</ul>', 'a\n'],
+			['<div>\n  <b>x</b>\n</div>', 'x\n'],
+			['<p>a\nb</p>', 'a b\n']
 		];
-		// Whitespace is stripped from BOTH sides on purpose. The two disagree about it
-		// and `richTextPlainText` is the sloppier one — its `</li>` → newline regex
-		// runs `a` and `b` together for a NESTED list, where the delta correctly puts
-		// them on two lines. The claim under test is that no CHARACTER is lost, and
-		// pinning line breaks to the weaker reference would pin the weakness.
-		const textOf = (value) => value.replace(/\s+/gu, '');
-		for (const html of corpus) {
-			const delta = htmlToDelta(html);
-			const carried = textOf(delta.ops.map((op) => String(op.insert)).join(''));
-			const expected = textOf(richTextPlainText(html));
+		for (const [html, expected] of corpus) {
+			const carried = htmlToDelta(html)
+				.ops.map((op) => String(op.insert))
+				.join('');
 			assert.equal(carried, expected, html);
 		}
+		/**
+		 * THE THREE DELIBERATE DIVERGENCES from Quill's own converter, all measured:
+		 *
+		 *   1. U+00A0 stays U+00A0. `clipboard.convert` normalises it to a plain space;
+		 *      that is a character the author typed and the kit keeps it.
+		 *   2. Runs of spaces and tabs are NOT collapsed — `<p>a  b</p>` really does hold
+		 *      two spaces, because `preserveWhitespace: true` is how the CMS wrote it.
+		 *   3. `<p><ul><li>x</li></ul></p>` — Quill opens with a phantom empty line, the
+		 *      kit does not.
+		 */
+		assert.deepEqual(htmlToDelta('<p>a  b</p>'), { ops: [{ insert: 'a  b\n' }] });
 	});
 
 	it('an attribute named after a prototype member does not disturb the ones that are read', () => {
@@ -449,12 +616,190 @@ describe('htmlToDelta: the document structure a contenteditable produces', () =>
 		);
 	});
 
+	it('EVERY indent derivation is clamped, not just the one written as a class', () => {
+		/**
+		 * CODEX P5 FIX 4, ITEM 5. `ql-indent-N` was rejected above 8 and nesting depth
+		 * was not, so `<ul>`×30 wrote `indent: 29` — a level Quill has no `ql-indent-*`
+		 * class for, so it renders flush left while the html renders it nested. The two
+		 * halves of one value disagreeing, from the other end.
+		 *
+		 * MUTATION: drop the `clampIndent(...)` wrapper and the last assertion fails.
+		 */
+		const nested = (depth) => '<ul><li>'.repeat(depth) + 'deep' + '</li></ul>'.repeat(depth);
+		assert.deepEqual(htmlToDelta(nested(3)).ops.at(-1).attributes, {
+			list: 'bullet',
+			indent: 2
+		});
+		// Nine deep is past the last class Quill ships, and comes back AT it.
+		assert.deepEqual(htmlToDelta(nested(20)).ops.at(-1).attributes, {
+			list: 'bullet',
+			indent: 8
+		});
+		// The class derivation, unchanged: 8 is the last one that is honoured.
+		assert.deepEqual(htmlToDelta('<p class="ql-indent-8">x</p>').ops[1].attributes, { indent: 8 });
+		// Past it the class is ignored entirely — no attributes, so the two ops merge.
+		assert.deepEqual(htmlToDelta('<p class="ql-indent-9">x</p>'), { ops: [{ insert: 'x\n' }] });
+		// And the text is never the thing that is lost, however hostile the nesting.
+		assert.ok(
+			htmlToDelta(nested(200))
+				.ops.map((op) => String(op.insert))
+				.join('')
+				.includes('deep')
+		);
+	});
+
+	it('a block element this module does not model still ENDS A LINE', () => {
+		/**
+		 * OPUS 7b. `<section>a</section><section>b</section>` came back as `ab` — two
+		 * paragraphs run together into one word. Losing a format we do not model is a
+		 * formatting change; running two words together is text corruption.
+		 *
+		 * Every tag below was measured to end a line in Quill 2.0.3's own
+		 * `clipboard.convert`, and every tag in the second list was measured NOT to.
+		 *
+		 * MUTATION: remove the second group from `LEAF_BLOCK` and the first loop fails.
+		 */
+		for (const name of [
+			'section',
+			'article',
+			'header',
+			'footer',
+			'main',
+			'nav',
+			'address',
+			'figure',
+			'figcaption',
+			'dl',
+			'dt',
+			'dd',
+			'fieldset'
+		]) {
+			assert.deepEqual(
+				htmlToDelta(`<${name}>a</${name}><${name}>b</${name}>`),
+				{ ops: [{ insert: 'a\nb\n' }] },
+				name
+			);
+		}
+		// The table internals are NOT lines — measured against the same Quill build,
+		// and the stored-corpus case above (`<table><tr><td>cell</td></tr></table>`)
+		// agrees with it.
+		assert.deepEqual(htmlToDelta('<td>a</td><td>b</td>'), { ops: [{ insert: 'ab\n' }] });
+		assert.deepEqual(htmlToDelta('<table><tr><td>cell</td></tr></table>'), {
+			ops: [{ insert: 'cell\n' }]
+		});
+	});
+
 	it('pathological nesting is bounded rather than unbounded, and keeps the text', () => {
 		const deep = '<div>'.repeat(500) + 'x' + '</div>'.repeat(500);
 		assert.deepEqual(htmlToDelta(deep).ops.at(-1).insert.endsWith('\n'), true);
 		assert.ok(htmlToDelta(deep).ops.some((op) => String(op.insert).includes('x')));
 		const wide = '<img>'.repeat(500) + '<p>x</p>';
 		assert.deepEqual(htmlToDelta(wide), { ops: [{ insert: 'x\n' }] });
+	});
+});
+
+describe('the delta and the stored html are judged by ONE set of rules', () => {
+	/**
+	 * CODEX P5 FIX 4, ITEM 3. `{editor, html, content}` is one value with two
+	 * readings — the site renders `html`, Apex's CMS builds its editor from the
+	 * delta in `content` — so the two must not be able to say different things.
+	 * They were judged by different rules and could:
+	 *
+	 *   • the delta's link check was the RENDER-time `isSafeUrl`, which is happy
+	 *     with an unresolved character reference (it resolves as a relative URL),
+	 *     while the WRITE boundary refuses one outright;
+	 *   • unknown elements are unwrapped here, keeping their text, while the write
+	 *     boundary drops the EXECUTABLE ones with their contents.
+	 *
+	 * `htmlToDelta` now parses `sanitizeWriteHtml(input)` and asks `isSafeUrlValue`
+	 * about hrefs, so both halves are readings of one string.
+	 */
+	it('an over-long numeric or hex reference in an href is refused by BOTH halves', () => {
+		// A browser has no 7-digit window: this IS `javascript:` when it renders.
+		// `decodeReferences` cannot read it, and "cannot be read" must not resolve
+		// to "safe" — so the write boundary drops the attribute, and the delta must
+		// not carry a link the stored html no longer has.
+		for (const href of [
+			'&#00000000106;avascript:alert(1)',
+			'&#x000000006A;avascript:alert(1)',
+			'&#106avascript:alert(1)'
+		]) {
+			const html = `<p><a href="${href}">t</a></p>`;
+			assert.equal(sanitizeWriteHtml(html).includes('href'), false, href);
+			assert.deepEqual(htmlToDelta(html), { ops: [{ insert: 't\n' }] }, href);
+		}
+		// And the same value under the OLD judge reads as SAFE. That difference is
+		// the whole finding: the delta kept a link the stored html had dropped.
+		assert.equal(isSafeUrl('&#00000000106;avascript:alert(1)'), true);
+		assert.equal(isSafeUrlValue('&#00000000106;avascript:alert(1)'), false);
+	});
+
+	it('the delta asks the STORAGE judge, so it cannot drop a link the html keeps', () => {
+		/**
+		 * The two predicates disagree in BOTH directions, and this is the direction
+		 * that survives sanitisation. A bare backslash pair is refused by the
+		 * RENDER-time `isSafeUrl` (some browsers read it as protocol-relative) and
+		 * accepted by the write boundary, which resolves it like any other relative
+		 * value — so `sanitizeWriteHtml` KEEPS the href.
+		 *
+		 * If this module asked the render judge, the stored html would carry the link
+		 * and the delta would not: one value, two answers, which is the whole finding.
+		 * Which judge the RENDERER then applies to that href is its own business, and
+		 * it still refuses it — that is the render allowlist doing its job, not a
+		 * reason for the delta to disagree with the string it is a reading of.
+		 */
+		const href = '\\\\evil.test\\a';
+		assert.equal(isSafeUrl(href), false);
+		assert.equal(isSafeUrlValue(href), true);
+		assert.equal(sanitizeWriteHtml(`<p><a href="${href}">t</a></p>`).includes('href'), true);
+		assert.deepEqual(htmlToDelta(`<p><a href="${href}">t</a></p>`).ops[0].attributes, {
+			link: href
+		});
+	});
+
+	it('an executable wrapper loses its TEXT in the delta, exactly as it does in the html', () => {
+		// Unwrapping an unknown element keeps its text on purpose. An EXECUTABLE
+		// element is not unknown — the write boundary deletes it and everything
+		// inside it — so keeping the text here would have put script source into
+		// the CMS's editor as prose, beside an `html` that had none of it.
+		for (const html of [
+			'<p>a</p><script>alert(1)</script><p>b</p>',
+			'<p>a</p><style>body{x:1}</style><p>b</p>',
+			'<p>a</p><svg><animate values="javascript:alert(1)"></animate></svg><p>b</p>',
+			'<p>a</p><form><input value="x"></form><p>b</p>'
+		]) {
+			const carried = htmlToDelta(html)
+				.ops.map((op) => String(op.insert))
+				.join('');
+			assert.equal(carried, 'a\nb\n', html);
+		}
+		for (const html of [
+			'<script>alert(1)</script>',
+			'<style>p{}</style>',
+			'<p>keep<script>drop</script>keep2</p>'
+		]) {
+			const carried = htmlToDelta(html)
+				.ops.map((op) => String(op.insert))
+				.join('');
+			assert.equal(/alert|drop|p\{\}/u.test(carried), false, html);
+		}
+	});
+
+	it('an ordinary href survives both halves, decoded the same way in each', () => {
+		// The risk a stricter judge brings is refusing something ordinary, so the
+		// safe set is pinned beside the refused one.
+		for (const href of [
+			'https://x.test/a?b=1&amp;c=2',
+			'/areas-of-work',
+			'#top',
+			'mailto:a@x.test',
+			'tel:+911234567890',
+			'https://例え.jp/a'
+		]) {
+			const html = `<p><a href="${href}">t</a></p>`;
+			assert.equal(sanitizeWriteHtml(html).includes('href'), true, href);
+			assert.deepEqual(htmlToDelta(html).ops[0].attributes, { link: decodeReferences(href) }, href);
+		}
 	});
 });
 

@@ -5,7 +5,10 @@ import { archetypeIdSchema } from '../archetype-record';
  * AUDIT ROW IS WRITTEN.
  *
  * Every create handler in this BFF has the same three-way problem and used to
- * answer it three different ways. The rule they now share:
+ * answer it as many different ways. The rule now shared by `createEntity`,
+ * `createPage`, `createPost`, `createRecord` and `handleCreateTag` — and by GLC's
+ * own copy of the tag handler, which imports this module rather than growing a
+ * seventh answer:
  *
  *   1. Apex answered a failure            → `apex_error`, and the caller gets 4xx/502.
  *   2. Apex answered 2xx with a usable id → `accepted`.
@@ -47,6 +50,24 @@ import { archetypeIdSchema } from '../archetype-record';
  * happened and this operation can name it, so the `accepted` row is true and
  * stays. What must not happen is that the re-read failure leaves no trace at all,
  * which is what `auditPostCreateReadFailure` is for.
+ *
+ * AND ONE 2xx-CREATE DELIBERATELY KEEPS ITS OWN ANSWER: the gallery-item create
+ * inside `handleFinalizeMediaUpload` (`media.ts:432-478`). The opening sentence here
+ * used to read "every create handler… the rule they now share", which was not true
+ * of it (Opus review of fix pass 3, finding 6). It is not an oversight and folding
+ * it in would make it worse:
+ *
+ *   • it is one step of a MULTI-STEP upload, so an unnameable item is swept on the
+ *     spot rather than reported and left — the outcome it records is about the whole
+ *     upload failing, not about this create's shape;
+ *   • it audits `apex_error` rather than `upstream_shape_error` because the request
+ *     it is describing genuinely failed and the row it made was then deleted;
+ *   • it checks for a NONEMPTY STRING rather than a uuid on purpose — an id of the
+ *     wrong type is still something to try deleting, and the client's own
+ *     `assertUuid` refuses a nonsense one, which `deleteQuietly` reports as `false`.
+ *
+ * The rule below is for a create whose id the CALLER is about to use. That one's id
+ * has no future beyond the sweep it is handed to.
  */
 export interface CreatedIdVerdict {
 	/** The id this operation may use and hand on, or null. */
@@ -71,9 +92,24 @@ export interface CreatedIdVerdict {
  *   rather than only that one could not.
  */
 export function judgeCreatedId(apexOk: boolean, raw: unknown, noun: string): CreatedIdVerdict {
-	const returnedId = typeof raw === 'string' && raw !== '' ? raw : null;
-	const id =
-		returnedId !== null && archetypeIdSchema.safeParse(returnedId).success ? returnedId : null;
+	/**
+	 * A NON-STRING ID IS STILL AN ID, and this used to throw it away and then misname
+	 * what it had done (Opus review of fix pass 3, finding 5). `judgeCreatedId(true,
+	 * 42, 'page')` answered `{reason: 'missing-page-id', returnedId: null}` — but
+	 * there WAS an id; it simply was not a string. The row exists, `42` is the handle
+	 * an operator has on it, and the log said there was nothing to look for.
+	 *
+	 * `String(raw)` keeps it, the way `media.ts:462` already does for the same
+	 * situation, and it is capped here as well as in `shapeFaultDetail` so nothing
+	 * downstream can be handed an unbounded upstream string. `''` and `null` still
+	 * read as MISSING — an empty string names nothing, which is the deliberate choice
+	 * the section above records.
+	 */
+	const returnedId =
+		raw === null || raw === undefined || raw === '' ? null : String(raw).slice(0, 120);
+	// `id` is what the caller may HAND ON, so it is the uuid rule and nothing else: a
+	// number that stringifies to `'42'` is not an id any Apex URL may be built from.
+	const id = typeof raw === 'string' && archetypeIdSchema.safeParse(raw).success ? raw : null;
 	const shapeFault = !apexOk
 		? null
 		: returnedId === null

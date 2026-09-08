@@ -83,10 +83,33 @@
 // which this module has to do (`&nbsp;` is not in the sanitizer's named set and
 // is the single most common reference a contenteditable emits). Giving a security
 // boundary a second consumer with a different contract is how one gets widened
-// for the other's benefit. `isSafeUrl` IS imported: that is a judgement, not a
-// tokenizer, and there must be exactly one of it.
+// for the other's benefit. The URL JUDGEMENT is imported, because that is a
+// judgement rather than a tokenizer and there must be exactly one of it.
+//
+// ── THE DELTA IS DERIVED FROM WHAT WILL BE STORED ──────────────────────────
+// codex P5 fix 4, item 3. A `rich_text` value's two halves — `html` and the delta
+// in `content` — are ONE value shown by two editors, so they must say the same
+// thing. They were being judged by DIFFERENT RULES, and could therefore disagree:
+//
+//   • The link check here was the RENDER-time `isSafeUrl`, which resolves an
+//     unresolved character reference as a relative URL and calls it safe.
+//     `href="&#00000000106;avascript:x"` is `javascript:` to a browser (its
+//     numeric window has no 7-digit limit); the write boundary REFUSES it as
+//     unreadable, so the stored html lost the href while the delta kept a link.
+//   • Unknown elements are unwrapped here — text survives, tag does not — but the
+//     write boundary DROPS `<script>`, `<style>`, `<svg>`, `<form>` and the rest
+//     of the executable set WITH THEIR CONTENTS. So `<script>alert(1)</script>`
+//     left the stored html empty and the delta holding `alert(1)` as prose.
+//
+// Both are closed the same way: this module runs `sanitizeWriteHtml` over its
+// input FIRST and parses the result, and uses `isSafeUrlValue` — the write
+// boundary's strict predicate — for `<a href>`. The delta is then a reading of
+// exactly the html that reaches Apex, not of what was typed. Note the direction
+// this errs in if a write path ever forgets to sanitize: the delta is the
+// STRICTER of the two, never the looser one.
 
-import { isSafeUrl } from '../sanitize/html.js';
+import { decodeReferences } from '../sanitize/html.js';
+import { isSafeUrlValue, sanitizeWriteHtml } from '../sanitize/write-boundary';
 
 /** Inline elements and the Quill attribute each one sets. */
 const INLINE_ATTRIBUTE = new Map([
@@ -118,8 +141,46 @@ const BLOCK_ATTRIBUTE = new Map([
  * Elements that OWN a line: closing one ends the line and stamps the newline with
  * that element's attributes. `div` is here because that is what a contenteditable
  * produces for a new line in Chrome, and `p` because that is what Quill produces.
+ *
+ * THE SECOND GROUP is every other block-level element MEASURED to end a line in
+ * Quill 2.0.3's own `clipboard.convert` (Opus review of fix pass 3, finding 7b).
+ * Without them `<section>a</section><section>b</section>` came out as `ab` — two
+ * paragraphs run together into one word, which is text corruption rather than a lost
+ * format. Neither producer emits any of them, but a paste can.
+ *
+ * DELIBERATELY ABSENT, each measured under the same Quill build, which does NOT end
+ * a line on them: `table`, `tbody`, `thead`, `tr`, `td`, `th`, `caption`, `details`,
+ * `summary`, `hgroup`, `legend`, `aside`. `<table><tr><td>cell</td></tr></table>`
+ * being one line is what the existing corpus case asserts, and it agrees. And `pre`
+ * stays out for the reason the header gives: Quill's serializer has already emptied
+ * a code block by the time this module sees it, so giving `<pre>` a line of its own
+ * would add a blank line and nothing else.
  */
-const LEAF_BLOCK = new Set(['p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote']);
+const LEAF_BLOCK = new Set([
+	'p',
+	'div',
+	'h1',
+	'h2',
+	'h3',
+	'h4',
+	'h5',
+	'h6',
+	'li',
+	'blockquote',
+	'address',
+	'article',
+	'dd',
+	'dl',
+	'dt',
+	'fieldset',
+	'figcaption',
+	'figure',
+	'footer',
+	'header',
+	'main',
+	'nav',
+	'section'
+]);
 
 /** List containers, and the `list` value each gives the `<li>`s inside it. */
 const LIST_CONTAINER = new Map([
@@ -154,6 +215,49 @@ const VOID_ELEMENTS = new Set([
 const ALIGNMENTS = new Set(['center', 'right', 'justify']);
 
 /**
+ * The deepest indent Quill has a class for — `ql-indent-1` … `ql-indent-8`.
+ *
+ * Past it the delta names a level the stylesheet cannot render, so the CMS shows the
+ * line flush left while the html shows it nested: the two halves disagreeing again.
+ */
+const MAX_INDENT = 8;
+
+/** @param {number} level */
+function clampIndent(level) {
+	if (!Number.isInteger(level) || level <= 0) return 0;
+	return level > MAX_INDENT ? MAX_INDENT : level;
+}
+
+/**
+ * A run of whitespace that contains a LINE BREAK — a layout separator.
+ *
+ * Two rules meet here and they disagree, so the boundary between them is drawn
+ * explicitly rather than by accident:
+ *
+ *   • SPACES AND TABS ARE CONTENT. The CMS reads its editor back with
+ *     `getSemanticHTML({preserveWhitespace: true})`, so `<p>a  b</p>` really does
+ *     mean two spaces and collapsing them would delete one. This module keeps them.
+ *   • A LINE BREAK IS NOT. Neither producer of this field emits one as content:
+ *     Quill's serializer emits a newline only inside a `<pre>` (which this module
+ *     deliberately does not model), and a contenteditable emits none at all. Every
+ *     newline that reaches here is therefore source formatting — a pretty-printed
+ *     document, or a seed script's template literal.
+ *
+ * And keeping one would be far worse than cosmetic: in a Quill delta a `\n` inside
+ * an `insert` string is a LINE TERMINATOR. `<h2>\n  Heading\n</h2>` used to produce
+ * `[{insert:'\n  Heading\n'}, {insert:'\n', header:2}]` — three lines, the text on
+ * an unstyled one and the `header:2` stranded on an empty line at the end. The
+ * heading was destroyed by its own indentation.
+ *
+ * So a newline-bearing run becomes ONE SPACE, and only when content follows it on
+ * the same line (`pendingLayout` below). That is what a browser does, and it is
+ * what Quill's own `clipboard.convert` does — measured to agree exactly on
+ * `<b>a</b>\n<i>b</i>`, `<h2>\n  Heading\n</h2>`, `<ul>\n <li>\n a\n </li>\n</ul>`
+ * and `<div>\n  <b>x</b>\n</div>`.
+ */
+const LAYOUT_RUN = /[ \t\f]*[\n\r][ \t\n\r\f]*/u;
+
+/**
  * The same depth cap `sanitize/html.js` uses, for the same reason: pathological
  * nesting must not build an unbounded stack. Past it an element is not opened at
  * all, so its text still reaches the delta as content of the enclosing block —
@@ -162,29 +266,118 @@ const ALIGNMENTS = new Set(['center', 'right', 'justify']);
 const MAX_DEPTH = 64;
 
 /**
- * The named character references this module decodes.
+ * The HTML 4 Latin-1 names, in code-point order from U+00A0 to U+00FF.
  *
- * NOT the sanitizer's `NAMED_ENTITIES`, on purpose (see the header). This set is
- * what the two producers actually emit: Quill 2.0.3's `getSemanticHTML` escapes
- * `& < > "` and passes U+00A0 through raw, and a contenteditable's `innerHTML`
- * escapes `& < >` and writes `&nbsp;`. Anything outside this set and the numeric
- * forms is left as literal text — visible, rather than silently becoming a
- * different character than the html renders.
+ * Written as their sequence rather than as ninety-six map literals because that is
+ * what they are — the block is contiguous and defined by its order, so a name in the
+ * wrong place is visible as a name in the wrong place. `tests/html-to-delta.test.js`
+ * pins the count and both ends.
+ */
+const LATIN1_NAMES =
+	'nbsp iexcl cent pound curren yen brvbar sect uml copy ordf laquo not shy reg macr ' +
+	'deg plusmn sup2 sup3 acute micro para middot cedil sup1 ordm raquo frac14 frac12 frac34 iquest ' +
+	'Agrave Aacute Acirc Atilde Auml Aring AElig Ccedil Egrave Eacute Ecirc Euml Igrave Iacute Icirc Iuml ' +
+	'ETH Ntilde Ograve Oacute Ocirc Otilde Ouml times Oslash Ugrave Uacute Ucirc Uuml Yacute THORN szlig ' +
+	'agrave aacute acirc atilde auml aring aelig ccedil egrave eacute ecirc euml igrave iacute icirc iuml ' +
+	'eth ntilde ograve oacute ocirc otilde ouml divide oslash ugrave uacute ucirc uuml yacute thorn yuml';
+
+/**
+ * The named character references this module decodes — A STATED, TESTED SUBSET.
+ *
+ * NOT the sanitizer's `NAMED_ENTITIES`, on purpose (see the header): that set is nine
+ * entries, locked to an ESCAPE grammar by a coupling test, and carries a warning
+ * against widening it for anyone else's benefit.
+ *
+ * IT USED TO BE SIX, AND SIX WAS TOO FEW (codex P5 fix 4, item 5; Opus 7c). Anything
+ * outside the set was left as literal text on the reasoning that literal is visible
+ * and a wrong character is not. That reasoning was wrong in one direction nobody had
+ * traced: the delta's text goes back through Quill, whose `getSemanticHTML` escapes a
+ * bare `&`, so `&eacute;` in the html became the literal text `&eacute;` in the delta
+ * and then `&amp;eacute;` in the html on the CMS's next save. Not a wrong character —
+ * a growing one, on every save, and the page renders it.
+ *
+ * So the set is the Latin-1 block plus the general-punctuation names a word processor
+ * paste actually produces, which between them cover what an editor can type. It is
+ * still a SUBSET of HTML5's 2,231 names and this docblock is where that is admitted:
+ * a reference outside it is still left literal, and `&zeta;` still round-trips badly.
+ * The alternative — shipping the full table, or reaching for the DOM, which this
+ * module cannot do because its tests run in Node — buys the last fraction of a
+ * percent for two thousand lines of data.
+ *
+ * CASE IS SIGNIFICANT, and that is new: `&Eacute;` and `&eacute;` are different
+ * characters, so the lookup is exact. The five markup names keep their legacy
+ * upper-case spellings, which is the only case-folding a browser does that anything
+ * here emits.
  */
 const NAMED_REFERENCES = new Map([
+	...LATIN1_NAMES.split(' ').map((name, index) => [name, String.fromCodePoint(0xa0 + index)]),
 	['amp', '&'],
+	['AMP', '&'],
 	['apos', "'"],
+	['APOS', "'"],
 	['gt', '>'],
+	['GT', '>'],
 	['lt', '<'],
-	['nbsp', ' '],
-	['quot', '"']
+	['LT', '<'],
+	['quot', '"'],
+	['QUOT', '"'],
+	// General punctuation — what a paste from Word, Docs or a browser leaves behind.
+	['ndash', '–'],
+	['mdash', '—'],
+	['lsquo', '‘'],
+	['rsquo', '’'],
+	['sbquo', '‚'],
+	['ldquo', '“'],
+	['rdquo', '”'],
+	['bdquo', '„'],
+	['dagger', '†'],
+	['Dagger', '‡'],
+	['bull', '•'],
+	['hellip', '…'],
+	['permil', '‰'],
+	['prime', '′'],
+	['Prime', '″'],
+	['lsaquo', '‹'],
+	['rsaquo', '›'],
+	['oline', '‾'],
+	['frasl', '⁄'],
+	['euro', '€'],
+	['trade', '™'],
+	['larr', '←'],
+	['uarr', '↑'],
+	['rarr', '→'],
+	['darr', '↓'],
+	['harr', '↔'],
+	['minus', '−'],
+	['circ', 'ˆ'],
+	['tilde', '˜'],
+	['ensp', ' '],
+	['emsp', ' '],
+	['thinsp', ' '],
+	['zwnj', '‌'],
+	['zwj', '‍'],
+	['lrm', '‎'],
+	['rlm', '‏']
 ]);
 
-/** @param {string} value */
+/**
+ * @param {string} value
+ *
+ * The NUMERIC forms have NO DIGIT WINDOW at all, unlike the sanitizer's (7 decimal,
+ * 6 hex), and deliberately so. The sanitizer's narrow windows are a
+ * FAIL-CLOSED device: what it cannot resolve it re-escapes, or the write boundary
+ * refuses. Here there is nothing to fail closed about — the output is a delta, not
+ * markup, and nothing is re-serialized from it into a page — so the only question is
+ * whether the delta says what the html renders. A browser decodes
+ * `&#00000000106;` however many leading zeros it carries, and leaving it literal is
+ * the same growing-`&amp;` corruption as the named case above. The code-point range
+ * check is what bounds it: a reference too long to parse becomes `Infinity`, fails
+ * `Number.isFinite`, and is left exactly as it was written.
+ */
 function decodeText(value) {
 	if (!value.includes('&')) return value;
 	return value.replace(
-		/&(#[0-9]{1,7}|#[xX][0-9a-fA-F]{1,6}|[a-zA-Z][a-zA-Z0-9]{1,31});/gu,
+		/&(#[0-9]+|#[xX][0-9a-fA-F]+|[a-zA-Z][a-zA-Z0-9]{1,31});/gu,
 		(match, body) => {
 			if (body[0] === '#') {
 				const code =
@@ -198,7 +391,7 @@ function decodeText(value) {
 					return match;
 				}
 			}
-			return NAMED_REFERENCES.get(body.toLowerCase()) ?? match;
+			return NAMED_REFERENCES.get(body) ?? match;
 		}
 	);
 }
@@ -345,7 +538,7 @@ function blockAttributesOf(frame) {
 		}
 		if (token.startsWith('ql-indent-')) {
 			const level = Number.parseInt(token.slice('ql-indent-'.length), 10);
-			if (Number.isInteger(level) && level > 0 && level <= 8) classIndent = level;
+			if (Number.isInteger(level) && level > 0 && level <= MAX_INDENT) classIndent = level;
 		}
 	}
 
@@ -353,7 +546,12 @@ function blockAttributesOf(frame) {
 	// (`<ul><li>a<ul><li>b</li></ul></li></ul>`) and by `ql-indent-N` in the
 	// editor's own DOM. Either can reach this module, so an explicit class wins
 	// and the nesting depth is the fallback.
-	const indent = classIndent ?? (frame.name === 'li' ? frame.listDepth - 1 : 0);
+	//
+	// BOTH derivations are clamped, and only one of them used to be (codex P5 fix 4,
+	// item 5). A `ql-indent-9` class was rejected while thirty nested `<ul>`s wrote
+	// `indent: 29` — a value `ql-indent-*` has no class for, so Quill renders it at no
+	// indent at all and the delta and the html stop agreeing. Same ceiling, both ways.
+	const indent = clampIndent(classIndent ?? (frame.name === 'li' ? frame.listDepth - 1 : 0));
 	if (indent > 0) out.indent = indent;
 
 	return Object.keys(out).length > 0 ? out : null;
@@ -396,11 +594,25 @@ function lineAttributesOf(frame) {
  * @returns {{ops: Array<Record<string, unknown>>}}
  */
 export function htmlToDelta(input) {
-	const html = typeof input === 'string' ? input : `${input ?? ''}`;
+	// The WRITE-sanitised html, not the raw input — see the header. This is what
+	// makes the delta and the stored `html` two readings of one string rather than
+	// two documents judged by different rules.
+	const html = sanitizeWriteHtml(typeof input === 'string' ? input : `${input ?? ''}`);
 	/** @type {Array<Record<string, unknown>>} */
 	const ops = [];
 	/** @type {Array<Record<string, unknown>>} */
 	let line = [];
+	/**
+	 * Is a layout separator (see `LAYOUT_RUN`) waiting to be spent?
+	 *
+	 * It becomes a single space if content follows it ON THE SAME LINE, and nothing
+	 * at all otherwise — which is how the leading and trailing indentation of a
+	 * pretty-printed block disappears while the space between two inline runs
+	 * survives. Cleared at every line boundary: a separator never crosses one.
+	 */
+	let pendingLayout = false;
+	/** @type {Record<string, unknown> | null} the inline attributes it was seen with. */
+	let pendingLayoutAttributes = null;
 	/** @type {Array<{name: string, attributes: Record<string, string>, inline: [string, unknown] | null,
 	 *   leaf: boolean, inherited: Record<string, unknown> | null, listKind: string | null,
 	 *   listDepth: number, emitted: boolean}>} */
@@ -456,6 +668,9 @@ export function htmlToDelta(input) {
 	function closeLine(attributes) {
 		for (const op of line) pushOp(op);
 		line = [];
+		// The separator that was waiting had nothing follow it on this line, so it
+		// was the trailing indentation of a pretty-printed block. It is spent here.
+		pendingLayout = false;
 		pushOp(attributes ? { insert: '\n', attributes } : { insert: '\n' });
 	}
 
@@ -492,16 +707,74 @@ export function htmlToDelta(input) {
 		}
 	}
 
-	/** @param {string} raw */
-	function addText(raw) {
-		const text = decodeText(raw);
+	/**
+	 * Push one run of CONTENT onto the line in progress.
+	 *
+	 * `line.length === 0` is the load-bearing half of the drop rule, and it was not
+	 * there until codex found what its absence costs. The condition used to be
+	 * `currentBlock() === null` alone, so whitespace was discarded whenever no block
+	 * was open — including the space in `<strong>a</strong> <em>b</em>`, two
+	 * formatted runs at the DOCUMENT ROOT, which is exactly what a contenteditable
+	 * holds before anything has wrapped it in a `<p>`. The two words were stored
+	 * joined: TEXT LOSS, in the headline feature of this module, on the commonest
+	 * markup its own control produces. Inside a `<p>` the same markup was fine,
+	 * which is why it survived review.
+	 *
+	 * A line that already holds ops is INSIDE a run of content whatever the stack
+	 * says, so its whitespace is content. An empty line means nothing has been
+	 * emitted since the last newline, so LEADING and BETWEEN-BLOCK whitespace is
+	 * still dropped — `<ul>  <li>` and `<p>a</p> <p>b</p>` are unchanged.
+	 *
+	 * @param {string} text
+	 */
+	function pushText(text) {
 		if (text === '') return;
-		// Whitespace between blocks — `<ul>\n  <li>` — is layout, not content. Inside
-		// a block it is content, and `preserveWhitespace: true` means the old admin
-		// keeps it, so only the no-open-block case is dropped.
-		if (currentBlock() === null && text.trim() === '') return;
+		if (line.length === 0 && currentBlock() === null && text.trim() === '') return;
 		const attributes = inlineAttributes();
 		line.push(attributes ? { insert: text, attributes } : { insert: text });
+	}
+
+	/**
+	 * Remember that a layout separator was seen, and WITH WHICH INLINE ATTRIBUTES.
+	 *
+	 * The separator belongs to the gap it was written in, not to whatever opens
+	 * next: in `<b>a</b>\n<i>b</i>` the newline sits at the document root, between
+	 * the two elements, so its space is unattributed. Reading the attributes at
+	 * spend time instead would put the space inside the `<em>` and serialize back as
+	 * `<em> b</em>` — the same text, in a place Quill does not put it.
+	 */
+	function markLayout() {
+		if (pendingLayout) return;
+		pendingLayout = true;
+		pendingLayoutAttributes = inlineAttributes();
+	}
+
+	/** Spend a waiting layout separator: one space, but only mid-line. */
+	function spendLayout() {
+		if (!pendingLayout) return;
+		pendingLayout = false;
+		if (line.length === 0) return;
+		line.push(
+			pendingLayoutAttributes
+				? { insert: ' ', attributes: pendingLayoutAttributes }
+				: { insert: ' ' }
+		);
+	}
+
+	/** @param {string} raw */
+	function addText(raw) {
+		const decoded = decodeText(raw);
+		if (decoded === '') return;
+		// Split on the layout runs: every gap between two parts WAS one, and a leading
+		// or trailing empty part means the text began or ended with one.
+		const parts = LAYOUT_RUN.test(decoded) ? decoded.split(LAYOUT_RUN) : [decoded];
+		for (let index = 0; index < parts.length; index += 1) {
+			if (index > 0) markLayout();
+			if (parts[index] === '') continue;
+			spendLayout();
+			pushText(parts[index]);
+		}
+		if (parts[parts.length - 1] === '') markLayout();
 	}
 
 	let cursor = 0;
@@ -565,9 +838,20 @@ export function htmlToDelta(input) {
  * `<a>` is the one that reads an attribute value, and the one that can refuse:
  * before this module, no href ever reached `content`, so writing one there is a
  * new path for a `javascript:` URL to reach a place that renders it — Apex's CMS
- * UI builds its editor from the delta. `isSafeUrl` is the kit's single URL
- * judgement, shared with the render sanitizer and the write boundary. A refused
- * href drops the link attribute and KEEPS the text.
+ * UI builds its editor from the delta. A refused href drops the link attribute and
+ * KEEPS the text.
+ *
+ * `isSafeUrlValue` is the STORAGE predicate — the same one `sanitizeWriteHtml`
+ * uses to decide whether the attribute may stay in the html at all — and it is
+ * stricter than the render-time `isSafeUrl` this used to call, in exactly the way
+ * that matters here: it REFUSES a value still holding a character reference after a
+ * full decode. Two judges meant two answers about one href, and the delta kept
+ * links the stored html had already dropped (codex P5 fix 4, item 3). One judge.
+ *
+ * The value CARRIED is `decodeReferences(raw)` — the write boundary's decode, not
+ * this module's narrower `decodeText` — for the same reason: the surviving
+ * attribute and the delta's `link` have to be the same URL, and the boundary's
+ * grammar is the one that decided the attribute could stay.
  *
  * @param {string} name
  * @param {Record<string, string>} attributes
@@ -575,9 +859,9 @@ export function htmlToDelta(input) {
  */
 function inlineFor(name, attributes) {
 	if (name === 'a') {
-		const href = decodeText(attributes.href ?? '');
-		if (!href || !isSafeUrl(href)) return null;
-		return ['link', href];
+		const raw = attributes.href ?? '';
+		if (!raw || !isSafeUrlValue(raw)) return null;
+		return ['link', decodeReferences(raw)];
 	}
 	return INLINE_ATTRIBUTE.get(name) ?? null;
 }

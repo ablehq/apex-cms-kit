@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { plainToRichText, richTextHtml, richTextPlainText } from '../src/admin/rich-text.js';
+import { plainToRichText, richTextHtml } from '../src/admin/rich-text.js';
 
 /**
  * P5a: RICH TEXT THAT PRESERVES WHAT IS STORED.
@@ -153,14 +153,5 @@ describe('plainToRichText: when the HTML MOVES, the editor decides the content d
 			html: '',
 			content: { ops: [] }
 		});
-	});
-});
-
-describe('richTextPlainText', () => {
-	it('flattens block markup to lines and decodes the references the editor writes', () => {
-		assert.equal(richTextPlainText({ html: '<p>one</p><p>two</p>' }), 'one\ntwo');
-		assert.equal(richTextPlainText({ html: '<p>a&amp;b</p>' }), 'a&b');
-		assert.equal(richTextPlainText('plain, no tags'), 'plain, no tags');
-		assert.equal(richTextPlainText(CONTENT_HTML), '', 'unreadable reads as nothing, not as markup');
 	});
 });
