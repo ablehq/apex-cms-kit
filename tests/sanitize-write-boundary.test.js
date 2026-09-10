@@ -691,3 +691,62 @@ describe('the per-field ceiling', () => {
 		assert.deepEqual(oversizedFieldNames('x'.repeat(200_001)), []);
 	});
 });
+
+describe('the attribute strip runs to a fixed point, like the element strip', () => {
+	/**
+	 * REMOVING AN ATTRIBUTE JOINS THE TEXT ON EITHER SIDE OF IT, AND THE JOIN CAN SPELL
+	 * AN ATTRIBUTE NEITHER SIDE CONTAINED.
+	 *
+	 * A global `.replace()` scans the ORIGINAL string and resumes after each match, so
+	 * the two sides of a removed span are never examined together. `stripExecutableElements`
+	 * has looped since P4 for exactly this reason — `<scr<script></script>ipt>` reconstitutes
+	 * a live `<script>` — and its docblock says a single pass "hands back working script
+	 * from input it just sanitised". The two attribute passes after it were left single and
+	 * carried the identical defect.
+	 *
+	 * Found by the whole-library review, 2026-09-10, and measured against the shipped code.
+	 * The second case is the sharp one: the URL pass, whose entire job is removing unsafe
+	 * hrefs, MINTED one out of the fragments `hre` and `f="javascript:alert(2)"`.
+	 *
+	 * It matters most where the write boundary is the ONLY lock — Godrej renders CMS HTML
+	 * with no render-time sanitiser, and `<img>` is deliberately not on the element
+	 * denylist, so a stored `onerror=` there is script execution.
+	 *
+	 * MUTATION: replace the loop in `sanitizeWriteHtml` with one `stripAttributesOnce(...)`
+	 * — the first three fail.
+	 */
+	it('does not re-assemble an event handler out of what it removed', () => {
+		assert.equal(sanitizeWriteHtml('<img src=x o onclick="1"nerror=alert(1)>'), '<img src=x>');
+	});
+
+	it('does not MINT an unsafe href out of two fragments', () => {
+		assert.equal(
+			sanitizeWriteHtml('<a hre href="javascript:1"f="javascript:alert(2)">x</a>'),
+			'<a>x</a>'
+		);
+	});
+
+	it('closes the same hole when the decoy is a url attribute', () => {
+		assert.equal(
+			sanitizeWriteHtml('<img src="x" o href="javascript:1"nerror=alert(1)>'),
+			'<img src="x">'
+		);
+	});
+
+	it('removes `style`, which the render allowlist already drops', () => {
+		assert.equal(
+			sanitizeWriteHtml('<p style="background:url(javascript:alert(1))">styled</p>'),
+			'<p>styled</p>'
+		);
+	});
+
+	it('leaves clean markup byte-identical — the loop is not destructive', () => {
+		for (const clean of [
+			'<p>hello <a href="https://x.test/?a=1&b=2">link</a></p>',
+			'<p class="ql-align-center">ok</p>',
+			'<ul><li>one</li><li>two</li></ul>'
+		]) {
+			assert.equal(sanitizeWriteHtml(clean), clean);
+		}
+	});
+});

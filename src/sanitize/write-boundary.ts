@@ -149,6 +149,18 @@ const EXECUTABLE_ELEMENT =
  * `<img src="x"formaction="javascript:…">` cannot hide behind the absence of a
  * space either.
  */
+/**
+ * `style` is removed outright at the write boundary.
+ *
+ * The render allowlist already drops it — `style` is not in `ALLOWED_ATTRIBUTES` — so
+ * the two judges disagreed, and on a site with no render-time sanitiser only the
+ * losing one runs. `<p style="background:url(javascript:alert(1))">` was stored
+ * byte-for-byte before this. Arbitrary CSS is not script on a current browser, so this
+ * is depth rather than a hole being closed; it is here because the rule belongs with
+ * the other attribute rules and costs one line.
+ */
+const STYLE_ATTRIBUTE = /(?:\s|(?<=["'/]))style\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]*)/giu;
+
 const URL_ATTRIBUTE =
 	/(?:\s|(?<=["'/]))(?:href|src|xlink:href|formaction|action|values|to|from|poster|background|ping|data)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]*))/giu;
 
@@ -213,15 +225,48 @@ function stripExecutableElements(html: string): string {
 	return '';
 }
 
-export function sanitizeWriteHtml(html: string): string {
-	return stripExecutableElements(html)
+/** One sweep of the attribute rules. Not safe on its own — see `sanitizeWriteHtml`. */
+function stripAttributesOnce(html: string): string {
+	return html
 		.replace(EVENT_ATTRIBUTE, '')
+		.replace(STYLE_ATTRIBUTE, '')
 		.replace(URL_ATTRIBUTE, (match, doubled?: string, singled?: string, bare?: string) => {
 			const value = doubled ?? singled ?? bare ?? '';
 			// The whole attribute goes, not just its value: an `href`-less `<a>` is
 			// inert text, which is the right outcome for a link nobody may follow.
 			return isSafeUrlValue(value) ? match : '';
 		});
+}
+
+export function sanitizeWriteHtml(html: string): string {
+	// TO A FIXED POINT, for the reason `stripExecutableElements` already loops.
+	//
+	// A global `.replace()` scans the ORIGINAL string and resumes after each match, so
+	// the text on the two sides of a removed span is never examined together. Removing
+	// an attribute therefore JOINS them — and the join can spell an attribute neither
+	// side contained. Measured 2026-09-10, against this function as it stood:
+	//
+	//   <img src=x o onclick="1"nerror=alert(1)>        ->  <img src=x onerror=alert(1)>
+	//   <a hre href="javascript:1"f="javascript:alert(2)">  ->  <a href="javascript:alert(2)">
+	//
+	// The second is the sharp one: the URL pass MINTS a live `javascript:` href out of
+	// the fragments `hre` and `f="javascript:alert(2)"` — the exact thing it exists to
+	// remove. The element pass has looped since P4 for the `<scr<script></script>ipt>`
+	// case; the attribute passes were left single and carry the identical defect.
+	//
+	// This matters most where the write boundary is the ONLY lock. Godrej renders CMS
+	// HTML with no render-time sanitiser (open decision 1), so on that site a stored
+	// `onerror=` is script execution — and `<img>` is deliberately not on the element
+	// denylist, so nothing else stops it.
+	let current = stripExecutableElements(html);
+	for (let pass = 0; pass < 20; pass += 1) {
+		const next = stripAttributesOnce(current);
+		if (next === current) return current;
+		current = next;
+	}
+	// Same refusal the element loop makes: input crafted to defeat the loop is not
+	// authored content.
+	return '';
 }
 
 /**
