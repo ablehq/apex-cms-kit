@@ -54,10 +54,25 @@ export interface AdminHooksOptions {
 	/**
 	 * `X-Frame-Options`, default `DENY`. `null` disables it.
 	 *
-	 * **If the site serves an Apex live-preview iframe, its own hook must delete this
-	 * on that path** — Godrej's `previewFrame` does exactly that, and it is sequenced
-	 * AFTER `adminHooks()` so it still wins. Measured 2026-09-10: GLC and Poovayya
-	 * have no preview route, so `DENY` is safe for them as it stands.
+	 * **If the site serves an Apex live-preview iframe, its own hook must handle this
+	 * on that path** — Godrej's `previewFrame` deletes the header and sets its own CSP.
+	 *
+	 * CORRECTED 2026-09-10, and the correction matters more than the original claim:
+	 * an earlier version of this comment said `previewFrame` is "sequenced AFTER
+	 * `adminHooks()` so it still wins. Measured." **That is not what `sequence()` does.**
+	 * It NESTS handles, so the later handle's post-processing runs FIRST and this header
+	 * is re-set after that delete. The final review drove the real `sequence` and got
+	 * `x-frame-options: DENY` alongside the preview CSP on `/__preview__`.
+	 *
+	 * The preview still works, because a browser that sees `frame-ancestors` ignores
+	 * `X-Frame-Options` entirely — so this is a note, not a defect. But the word
+	 * "measured" was doing work it had not earned, in three separate documents. If the
+	 * ordering is ever made to matter, `sequence(previewFrame, adminHooks(...))` is the
+	 * arrangement that does what the old comment described, and it should be verified
+	 * with `curl -I` against a real deploy rather than by reasoning.
+	 *
+	 * GLC and Poovayya have no preview route at all (measured 2026-09-10, and that part
+	 * held up), so `DENY` is safe for them as they stand.
 	 */
 	frameOptions?: string | null;
 }
