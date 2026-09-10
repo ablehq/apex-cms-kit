@@ -46,7 +46,7 @@ const CMS_CONFIG = {
 };
 
 /** An Apex client that answers every read from a table of path → body. */
-function stubApex(overrides = {}) {
+function stubApex(overrides = {}, cmsConfig = CMS_CONFIG) {
 	const calls = [];
 	const bodies = {
 		'/api/platform/v1/cms/post_archetype_views/search_and_filter': {
@@ -80,7 +80,7 @@ function stubApex(overrides = {}) {
 	return {
 		calls,
 		async readCmsConfig() {
-			return { status: 200, ok: true, body: CMS_CONFIG };
+			return { status: 200, ok: true, body: cmsConfig };
 		},
 		async get(path, query) {
 			calls.push({ path, query });
@@ -174,6 +174,65 @@ describe('publishContent', () => {
 		assert.equal(allowed.ok, true);
 		assert.equal(allowed.counts.authors, 0);
 		assert.equal(allowed.previous.authors, 1);
+	});
+
+	it('refuses a collection that DISAPPEARED, not only one that emptied', async () => {
+		// The twin at `publish.ts:220-229` — a collection that came back empty — was
+		// tested; this one, a collection the previous snapshot had and this publish does
+		// not produce AT ALL, was not. Removing it left the whole suite green, and the
+		// consequence is the same either way: the site's pages render nothing and say
+		// nothing about why.
+		const kv = memoryStore();
+		assert.equal(
+			(await publishContent({ apex: stubApex(), kv, accountId: ACCOUNT, publishedBy: 'e' })).ok,
+			true
+		);
+		const before = kv.map.get(CONTENT_KEY);
+
+		// `authors` comes from cms_config's `content_library`. Drop it and the collection
+		// is not empty — it is absent, so it never reaches the empty check below it.
+		const withoutAuthors = { data: { ...CMS_CONFIG.data, content_library: [] } };
+		const refused = await publishContent({
+			apex: stubApex({}, withoutAuthors),
+			kv,
+			accountId: ACCOUNT,
+			publishedBy: 'e'
+		});
+		assert.deepEqual([refused.ok, refused.error], [false, 'empty_collection']);
+		assert.match(refused.detail, /authors is no longer published at all/);
+		assert.equal(kv.map.get(CONTENT_KEY), before, 'nothing was written');
+
+		const allowed = await publishContent({
+			apex: stubApex({}, withoutAuthors),
+			kv,
+			accountId: ACCOUNT,
+			publishedBy: 'e',
+			allowEmpty: true
+		});
+		assert.equal(allowed.ok, true, 'allowEmpty is still the way to confirm it deliberately');
+	});
+
+	it('refuses a snapshot over the KV ceiling as a TYPED refusal, not a kv.put throw', async () => {
+		// Without this guard a >25 MiB value is an unhandled `kv.put` rejection: the
+		// editor sees a 500, the audit row says nothing useful, and the cause — one
+		// oversized field somewhere in the content — is invisible. Removing it left the
+		// suite green.
+		const kv = memoryStore();
+		const huge = {
+			'/api/platform/v1/cms/gallery_items/search_and_filter': {
+				data: [{ id: 'img-1', blob: 'x'.repeat(21 * 1_048_576) }],
+				pagination: { total_count: 1, current_page: 1, total_pages: 1 }
+			}
+		};
+		const refused = await publishContent({
+			apex: stubApex(huge),
+			kv,
+			accountId: ACCOUNT,
+			publishedBy: 'e'
+		});
+		assert.deepEqual([refused.ok, refused.error], [false, 'too_large']);
+		assert.match(refused.detail, /KV holds 25 MiB per value/);
+		assert.equal(kv.map.has(CONTENT_KEY), false, 'nothing was written');
 	});
 
 	it('refuses a publish whose store moved underneath it, and keeps the newer content', async () => {
