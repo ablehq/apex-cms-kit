@@ -4,7 +4,13 @@ import { appendAuditEntry } from '../audit';
 import { containsReviewOnlyField } from '../authorization';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectGuardFailure, rejectMutation } from '../reject';
+import {
+	refuseOversizedFields,
+	refuseUnreadableUrls,
+	rejectGuardFailure,
+	rejectMutation
+} from '../reject';
+import { sanitizeFieldValue } from '../../../sanitize/write-boundary';
 import { pageIdSchema } from './get-page';
 import { computePageVersion } from '../page-version';
 import type { BffContext } from '../context';
@@ -98,6 +104,75 @@ export function findForeignId(body: unknown, owned: Set<string>): { key: string 
 	return walk(body, 0);
 }
 
+/**
+ * The keys under which a structure body carries a BAG OF FIELD VALUES rather than
+ * structure. Apex's page permit spells `fields_data` as `property_set_attributes.info`
+ * (`ContentLibrary::Entity` reads its `fields_data` out of `property_set.info_object.rows`),
+ * so both names address the same thing and both are measured entry by entry.
+ */
+const FIELD_VALUE_BAGS = new Set(['fields_data', 'info']);
+
+/**
+ * The caller-supplied VALUES inside a structure body, flattened to `path -> value` so
+ * that the two refusals every other write path already runs can run here too.
+ *
+ * WHY THIS EXISTS. `blocks_attributes` is `z.array(jsonRecord)` — a deliberate
+ * passthrough for the Apex-shaped tree, which is walked twice already (for
+ * review-only keys, and for id ownership) and both of those walks are about KEYS.
+ * Nothing looked at the values, so this was the one write path in the BFF with no
+ * ceiling and no URL judge: `patch-entity-fields`, `create-entity`, `create-record`,
+ * `update-record`, `create-post`, `update-post-archetype` and `save-post-body` all
+ * run both, and this one ran neither.
+ *
+ * MEASURED THE SAME WAY THE SIBLINGS MEASURE, deliberately, so this route is not held
+ * to a tighter rule than the rest of the boundary. A field bag is measured ENTRY BY
+ * ENTRY — a structured field value (a Quill delta, a rich-text envelope) is measured
+ * whole, exactly as `patch-entity-fields` measures one `fields_data` entry — and every
+ * other string leaf is measured on its own. The whole block is NOT measured as one
+ * value: that would be a ceiling no other path imposes, and a legitimately long page
+ * would trip it.
+ *
+ * Keyed by PATH (`blocks_attributes[3].blockable_attributes.content_html`) because the
+ * refusals name the field they refuse, and "content_html" alone would send an editor
+ * bisecting a 200-block page to find which one.
+ */
+export function structureValueFields(body: unknown): Record<string, unknown> {
+	const values: Record<string, unknown> = {};
+	const walk = (value: unknown, path: string, depth: number) => {
+		if (depth > 32) return;
+		// A string is a value wherever it sits — INCLUDING inside an array. An earlier
+		// draft of this walk descended into arrays but only recorded strings found as
+		// object properties, so `group_member_template_instance_ids: [<200k chars>]`
+		// measured nothing at all.
+		if (typeof value === 'string') {
+			values[path] = value;
+			return;
+		}
+		if (value === null || typeof value !== 'object') return;
+		if (Array.isArray(value)) {
+			value.forEach((item, index) => walk(item, `${path}[${index}]`, depth + 1));
+			return;
+		}
+		for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+			const here = path ? `${path}.${key}` : key;
+			if (
+				FIELD_VALUE_BAGS.has(key) &&
+				nested &&
+				typeof nested === 'object' &&
+				!Array.isArray(nested)
+			) {
+				for (const [name, fieldValue] of Object.entries(nested as Record<string, unknown>)) {
+					values[`${here}.${name}`] = fieldValue;
+				}
+				continue;
+			}
+			walk(nested, here, depth + 1);
+		}
+	};
+	walk(body, '', 0);
+	return values;
+}
+
 export const savePageStructureBodySchema = z
 	.object({
 		title: z.string().max(300).optional(),
@@ -159,6 +234,23 @@ export async function handleSavePageStructure(
 	const parsed = savePageStructureBodySchema.safeParse(bodyJson);
 	if (!parsed.success) return rejectMutation(ctx, validMeta, 400, 'invalid body', 'invalid body');
 
+	// The same two rules `patch-entity-fields.ts:109-115` runs, in the same place —
+	// after the schema, before any Apex round-trip. Both name the offending field
+	// rather than collapsing into `invalid body`, because an editor who pasted a
+	// document into one of a page's blocks should not find it by bisection.
+	//
+	// The ceiling is the half that bites today. `MAX_FIELD_VALUE_CHARS`'s own docblock
+	// calls it "a MECHANIC, not a screen's preference", and describes this route
+	// exactly: without one, a single authenticated POST pushes an unbounded string
+	// through the BFF into Apex and into the published snapshot — where `publishContent`
+	// then refuses the whole snapshot as `too_large`, blocking publishing SITE-WIDE for
+	// every collection, with nothing pointing at the block that caused it.
+	const structureValues = structureValueFields(parsed.data);
+	const tooLarge = await refuseOversizedFields(ctx, validMeta, structureValues);
+	if (tooLarge) return tooLarge;
+	const unreadable = await refuseUnreadableUrls(ctx, validMeta, structureValues);
+	if (unreadable) return unreadable;
+
 	// Ownership: every id the body names must be in the addressed page's tree, read
 	// FRESH here (never from the body). Anything else is refused before the PATCH,
 	// with zero writes — see `findForeignId` for what Rails would otherwise permit.
@@ -181,9 +273,37 @@ export async function handleSavePageStructure(
 		);
 	}
 
+	// The third rule the siblings run, and the last one this path was missing.
+	// `sanitizeFieldValue` is the SAME call `patch-entity-fields.ts:119` makes over one
+	// entity's `fields_data`; here it walks the block tree, which carries field bags of
+	// its own (`entities_attributes[].property_set_attributes.info` IS `fields_data`)
+	// plus `blockable_attributes.content_html`, the raw HTML column on
+	// `Cms::PageBlock::RichText`.
+	//
+	// It is `sanitizeWriteHtml` underneath, NOT the render allowlist: it removes
+	// executable elements and dangerous attributes and leaves everything else exactly
+	// as the editor wrote it. A string with no `<` in it is returned by reference, so
+	// ids, slugs and positions are untouched — the identity contract that file
+	// documents holds for the whole tree.
+	//
+	// Not an XSS fix. `content_html` is sanitized again at projection by GLC and
+	// Poovayya, and Godrej's loader never renders it. This is the write boundary doing
+	// at the boundary what three sites currently each do downstream.
+	const sanitizedBody = {
+		...parsed.data,
+		...(parsed.data.blocks_attributes
+			? { blocks_attributes: sanitizeFieldValue(parsed.data.blocks_attributes) }
+			: {}),
+		...(parsed.data.meta_properties_attributes
+			? {
+					meta_properties_attributes: sanitizeFieldValue(parsed.data.meta_properties_attributes)
+				}
+			: {})
+	};
+
 	const apexResponse = await guard.apex.updatePageStructure(
 		idResult.data,
-		parsed.data as PageStructureBody
+		sanitizedBody as PageStructureBody
 	);
 	const outcome = apexResponse.ok ? 'accepted' : 'apex_error';
 
