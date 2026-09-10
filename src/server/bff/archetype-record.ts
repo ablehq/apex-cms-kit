@@ -28,10 +28,15 @@ export const archetypeIdSchema = z
 	.regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu);
 
 /**
- * Unwrap the single record from an Apex response. Apex answers either
- * `{ data: { … } }` or the bare record; anything else is not a record, and saying
- * so is what turns an unexpected upstream shape into a 502 instead of a silent
- * empty result.
+ * Unwrap the single record from an Apex response. Despite the name it serves every
+ * envelope this BFF reads — archetype record, page, gallery item, medium — because
+ * three looser copies were folded into it. The name is kept because both sites
+ * import it. Apex answers either `{ data: { … } }` or the bare record;
+ * anything else is not a record, and saying so is what turns an unexpected upstream
+ * shape into a 502 instead of a silent empty result.
+ *
+ * `data: []` is REJECTED. Three looser copies of this reader used to accept it and
+ * hand back an empty object, which reached callers as a 200 with nothing in it.
  */
 export function unwrapArchetypeRecord(body: unknown): Record<string, unknown> | null {
 	if (!body || typeof body !== 'object') return null;
@@ -56,7 +61,8 @@ export function unwrapArchetypeCollection(body: unknown): Record<string, unknown
 	return [];
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+/** A JSON object, and not an array. Shared with the operations that read Apex JSON. */
+export function isRecord(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
@@ -196,7 +202,6 @@ export function readTaggingsStrict(record: Record<string, unknown>): StrictTaggi
 	return { ok: true, taggings: rows };
 }
 
-/** `updated_at` as a plain string — the stale-save token for a single record. */
 /**
  * Read a PRIMITIVE field's value, preferring the `archetype_item` row over
  * `primitives`.
@@ -223,6 +228,44 @@ export function readPrimitiveValue(record: Record<string, unknown>, name: string
 	}
 	const primitives = readPrimitives(record);
 	return name in primitives ? primitives[name] : undefined;
+}
+
+/**
+ * Which keys of `primitives` NO Primitive `archetype_item` row accounts for — the
+ * measurement the partial-write guard is built on.
+ *
+ * `Archetype#primitives` is a CACHE, not storage. `Archetype#on_primitive_changed`
+ * rebuilds it from scratch out of every Primitive item's `fields_data` on each item
+ * save and each item destroy (`archetype.rb:206-218`, `archetype_item.rb:184-197`).
+ * So a key that lives in `primitives` with no item behind it survives only until
+ * the next write of ANY field on that record, at which point the rebuild simply
+ * does not produce it and it is gone — silently, with a 200.
+ *
+ * An empty answer therefore means "every stored value has a row to be rebuilt
+ * from", which is the state every record created through any admin is in from
+ * birth. A non-empty answer names exactly what a partial write would destroy.
+ *
+ * Conservative on purpose: an item whose `fields_data` does not carry the key is
+ * NOT counted as covering it, because the rebuild would not carry it either.
+ *
+ * The other direction, which surprises people: a row holding `{field: []}` — minted
+ * by a flat save that sent an array to a field the permit does not cover, which
+ * answers 200 and stores the empty array — DOES cover its key, and correctly. This guard asks one question, "what would a
+ * partial write destroy", and the answer there is nothing: the rebuild reproduces
+ * `[]`, and `primitives` already reads `[]` because that same bad save triggered the
+ * rebuild that emptied it. Refusing the save would block an edit while protecting
+ * nothing. The cost is that such a record reads as HEALTHY while its list is
+ * silently empty — noticing that is the backfill's job, not this function's.
+ */
+export function unbackedPrimitiveKeys(record: Record<string, unknown>): string[] {
+	const covered = new Set<string>();
+	for (const item of readArchetypeItems(record)) {
+		if (item.relatable_type !== 'PropertySet') continue;
+		const fieldsData = isRecord(item.fields_data) ? item.fields_data : null;
+		if (!fieldsData) continue;
+		for (const key of Object.keys(fieldsData)) covered.add(key);
+	}
+	return Object.keys(readPrimitives(record)).filter((key) => !covered.has(key));
 }
 
 /** One entry of a reference relation: the JOIN ROW and the record it points at. */

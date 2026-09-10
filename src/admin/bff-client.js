@@ -33,7 +33,11 @@ function readCsrfToken() {
  * method for method, and its return shapes are those of the BFF operations in
  * `src/lib/server/bff/operations/`.
  *
- * @param {{ fetchImpl?: typeof fetch, csrfToken?: string | (() => string) }} [options]
+ * `extend` is how a site adds its own methods over the SAME transport: it receives
+ * `get` and `mutate` and returns an object merged over the base client. It is not
+ * given the internal `readJson` — neither site ever destructured it.
+ *
+ * @param {{ fetchImpl?: typeof fetch, csrfToken?: string | (() => string), extend?: (transport: { get: Function, mutate: Function }) => object }} [options]
  * @returns {import('./types').BffClient}
  */
 export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
@@ -74,10 +78,25 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 			body: body === undefined ? undefined : JSON.stringify(body)
 		});
 		const parsed = await readJson(response);
+		/**
+		 * THE HTTP STATUS WINS, and the order of these three lines is the whole point.
+		 *
+		 * Spreading the body LAST let a response key named `status` replace the real
+		 * one. That is not hypothetical: nine shipped BFF operations answer a 502 whose
+		 * body is `{error: 'upstream error', status: <the upstream 500>}` — the
+		 * upstream status, deliberately reported, in a key that then overwrote the
+		 * transport's. Every screen reading `result.status` to decide "was this
+		 * refused, or did the server break?" got the wrong number, silently, on exactly
+		 * the responses where it matters.
+		 *
+		 * Fixing it here rather than by renaming the body key fixes all of them at
+		 * once, and makes the next operation that reports an upstream status safe by
+		 * default. `ok` is pinned for the same reason.
+		 */
 		return {
+			...(parsed && typeof parsed === 'object' ? parsed : {}),
 			ok: response.ok,
-			status: response.status,
-			...(parsed && typeof parsed === 'object' ? parsed : {})
+			status: response.status
 		};
 	}
 
@@ -111,11 +130,26 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 		getPage(pageId) {
 			return get(`/api/admin/pages/${pageId}`);
 		},
+		/** Create-then-reveal: the page exists (as a draft) before the editor opens. */
+		createPage(payload) {
+			return mutate('/api/admin/pages', 'POST', payload);
+		},
 		readVersion(pageId) {
 			return get(`/api/admin/pages/${pageId}/version`);
 		},
+		/**
+		 * BOTH SEGMENTS ARE ENCODED. The server validates and encodes them again
+		 * (`assertEntityTypeRef` / `assertUuid` in `apex-admin-client.ts`), which is
+		 * where the guarantee lives — but the URL built HERE decides which of OUR OWN
+		 * routes the request reaches, and that is decided before any of that runs. A
+		 * caller passing `..` would address a different admin route entirely, and P4a
+		 * widened the type segment from a uuid to a SLUG, which is the shape a caller
+		 * is most likely to build from something it read.
+		 */
 		patchEntityFields(entityTypeId, entityId, fieldsData) {
-			return mutate(`/api/admin/entities/${entityTypeId}/${entityId}`, 'PATCH', {
+			const type = encodeURIComponent(entityTypeId);
+			const id = encodeURIComponent(entityId);
+			return mutate(`/api/admin/entities/${type}/${id}`, 'PATCH', {
 				fields_data: fieldsData
 			});
 		},
@@ -125,9 +159,13 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 		changePageStatus(pageId, statusEvent) {
 			return mutate(`/api/admin/pages/${pageId}/status`, 'PATCH', { status_event: statusEvent });
 		},
-		// Media upload path (MediaPickerModal). `sign` creates the gallery item + a
-		// signed storage URL; the browser PUTs the file to that URL directly (it is a
-		// storage URL, not Apex); `finalize` records the medium. All same-origin.
+		// Media upload path (`upload-media.js`, which is what the picker and both
+		// library screens call). `sign` checks the type and size and mints a signed
+		// storage URL and creates NOTHING; the browser PUTs the file to that URL
+		// directly (storage, not Apex, no credential); `finalize` creates the gallery
+		// item and attaches the medium in one server-side op. Creating the item last
+		// is why no failure on this path can leave a caption with no picture. Both
+		// legs are same-origin.
 		signMediaUpload(payload) {
 			return mutate('/api/admin/media/uploads', 'POST', payload);
 		},
@@ -148,20 +186,16 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 
 		// ── Images (3d) ──────────────────────────────────────────────────────────
 		//
-		// There is no `createImage`. An image is created by uploading BYTES, and that
-		// leg is bring-up-gated (§2.7): the signed upload URL Apex hands back points at
-		// a port it does not serve. `listImages` reports the gate as `uploadEnabled` so
-		// the screen can disable the control and say why, instead of offering an upload
-		// that would stall forever and leave a captioned item with no picture.
+		// There is still no `createImage`, and there never will be: an image is
+		// created by uploading BYTES, which is `signMediaUpload` + `finalizeMediaUpload`
+		// above. That path is now proved end to end against real Apex for all three
+		// galleries; the methods here read and edit what it produced.
 
 		async listImages() {
 			const body = await get('/api/admin/images');
 			return {
 				images: Array.isArray(body?.images) ? body.images : [],
-				galleryId: typeof body?.galleryId === 'string' ? body.galleryId : '',
-				uploadEnabled: body?.uploadEnabled === true,
-				uploadDisabledReason:
-					typeof body?.uploadDisabledReason === 'string' ? body.uploadDisabledReason : ''
+				galleryId: typeof body?.galleryId === 'string' ? body.galleryId : ''
 			};
 		},
 		/** Caption and alt only. Position is not writable — this screen cannot reorder. */
@@ -178,5 +212,5 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 		}
 	};
 	// A site adds its own methods over the same `get`/`mutate`, never a second transport.
-	return extend ? { ...base, ...extend({ get, mutate, readJson }) } : base;
+	return extend ? { ...base, ...extend({ get, mutate }) } : base;
 }

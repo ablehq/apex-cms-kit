@@ -1,39 +1,106 @@
 import { z } from 'zod';
-import { unwrapData } from '../apex-admin-client';
-import { appendAuditEntry } from '../audit';
+import { unwrapArchetypeRecord } from '../archetype-record';
+import { auditOutcome } from '../audit';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
+import {
+	purgeExpiredUploadClaims,
+	recordUploadClaim,
+	redeemUploadClaim,
+	uploadClaimId,
+	uploadClaimMessage
+} from '../media-claim';
+import { rejectGuardFailure, rejectMutation } from '../reject';
+import { readGalleryId } from './list-gallery-images';
+import { CAPTION_MAX_LENGTH, galleryMedia, refuseUpload } from '../../../admin/media-types.js';
+import type { ApexAdminClient, ApexResponse } from '../apex-admin-client';
 import type { BffContext } from '../context';
 
 /**
- * The MediaPickerModal upload path (plan §8, 3a lift list), as two same-origin BFF
- * ops. Keus's MediaService did all of this browser-side with a raw Apex bearer token;
- * here every Apex call is server-side behind the guard, and only the raw file bytes
- * ever leave the browser directly — to the ActiveStorage SIGNED URL, which is storage,
- * not Apex, and carries no Apex credential.
+ * The media upload path, as two same-origin BFF ops. Keus's MediaService did all of
+ * this browser-side with a raw Apex bearer token; here every Apex call is server-side
+ * behind the guard, and only the raw file bytes ever leave the browser directly — to
+ * the ActiveStorage SIGNED URL, which is storage, not Apex, and carries no Apex
+ * credential.
  *
- *   POST /api/admin/media/uploads  → create the gallery item + a signed upload URL
- *   (browser PUTs the file to that URL)
- *   POST /api/admin/media          → finalize: record the medium against the item
+ *   POST /api/admin/media/uploads  → check the type and size, mint a signed URL,
+ *                                    write the CLAIM. Creates NOTHING upstream.
+ *   (the browser PUTs the file to that URL)
+ *   POST /api/admin/media          → spend the claim, then create the gallery item
+ *                                    AND attach the medium.
  *
- * Media upload remains upload-only (no browse/reuse) exactly as the design notes
- * (02 §5 — that is Phase 5). Fail closed: strict bodies, gallery ids UUID-checked.
+ * ── WHY THE ITEM IS CREATED HERE AND NOT AT SIGN ──────────────────────────────
+ * It used to be created at sign, before the bytes existed. Every failure after that
+ * point — a 422 from storage, a size refusal, a closed tab — left a gallery item with
+ * a caption and no picture, and a sign-leg failure left one the browser could not even
+ * name, because the op answered 502 without the id. Compensating for that in the
+ * browser was tried and does not work.
+ *
+ * Creating the item at FINALIZE removes the failure mode rather than handling it:
+ * nothing exists until the bytes are stored, so there is no rollback to perform and
+ * no orphaned item to sweep. The one compensation left is local and server-side: if
+ * creating the MEDIUM fails after the item was created, this op deletes the item it
+ * just made, in the same request.
+ *
+ * ── WHAT MOVING THE CREATE DID *NOT* REMOVE ───────────────────────────────────
+ * This file used to argue that finalize no longer had to guard its target because
+ * there was no browser-supplied `galleryItemId` left to distrust. That was wrong,
+ * and measurably so. The SIGNED ID is still a caller-supplied token, and it is the
+ * only thing tying the finalize request to the type and size check the sign leg ran.
+ * With nothing checking it: a PNG signed for `images` finalized into `videos` (200);
+ * a PDF signed for `files` finalized into `images` (200); one signed id finalized
+ * twice, and twice concurrently, each time leaving two gallery items whose media
+ * shared a single blob — which `dependent: :purge_later` turns into "deleting one
+ * item destroys the other's bytes".
+ *
+ * `media-claim.ts` closes both holes with one row: sign writes down the gallery it
+ * judged, finalize spends that row with a single conditional UPDATE. See that file
+ * for why one statement, and not a read followed by a write.
+ *
+ * ── THE WINDOW BETWEEN THE ITEM AND ITS BYTES, STATED HONESTLY ────────────────
+ * An earlier comment here said the cleanup delete "cannot race a caller". It can.
+ * The item is created before the file is attached, so for the length of one Apex
+ * round trip it is a real, listable row that another editor could delete — and Rails
+ * permits a `Medium` whose polymorphic record is absent, measured: create an item,
+ * delete it, then attach to its id and Apex answers 200 with a medium pointing at
+ * nothing. So this op can report an accepted upload whose gallery item is gone, and
+ * leave a `Medium` row referencing a deleted record.
+ *
+ * Not repaired, deliberately. Re-reading the item after the attach would narrow the
+ * window and not close it — the delete can land immediately after the re-read — and
+ * a check that looks like a guarantee but is not one is worse than a stated limit.
+ * Closing it needs something upstream this API does not offer: creating the item and
+ * attaching the file in one transaction, or a foreign key that refuses a `Medium`
+ * whose record is absent. Both belong in `ellipsis-backend`, next to the
+ * unattached-blob sweeper below.
+ *
+ * The practical reach is small: the id is seconds old and appears in no list anyone
+ * has read, so deleting it means already holding an id nothing has published yet.
+ * That is why it is documented rather than defended against.
+ *
+ * ── WHAT IS STILL NOT REPAIRED ────────────────────────────────────────────────
+ * The blob. Signing mints an `ActiveStorage::Blob` immediately, so an abandoned or
+ * failed PUT strands bytes that no platform API can reach, and `ellipsis-backend` has
+ * no sweeper for unattached blobs. Even the success-then-delete path purges
+ * asynchronously. That is upstream debt — a periodic purge with an age threshold —
+ * named here rather than silently inherited.
+ *
+ * Fail closed: strict bodies, and the gallery is addressed by NAME (its id is
+ * account-scoped and resolved from `cms_config` per request — risk R14).
  */
-const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu);
 
+/**
+ * The gallery is a NAME, never an id. `refuseUpload` rejects a name this kit does not
+ * serve, so the schema only has to bound the string; keeping the vocabulary in one
+ * module (`admin/media-types.js`) is what stops the browser check, this check and the
+ * file input's `accept` from drifting apart.
+ */
 const signBodySchema = z
 	.object({
-		galleryId: uuid,
-		title: z.string().max(300).optional(),
-		alt: z.string().max(300).optional(),
+		gallery: z.string().max(40),
 		file: z
 			.object({
-				byte_size: z
-					.number()
-					.int()
-					.positive()
-					.max(50 * 1024 * 1024),
+				byte_size: z.number().int().positive(),
 				content_type: z.string().max(120),
 				filename: z.string().max(300),
 				checksum: z.string().max(64)
@@ -44,11 +111,96 @@ const signBodySchema = z
 
 const finalizeBodySchema = z
 	.object({
-		galleryItemId: uuid,
+		gallery: z.string().max(40),
 		signedId: z.string().min(1).max(4096),
-		contentType: z.string().max(120).optional()
+		title: z.string().max(CAPTION_MAX_LENGTH).optional(),
+		alt: z.string().max(CAPTION_MAX_LENGTH).optional()
 	})
 	.strict();
+
+/**
+ * A rejected body, as a sentence.
+ *
+ * Everywhere else in this BFF a schema failure answers the code `invalid body`, and
+ * that is right: those codes are read by screens that already know what they sent
+ * and choose their own words. This path is the exception, and it is the only one —
+ * the media screens print the server's string VERBATIM, and they print it after the
+ * editor's bytes have already been uploaded. A caption pasted past the cap therefore
+ * showed a person the words "invalid body" as the explanation for losing a 20 MB
+ * upload. The `maxlength` attributes make that unreachable through the UI; this
+ * makes it survivable when it is reached anyway.
+ *
+ * The audit row still records `invalid body`, so nothing that greps the log changes.
+ */
+function invalidBodyMessage(issues: { path: PropertyKey[]; code: string }[], fallback: string) {
+	for (const issue of issues) {
+		if (issue.code !== 'too_big') continue;
+		const field = issue.path[issue.path.length - 1];
+		if (field === 'title')
+			return `That caption is too long. Keep it to ${CAPTION_MAX_LENGTH} characters or fewer.`;
+		if (field === 'alt')
+			return `That alt text is too long. Keep it to ${CAPTION_MAX_LENGTH} characters or fewer.`;
+		if (field === 'filename') return 'That file name is too long. Rename the file and try again.';
+	}
+	return fallback;
+}
+
+/**
+ * What Apex actually said, dug out of the two failure shapes its controllers use:
+ *
+ *   {"message": "Content type image/avif is not a valid kind", "errors": {...}}
+ *   {"data": [{"attribute_name": "file", "messages": ["File file size must be …"]}]}
+ *
+ * Flattening both to `502 {error:'upstream error'}` — which is what this file used to
+ * do on every non-2xx — means an editor is told an upload failed and never told why,
+ * for a class of failures whose reasons are entirely actionable ("that type is not
+ * allowed", "that file is too big"). Length-capped: it is a message for a person, not
+ * a channel for arbitrary upstream text.
+ */
+function apexMessage(body: unknown): string {
+	const root = body as { message?: unknown; errors?: unknown; data?: unknown } | null;
+	if (typeof root?.message === 'string' && root.message.trim())
+		return root.message.trim().slice(0, 300);
+
+	const rows = Array.isArray(root?.data) ? root.data : [];
+	const fromRows: string[] = [];
+	for (const row of rows) {
+		const messages = (row as { messages?: unknown })?.messages;
+		if (Array.isArray(messages))
+			for (const m of messages) if (typeof m === 'string') fromRows.push(m);
+	}
+	if (fromRows.length) return fromRows.join('. ').slice(0, 300);
+
+	const errors = root?.errors;
+	if (errors && typeof errors === 'object') {
+		const flat: string[] = [];
+		for (const value of Object.values(errors as Record<string, unknown>)) {
+			// Rails answers `{field: ["msg"]}` here, but a bare `{field: "msg"}` shows up
+			// too. Braces, not a dangling `else`: without them the string branch binds to
+			// the INNER `if` and can never run, silently dropping half the shapes.
+			if (Array.isArray(value)) {
+				for (const m of value) if (typeof m === 'string') flat.push(m);
+			} else if (typeof value === 'string') {
+				flat.push(value);
+			}
+		}
+		if (flat.length) return flat.join('. ').slice(0, 300);
+	}
+	return '';
+}
+
+/**
+ * An upstream failure, with its reason. A 422 is Apex judging the REQUEST and is
+ * passed through as a 422 so the browser can tell "you sent something invalid" from
+ * "the upstream is unwell". Every other upstream status becomes a 502 — echoing a 401
+ * or a 403 from Apex would read to the admin as "your session ended", which is a
+ * different and misleading thing — but it still carries the message.
+ */
+function upstreamFailure(response: ApexResponse): Response {
+	const message = apexMessage(response.body);
+	const status = response.status === 422 ? 422 : 502;
+	return noStoreJson({ error: message || 'upstream error' }, status);
+}
 
 export async function handleSignMediaUpload(request: Request, ctx: BffContext): Promise<Response> {
 	const meta = {
@@ -58,7 +210,7 @@ export async function handleSignMediaUpload(request: Request, ctx: BffContext): 
 		requestId: request.headers.get('cf-ray')
 	};
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 	const actorMeta = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 
 	let bodyJson: unknown;
@@ -68,44 +220,130 @@ export async function handleSignMediaUpload(request: Request, ctx: BffContext): 
 		return rejectMutation(ctx, actorMeta, 400, 'invalid json', 'invalid json');
 	}
 	const parsed = signBodySchema.safeParse(bodyJson);
-	if (!parsed.success) return rejectMutation(ctx, actorMeta, 400, 'invalid body', 'invalid body');
-
-	const galleryItem = await guard.apex.createGalleryItem(
-		parsed.data.galleryId,
-		parsed.data.title ?? '',
-		parsed.data.alt ?? ''
-	);
-	if (!galleryItem.ok) return noStoreJson({ error: 'upstream error' }, 502);
-	const item = unwrapData(galleryItem.body);
-	const galleryItemId = typeof item?.id === 'string' ? item.id : null;
-	if (!galleryItemId) return noStoreJson({ error: 'unexpected upstream shape' }, 502);
-
-	const signed = await guard.apex.createSignedUploadUrl(parsed.data.file);
-	if (!signed.ok) return noStoreJson({ error: 'upstream error' }, 502);
-	const signedData = unwrapData(signed.body) ?? (signed.body as Record<string, unknown> | null);
-
-	if (ctx.db) {
-		await appendAuditEntry(ctx.db, {
-			id: crypto.randomUUID(),
-			occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-			actorEmail: guard.actor.email,
-			actorSub: guard.actor.sub,
-			action: meta.action,
-			method: meta.method,
-			path: meta.path,
-			accountId: ctx.accountId ?? null,
-			pageId: null,
-			requestId: meta.requestId,
-			outcome: 'accepted',
-			detail: { galleryItemId, filename: parsed.data.file.filename }
-		});
+	if (!parsed.success) {
+		const said = invalidBodyMessage(
+			parsed.error.issues,
+			'That file could not be prepared for upload.'
+		);
+		return rejectMutation(ctx, actorMeta, 400, said, 'invalid body');
 	}
 
+	// The SAME check the browser ran, run again where it actually holds. A browser
+	// check constrains a well-behaved browser; this one constrains everyone. Note it
+	// happens before any Apex call, so a refusal costs nothing upstream.
+	const refusal = refuseUpload(
+		parsed.data.gallery,
+		parsed.data.file.content_type,
+		parsed.data.file.byte_size
+	);
+	if (refusal) return rejectMutation(ctx, actorMeta, 400, refusal, refusal);
+
+	// Fail CLOSED before asking Apex for anything: a signed id whose claim cannot be
+	// written is a token finalize could not check, so minting one would hand the
+	// browser exactly the unbound capability the claim exists to prevent.
+	if (!ctx.db) {
+		return noStoreJson({ error: 'Uploads are not available on this deployment.' }, 500);
+	}
+
+	/**
+	 * THE DESTINATION IS RESOLVED BEFORE THE BYTES ARE INVITED, not after they land.
+	 *
+	 * `readGalleryId` used to run only in FINALIZE. So an account with no such
+	 * gallery — or one whose `cms_config` could not be read — got a signed URL, an
+	 * ActiveStorage blob with nothing attached to it, and a full upload of the file
+	 * over the wire, and the first thing that failed was the finalize AFTER all of
+	 * that. On a 25 MB video that is a minute of an editor's time spent to be told
+	 * there was never anywhere to put it, and an unattached blob left in storage
+	 * that nothing here can name or sweep (codex's P5 fix review, 2026-09-08).
+	 *
+	 * One extra read per sign, on a leg that already makes an Apex call. The picker's
+	 * `uploadEnabled` is the same fact learned in the browser; this is the one that
+	 * holds, and the browser check may be `null` — "not asked" — on any site.
+	 */
+	const destination = await readGalleryId(guard.apex, parsed.data.gallery).catch(() => null);
+	if (!destination) {
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: {
+				gallery: parsed.data.gallery,
+				filename: parsed.data.file.filename,
+				reason: 'no-such-gallery-on-this-account'
+			}
+		});
+		// A 502, not a 400: the request is well-formed and the fault is this account's
+		// configuration or an unreadable `cms_config` — the same reasoning finalize
+		// already applied to the same read.
+		return noStoreJson(
+			{
+				error: `There is no “${parsed.data.gallery}” library on this workspace to upload to.`
+			},
+			502
+		);
+	}
+
+	const signed = await guard.apex.createSignedUploadUrl(parsed.data.file).catch(() => null);
+	if (signed === null) {
+		// A rethrown transport fault. Nothing upstream was created that could need
+		// sweeping — but an unaudited exception is still a request nobody can account
+		// for afterwards, which is the whole point of the log.
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: { gallery: parsed.data.gallery, filename: parsed.data.file.filename }
+		});
+		return noStoreJson({ error: 'The upload could not be started. Try again.' }, 502);
+	}
+	if (!signed.ok) {
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: { filename: parsed.data.file.filename, apexStatus: signed.status }
+		});
+		return upstreamFailure(signed);
+	}
+	const signedData =
+		unwrapArchetypeRecord(signed.body) ?? (signed.body as Record<string, unknown> | null);
+	const uploadUrl = typeof signedData?.url === 'string' ? signedData.url : '';
+	const signedId = typeof signedData?.signed_id === 'string' ? signedData.signed_id : '';
+	if (!uploadUrl || !signedId) {
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: { gallery: parsed.data.gallery, filename: parsed.data.file.filename }
+		});
+		return noStoreJson({ error: 'unexpected upstream shape' }, 502);
+	}
+
+	const now = ctx.now ?? Date.now();
+	// The sweep is best-effort housekeeping and must never cost an editor an upload;
+	// the claim write is the opposite, and a failure there fails the whole sign.
+	try {
+		await purgeExpiredUploadClaims(ctx.db, now);
+	} catch {
+		// swallow — an unswept expired claim is refused anyway, by its `expires_at`.
+	}
+	// The claim's key doubles as the ATTEMPT id in the audit log: it is what ties
+	// this row to the finalize row that spends it, and what makes a sign row with no
+	// finalize beside it recognisable as an abandonment. It is a one-way hash — the
+	// signed id is a capability to attach a blob and never reaches the log.
+	const attempt = await uploadClaimId(signedId);
+	try {
+		await recordUploadClaim(ctx.db, attempt, parsed.data.gallery, now);
+	} catch {
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: { gallery: parsed.data.gallery, attempt, claimStored: false }
+		});
+		return noStoreJson({ error: 'The upload could not be started.' }, 500);
+	}
+
+	await auditOutcome(ctx, meta, guard.actor, {
+		outcome: 'accepted',
+		detail: { gallery: parsed.data.gallery, attempt, filename: parsed.data.file.filename }
+	});
+
+	// No `galleryItemId`: nothing has been created. That absence is the design.
 	return noStoreJson({
-		galleryItemId,
-		uploadUrl: signedData?.url ?? null,
+		uploadUrl,
 		uploadHeaders: signedData?.headers ?? {},
-		signedId: signedData?.signed_id ?? null
+		signedId
 	});
 }
 
@@ -120,7 +358,7 @@ export async function handleFinalizeMediaUpload(
 		requestId: request.headers.get('cf-ray')
 	};
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 	const actorMeta = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 
 	let bodyJson: unknown;
@@ -130,34 +368,193 @@ export async function handleFinalizeMediaUpload(
 		return rejectMutation(ctx, actorMeta, 400, 'invalid json', 'invalid json');
 	}
 	const parsed = finalizeBodySchema.safeParse(bodyJson);
-	if (!parsed.success) return rejectMutation(ctx, actorMeta, 400, 'invalid body', 'invalid body');
-
-	const medium = await guard.apex.createMedium({
-		kind: 'primary',
-		file: parsed.data.signedId,
-		record_id: parsed.data.galleryItemId,
-		record_type: 'Cms::GalleryItem'
-	});
-	const outcome = medium.ok ? 'accepted' : 'apex_error';
-	const data = unwrapData(medium.body);
-
-	if (ctx.db) {
-		await appendAuditEntry(ctx.db, {
-			id: crypto.randomUUID(),
-			occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-			actorEmail: guard.actor.email,
-			actorSub: guard.actor.sub,
-			action: meta.action,
-			method: meta.method,
-			path: meta.path,
-			accountId: ctx.accountId ?? null,
-			pageId: null,
-			requestId: meta.requestId,
-			outcome,
-			detail: { galleryItemId: parsed.data.galleryItemId, apexStatus: medium.status }
-		});
+	if (!parsed.success) {
+		const said = invalidBodyMessage(parsed.error.issues, 'That upload could not be saved as sent.');
+		return rejectMutation(ctx, actorMeta, 400, said, 'invalid body');
 	}
 
-	if (!medium.ok) return noStoreJson({ error: 'upstream error' }, 502);
-	return noStoreJson({ galleryItemId: parsed.data.galleryItemId, mediumId: data?.id ?? null });
+	const { gallery, signedId } = parsed.data;
+	// An unknown name is the CALLER's fault and is refused before any upstream call.
+	if (!galleryMedia(gallery))
+		return rejectMutation(ctx, actorMeta, 400, 'no-such-gallery', 'no-such-gallery');
+
+	// Fail CLOSED: without the claim store there is nothing to check the signed id
+	// against, and an unchecked signed id is the whole defect this guard closes.
+	if (!ctx.db) {
+		return noStoreJson({ error: 'Uploads are not available on this deployment.' }, 500);
+	}
+
+	// SPEND THE SIGNED ID, and do it FIRST — before the Apex reads, so a token that
+	// was never minted here, was minted for another library, or has already been
+	// spent costs no upstream call at all. Winning this is what authorizes everything
+	// below it. A claim spent by a request that then fails upstream is NOT put back:
+	// releasing it would reopen the window it exists to close, and the cost of not
+	// releasing is that the editor chooses the file again — which is what the browser
+	// asks them to do on any finalize failure anyway.
+	// The same attempt id the sign leg recorded, so every row this request writes —
+	// including a refusal — can be read next to the sign row it belongs to.
+	const attempt = await uploadClaimId(signedId);
+	// The caption and the alt an editor typed. Not secrets, capped, and the only
+	// human-readable handle the log has on which upload a row is about.
+	const captionDetail = {
+		caption: (parsed.data.title ?? '').slice(0, 80),
+		alt: (parsed.data.alt ?? '').slice(0, 80)
+	};
+	const refusal = await redeemUploadClaim(ctx.db, attempt, gallery, ctx.now ?? Date.now());
+	if (refusal) {
+		return rejectMutation(
+			ctx,
+			{ ...actorMeta, detail: { gallery, attempt } },
+			400,
+			uploadClaimMessage(refusal),
+			refusal
+		);
+	}
+
+	// A name this kit serves that `cms_config` cannot resolve is an UPSTREAM fault —
+	// a failed read, or an account without that gallery — so it is a 502, not a 400.
+	// The two cases answer differently because they are different mistakes.
+	const galleryId = await readGalleryId(guard.apex, gallery).catch(() => null);
+	if (!galleryId) {
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: { gallery, attempt, ...captionDetail }
+		});
+		return noStoreJson({ error: 'upstream error' }, 502);
+	}
+
+	// `.catch(() => null)` on every upstream call from here down, because the ADMIN
+	// transport RETHROWS network faults (`apex-admin-client.ts`: only the
+	// signal-carrying ingest path turns them into typed failures). An escaping
+	// exception is a framework 500 with no audit row and no cleanup — which is the
+	// hole that was closed for the malformed-shape branch and left open on this one.
+	const created = await guard.apex
+		.createGalleryItem(galleryId, parsed.data.title ?? '', parsed.data.alt ?? '')
+		.catch(() => null);
+	if (created === null) {
+		// The create THREW: the request may or may not have reached Apex, and there is
+		// no id either way, so there is nothing to sweep by. Record it — an item that
+		// exists under a caption nobody can name is exactly what an operator needs the
+		// audit row to point at.
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: { gallery, attempt, itemCreated: 'unknown', ...captionDetail }
+		});
+		return noStoreJson({ error: 'The upload could not be saved. Choose the file again.' }, 502);
+	}
+	if (!created.ok) {
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: { gallery, attempt, apexStatus: created.status, ...captionDetail }
+		});
+		return upstreamFailure(created);
+	}
+	const item = unwrapArchetypeRecord(created.body);
+	const galleryItemId = typeof item?.id === 'string' && item.id ? item.id : null;
+	if (!galleryItemId) {
+		// Apex answered 2xx, so an item almost certainly EXISTS — this op simply cannot
+		// name it. That made this the one post-create failure that swept nothing and
+		// audited nothing, while its two neighbours do both: an orphan was left with a
+		// caption and no picture, and no record that it had happened.
+		//
+		// Sweep with whatever came back (an id of the wrong TYPE is still an id; the
+		// client's own uuid check refuses a nonsense one and `deleteQuietly` reports
+		// that as `false`), and audit either way. The caption goes in the detail — not
+		// a secret, and the only handle a person has on an item nothing can name.
+		const unusable = item?.id;
+		const rawId = unusable === undefined || unusable === null ? '' : String(unusable);
+		const swept = rawId ? await deleteQuietly(guard.apex, rawId) : false;
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: {
+				gallery,
+				attempt,
+				apexStatus: created.status,
+				unnamedItem: true,
+				itemDeleted: swept,
+				...captionDetail
+			}
+		});
+		return noStoreJson({ error: 'unexpected upstream shape' }, 502);
+	}
+
+	const medium = await guard.apex
+		.createMedium({
+			kind: 'primary',
+			file: signedId,
+			record_id: galleryItemId,
+			record_type: 'Cms::GalleryItem'
+		})
+		.catch(() => null);
+	if (medium === null) {
+		// ── THE ATTACH THREW, AND THAT IS THE AMBIGUOUS CASE ──────────────────────
+		// A rethrown transport fault means the request may have been LOST on the way
+		// out or on the way back: the `Medium` may exist, or may not, and this op
+		// cannot tell. Both readings are handled by the same action — sweep the item —
+		// because deleting the item destroys any medium hanging off it and purges the
+		// blob (`dependent: :purge_later`), so the outcome converges on "nothing
+		// exists" whichever way the coin actually landed. Leaving it alone does not
+		// converge: it is either a caption with no picture, or a finished upload the
+		// editor was told had failed, and the retry then makes a duplicate.
+		//
+		// The retry is safe to invite BECAUSE of the claim: this signed id is already
+		// spent, so "choose the file again" means a new sign and a new PUT, and the
+		// same bytes cannot be attached twice. What it costs is one stranded blob,
+		// which is the upstream debt this design already names.
+		const swept = await deleteQuietly(guard.apex, galleryItemId);
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: {
+				gallery,
+				attempt,
+				galleryItemId,
+				attachOutcome: 'unknown',
+				itemDeleted: swept,
+				...captionDetail
+			}
+		});
+		return noStoreJson({ error: 'The upload could not be saved. Choose the file again.' }, 502);
+	}
+	if (!medium.ok) {
+		// The ONE compensation this design still needs, and it is local: the item was
+		// created moments ago, in this request, by this op, so its id is known and the
+		// delete needs no search. An item with no medium is the "caption attached to no
+		// picture" the whole ordering exists to prevent. `deleteQuietly` reports rather
+		// than assumes, because the item may already be gone (see the header).
+		const swept = await deleteQuietly(guard.apex, galleryItemId);
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'apex_error',
+			detail: {
+				gallery,
+				attempt,
+				galleryItemId,
+				apexStatus: medium.status,
+				itemDeleted: swept,
+				...captionDetail
+			}
+		});
+		return upstreamFailure(medium);
+	}
+
+	const data = unwrapArchetypeRecord(medium.body);
+	await auditOutcome(ctx, meta, guard.actor, {
+		outcome: 'accepted',
+		detail: { gallery, attempt, galleryItemId, apexStatus: medium.status, ...captionDetail }
+	});
+	return noStoreJson({ galleryItemId, mediumId: data?.id ?? null });
+}
+
+/**
+ * Delete the item we just created, reporting whether it worked rather than assuming.
+ * A throw here would replace Apex's real reason for the failure with the reason the
+ * cleanup failed, which is the less useful of the two — so the outcome is recorded in
+ * the audit detail and the original failure is what the editor is told.
+ */
+async function deleteQuietly(apex: ApexAdminClient, galleryItemId: string): Promise<boolean> {
+	try {
+		const deleted = await apex.deleteGalleryItem(galleryItemId);
+		return deleted.ok;
+	} catch {
+		return false;
+	}
 }

@@ -12,7 +12,7 @@ describe('summarizeGalleryImage — the thumbnail a picker browses', () => {
 		alt: 'Alt text',
 		position: 2,
 		created_at: '2026-01-01T00:00:00Z',
-		medium: { file: { key: 'uploads/abc.jpg' } }
+		medium: { file: { key: 'uploads/abc.jpg', content_type: 'image/jpeg', byte_size: 4096 } }
 	};
 
 	it('composes the URL the public pages compose, from the site prefix', () => {
@@ -36,5 +36,20 @@ describe('summarizeGalleryImage — the thumbnail a picker browses', () => {
 			summarizeGalleryImage({ ...withBytes, medium: { file: {} } }, 'https://x').url,
 			null
 		);
+	});
+
+	it('carries the type and size for EVERY gallery, thumbnail or not', () => {
+		// A files or videos row gets no thumbnail — an image transform is meaningless
+		// for a PDF — so without these two it has no evidence at all that the bytes
+		// landed, which is how a screen ends up saying "No file attached" under an
+		// attached file. Apex returns no filename, so the screen does not claim one.
+		const asFile = summarizeGalleryImage(withBytes, 'https://assets.example', 'files');
+		assert.equal(asFile.url, null, 'no image transform for a file');
+		assert.equal(asFile.contentType, 'image/jpeg');
+		assert.equal(asFile.byteSize, 4096);
+		// With nothing attached they are empty and zero, never undefined.
+		const empty = summarizeGalleryImage({ ...withBytes, medium: undefined }, '', 'files');
+		assert.equal(empty.contentType, '');
+		assert.equal(empty.byteSize, 0);
 	});
 });

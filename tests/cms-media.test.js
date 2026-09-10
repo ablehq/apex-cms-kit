@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { buildMediaIndex, resolveMedia } from '../src/cms/media.js';
+import { buildMediaIndex } from '../src/cms/media.js';
+
+// The index is read the way PRODUCTION reads it — `media?.get(id)` at
+// `cms/page-data.js:116`. There used to be a `resolveMedia(index, id)` accessor
+// that only tests called; it is gone, so these assertions go through the Map.
+/** @param {Map<string, object>} index @param {unknown} id */
+const resolveMedia = (index, id) => (typeof id === 'string' && id ? (index.get(id) ?? null) : null);
 
 test('gallery items are indexed by the id a media field would store', () => {
 	const index = buildMediaIndex([

@@ -99,14 +99,22 @@ export async function handleLogin(request: Request, ctx: BffContext): Promise<Re
 		mutation: true
 	});
 	if (!boundary.ok) {
-		await audit(ctx, {
-			actorEmail: 'unknown',
-			action: LOGIN_ACTION,
-			method: request.method,
-			path,
-			outcome: 'rejected',
-			detail: { reason: boundary.reason }
-		});
+		/**
+		 * NO AUDIT ROW. This is the one exit on this path that ANY caller on the open
+		 * internet can reach — a cross-origin POST, or one with no CSRF token — and
+		 * auditing it bought an attacker one D1 INSERT per request at a rate they
+		 * chose. That is the write amplification `rejectGuardFailure` exists to stop
+		 * everywhere else (`reject.ts`), and login was the one operation still doing
+		 * it; codex found it reviewing P4.
+		 *
+		 * Nothing is lost. A boundary refusal is not an authentication event: the
+		 * credentials were never read, no principal can be attributed, and the row said
+		 * only `unknown` tried something from somewhere. Every exit BELOW this one is
+		 * still audited, including a failed password grant — that one is reachable only
+		 * by a caller that already cleared the same-origin + double-submit CSRF check,
+		 * which is a real browser on our own origin, and a failed login attempt by one
+		 * is exactly what the log is for.
+		 */
 		return bffError(boundary.status, boundary.reason);
 	}
 

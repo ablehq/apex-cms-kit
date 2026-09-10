@@ -1,0 +1,203 @@
+import { z } from 'zod';
+import { auditOutcome } from '../audit';
+import { containsNullPrimitive } from '../authorization';
+import { bffError, noStoreJson } from '../boundary';
+import { guardRequest } from '../guard';
+import { rejectGuardFailure, rejectMutation } from '../reject';
+import { contractOf, noContractResponse } from '../content-contract-guard';
+import { loadGalleryMemberIds } from './list-gallery-images';
+import {
+	buildPostLoad,
+	coverAttributes,
+	loadPostView,
+	metaAttributes,
+	postIdSchema,
+	postRouteMeta,
+	postSchemaOf,
+	publishedDateSchema,
+	readCoverId,
+	readPostIds,
+	rejectedWriteResponse
+} from './post-shape';
+import type { PostFields } from '../apex-admin-client';
+import type { BffContext } from '../context';
+
+/**
+ * PATCH /api/admin/posts/[schema]/[postId] — the post's OWN fields: title, slug,
+ * summary, published date, the SEO triple and the cover.
+ *
+ * The endpoint is `PATCH /cms/posts/:postId`, and that is not a preference.
+ * Routing a post's fields through `archetype_models` answers **422 `Slug has
+ * already been taken`**, because the service validates a freshly built `Cms::Post`
+ * whose slug collides with the post's own. The Apex client has no method that can
+ * express that mistake.
+ *
+ * SEO AND THE COVER ARE WRITTEN BY ID. Both are `accepts_nested_attributes_for`:
+ * an entry without an id creates a SECOND row (measured for both), so the ids
+ * come from the record read in this request, never from the browser.
+ *
+ * `coverId` is the one key here where `null` is CORRECT — it is a reference to a
+ * gallery item, and `null` destroys the cover row, which is exactly "this post has
+ * no cover". Every other key is a `Cms::Post` column where a clear is `''`.
+ *
+ * A NON-NULL COVER IS CHECKED AGAINST THE IMAGES GALLERY BEFORE THE WRITE.
+ * `Cms::SharedGalleryItem` is five lines with no gallery scoping, so a VIDEO item
+ * validates cleanly and becomes the cover with a 200 — the public loaders then
+ * read an item that has no image in it. A random uuid is refused by the same rule
+ * (it is in no gallery either), which is why this reaches Apex only for an id
+ * that was a member a moment ago.
+ *
+ * NEITHER `refuseOversizedFields` NOR `refuseUnreadableUrls` runs here, unlike the
+ * other three post write paths (`save-post-body.ts`, `update-post-archetype.ts`,
+ * `create-post.ts`). Every key on this route is a `Cms::Post` column with its own
+ * schema ceiling below — title 300, slug 200, summary 4000, meta 300/1000/500 —
+ * so an over-long value is `400 invalid body` from zod, not `field-too-large`, and
+ * nothing here carries authored HTML for the URL judge to read.
+ */
+export const updatePostBodySchema = z
+	.object({
+		title: z.string().min(1).max(300).optional(),
+		slug: z
+			.string()
+			.min(1)
+			.max(200)
+			.regex(/^[a-z0-9]+(?:[-_.][a-z0-9]+)*$/u)
+			.optional(),
+		summary: z.string().max(4000).optional(),
+		publishedDate: publishedDateSchema.optional(),
+		meta: z
+			.object({
+				title: z.string().max(300).optional(),
+				description: z.string().max(1000).optional(),
+				keywords: z.string().max(500).optional()
+			})
+			.strict()
+			.optional(),
+		coverId: postIdSchema.nullable().optional()
+	})
+	.strict();
+
+export async function handleUpdatePost(
+	request: Request,
+	ctx: BffContext,
+	params: { schema: string; postId: string }
+): Promise<Response> {
+	const contract = contractOf(ctx);
+	if (!contract) return noContractResponse();
+	const meta = postRouteMeta(request, 'posts.update', 'PATCH', true);
+
+	const guard = await guardRequest(request, ctx, { mutation: true });
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
+	const actor = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
+
+	if (!postSchemaOf(contract, params.schema)) {
+		return rejectMutation(ctx, actor, 404, 'unknown collection', 'unknown collection');
+	}
+	const idResult = postIdSchema.safeParse(params.postId);
+	if (!idResult.success) return rejectMutation(ctx, actor, 400, 'invalid id', 'invalid post id');
+
+	let bodyJson: unknown;
+	try {
+		bodyJson = await request.json();
+	} catch {
+		return rejectMutation(ctx, actor, 400, 'invalid json', 'invalid json');
+	}
+
+	// The shared null guard, told that `coverId` is the one reference-shaped key.
+	if (
+		bodyJson &&
+		typeof bodyJson === 'object' &&
+		containsNullPrimitive(bodyJson as Record<string, unknown>, ['coverId'])
+	) {
+		return rejectMutation(ctx, actor, 400, 'null-field', 'null primitive');
+	}
+	const parsed = updatePostBodySchema.safeParse(bodyJson);
+	if (!parsed.success) return rejectMutation(ctx, actor, 400, 'invalid body', 'invalid body');
+
+	const view = await loadPostView(guard.apex, params.schema, idResult.data);
+	if (!view) return rejectMutation(ctx, actor, 404, 'not found', 'not found');
+	const ids = readPostIds(view);
+
+	// The cover's membership check, BEFORE any field is assembled — a refusal here
+	// must leave the title and the SEO rows untouched too, not half-written.
+	const nextCover = parsed.data.coverId;
+	if (nextCover !== undefined && nextCover !== null && nextCover !== readCoverId(view)) {
+		const members = await loadGalleryMemberIds(guard.apex);
+		// Unreadable is not absent (the same distinction the body save draws).
+		if (members === null) return bffError(502, 'upstream error');
+		if (!members.has(nextCover)) {
+			return rejectMutation(ctx, actor, 400, 'unknown-image', 'unknown image: coverId');
+		}
+	}
+
+	const fields: PostFields = {};
+	if (parsed.data.title !== undefined) fields.title = parsed.data.title;
+	if (parsed.data.slug !== undefined) fields.slug = parsed.data.slug;
+	if (parsed.data.summary !== undefined) fields.summary = parsed.data.summary;
+	if (parsed.data.publishedDate !== undefined) fields.published_date = parsed.data.publishedDate;
+	if (parsed.data.meta) {
+		const attributes = metaAttributes(view, parsed.data.meta);
+		if (attributes.length > 0) fields.meta_properties_attributes = attributes;
+	}
+	if (parsed.data.coverId !== undefined) {
+		const attributes = coverAttributes(view, parsed.data.coverId);
+		if (attributes) fields.shared_gallery_items_attributes = attributes;
+	}
+
+	// Nothing to write is not an error — the browser only sends what changed, and a
+	// cover set to what it already is has nothing to say to Apex.
+	const apexResponse =
+		Object.keys(fields).length > 0
+			? await guard.apex.updatePostFields(ids.postId, fields)
+			: { ok: true, status: 200, body: null };
+
+	await auditOutcome(ctx, meta, guard.actor, {
+		outcome: apexResponse.ok ? 'accepted' : 'apex_error',
+		detail: {
+			schema: params.schema,
+			postId: ids.postId,
+			fields: Object.keys(fields),
+			apexStatus: apexResponse.status
+		}
+	});
+
+	// `409 slug-taken` only when the slug is what Apex refused; a rejected cover is
+	// `422 invalid`, carrying Apex's field errors. A bad `published_date` is NOT one
+	// of them any more: `publishedDateSchema` refuses a date that is not a real day
+	// before the request leaves this process, because `Cms::Post` has no validation
+	// on the column and Rails casts what it cannot parse to `nil` — a 200 that
+	// CLEARS the date. The 422 that remains is reachable only in the race where the
+	// cover item is deleted between the membership check above and this write.
+	if (apexResponse.status === 422) return rejectedWriteResponse(apexResponse.body);
+	if (!apexResponse.ok) return bffError(502, 'upstream error');
+
+	// Re-read rather than echo: the write surface answers 200 for shapes it drops.
+	//
+	// THE WRITE HAS ALREADY LANDED. So a re-read that fails is not a failed save,
+	// and saying "Saving failed. Nothing after it was saved — Save again to retry"
+	// over fields that ARE written is worse than saying nothing: the editor retries,
+	// and the stages after this one run against a screen showing stale values. The
+	// post's fields, its SEO rows and its cover are all written BY ID from the view
+	// read in this request, so the retry itself is harmless — but the report has to
+	// be true. `ok: true, unread: true`, and the next stage's own read decides what
+	// happens next.
+	const loaded = await buildPostLoad(contract, guard.apex, params.schema, ids.postId);
+	if (!loaded || loaded.ok !== true) {
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'accepted',
+			detail: {
+				schema: params.schema,
+				postId: ids.postId,
+				unread: true,
+				reason: loaded ? loaded.reason : 'post-update-read-failed'
+			}
+		});
+		return noStoreJson({ ok: true, unread: true });
+	}
+	return noStoreJson({
+		ok: true,
+		post: loaded.post,
+		version: loaded.version,
+		bodyVersion: loaded.bodyVersion
+	});
+}

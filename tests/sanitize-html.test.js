@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
 	allowRichTextClasses,
+	allowRichTextTags,
 	decodeReferences,
 	isSafeUrl,
 	plainTextForAttribute,
@@ -10,11 +11,7 @@ import {
 	sanitizeHtml,
 	sanitizeRichText
 } from '../src/sanitize/html.js';
-import {
-	EVENT_HANDLER_PATTERN,
-	FORBIDDEN_SUBSTRINGS,
-	XSS_PAYLOADS
-} from '../src/sanitize/xss-corpus.js';
+import { EVENT_HANDLER_PATTERN, FORBIDDEN_SUBSTRINGS, XSS_PAYLOADS } from './xss-corpus.js';
 
 test('the payload corpus covers every category the plan names', () => {
 	const categories = new Set(XSS_PAYLOADS.map((entry) => entry.category));
@@ -165,6 +162,14 @@ test('isSafeUrl judges what a browser would navigate to', () => {
 		'java​script:alert(1)',
 		'javascript&#58;alert(1)',
 		'javascript&colon;alert(1)',
+		// The named lookup is case-INSENSITIVE, and it has to be: `&Tab;` is the real
+		// HTML entity (`&tab;` is not one at all), and a browser turns it into a tab
+		// the URL parser then strips. The write boundary shares this decoder, so a
+		// mutation that drops the `toLowerCase()` opens both judges at once — this is
+		// the case that catches it.
+		'java&Tab;script:alert(1)',
+		'java&NewLine;script:alert(1)',
+		'javascript&Colon;alert(1)',
 		'data:text/html,<script>alert(1)</script>',
 		'vbscript:msgbox(1)',
 		'file:///etc/passwd',
@@ -373,4 +378,80 @@ test('the paragraph sink is total over odd input and keeps its output inert', ()
 			`${entry.name}: sink emitted an event handler — ${output}`
 		);
 	}
+});
+
+/**
+ * DECLARED LAST ON PURPOSE. `ALLOWED_TAGS` is module state, so a test that widens
+ * it would widen it for every test after it in this file. Nothing follows.
+ */
+test('a site may add a PRESENTATIONAL element, and may not add an executable one', () => {
+	// The default list is an editorial decision — `h1` is off it because a page has
+	// one `h1` — and one site's rich text is authored against a different decision.
+	// Poovayya's hero headline is an authored `<h1>`; unwrapping it resizes a live
+	// homepage, which is not a price a security fix should quietly charge.
+	assert.equal(sanitizeHtml('<mark>x</mark>'), 'x', 'unknown tags are unwrapped by default');
+	allowRichTextTags(['MARK']);
+	assert.equal(sanitizeHtml('<mark>x</mark>'), '<mark>x</mark>', 'and case-folded on the way in');
+
+	// The bound: an element that executes, loads, submits or structures a DOCUMENT is
+	// refused OUT LOUD, so a caller cannot believe the call did something.
+	//
+	// OPUS O3. This loop used to name six, and the check behind it was
+	// `DROP_WITH_CONTENT.has(tag)` — which omits every element on the second line
+	// below, while the docblock promised "nothing that executes, loads or navigates".
+	// Not exploitable at the time (`serializeAttributes` keeps `class` everywhere and
+	// `href`/`title` on `<a>`, so a registered `<form>` emits `<form>` with no
+	// `action`), and wrong, and the day an attribute extension point is added it stops
+	// being merely wrong.
+	for (const executable of [
+		'script',
+		'svg',
+		'iframe',
+		'object',
+		'math',
+		'style',
+		'link',
+		'meta',
+		'base',
+		'template',
+		'textarea',
+		'noscript',
+		'audio',
+		'video',
+		'canvas',
+		'applet',
+		'form',
+		'button',
+		'input',
+		'select',
+		'option',
+		'img',
+		'body',
+		'html',
+		'marquee',
+		'keygen',
+		'frame',
+		'frameset'
+	]) {
+		assert.throws(
+			() => allowRichTextTags([executable]),
+			/refusing to allow an executable element/u,
+			`${executable} was allowed onto the render allowlist`
+		);
+	}
+	for (const nonsense of ['a b', '<script>', '', 'div/script', 'h1!']) {
+		assert.throws(() => allowRichTextTags([nonsense]), /not an element name/u);
+	}
+	// And the refusal really is a refusal, not a partial application.
+	assert.equal(sanitizeHtml('<script>alert(1)</script>'), '');
+	assert.equal(sanitizeHtml('<svg><animate/></svg>'), '');
+	assert.equal(sanitizeHtml('<form action="/x">a</form>'), 'a', 'still unwrapped, never kept');
+	assert.equal(sanitizeHtml('<img src=x onerror=alert(1)>'), '');
+
+	// A VOID element registers as one, or the serializer would hand back
+	// `<wbr></wbr>` — an element the site did not register and not valid HTML.
+	assert.equal(sanitizeHtml('<p>a<wbr>b</p>'), '<p>ab</p>', 'unknown, so unwrapped');
+	allowRichTextTags(['wbr']);
+	assert.equal(sanitizeHtml('<p>a<wbr>b</p>'), '<p>a<wbr>b</p>');
+	assert.equal(sanitizeHtml('<p>a<wbr/>b</p>'), '<p>a<wbr>b</p>', 'self-closing too');
 });

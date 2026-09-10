@@ -1,4 +1,5 @@
 import type { BffDatabase } from './d1';
+import type { BffContext } from './context';
 
 /**
  * The append-only audit row the BFF writes for every mutation (plan §8, 3a).
@@ -37,7 +38,20 @@ export interface AuditEntry {
 	accountId?: string | null;
 	pageId?: string | null;
 	requestId?: string | null;
-	outcome: 'accepted' | 'rejected' | 'apex_error';
+	/**
+	 * `accepted` — the write happened and this operation can account for it.
+	 * `rejected` — this BFF refused it; nothing reached Apex.
+	 * `apex_error` — Apex was asked and answered a failure (or never answered).
+	 * `upstream_shape_error` — Apex answered SUCCESS with a body this operation
+	 *   cannot use: the write probably happened and cannot be named. It is its own
+	 *   value because it is neither of its neighbours, and auditing it as `accepted`
+	 *   put a row in the log that contradicted the 502 the caller was sent.
+	 *
+	 * (The `0001` migration's comment in all three repos now lists all four; the
+	 * column is free text and nothing reads it as an enum, so the comment is
+	 * documentation rather than a constraint.)
+	 */
+	outcome: 'accepted' | 'rejected' | 'apex_error' | 'upstream_shape_error';
 	detail?: unknown;
 }
 
@@ -121,4 +135,47 @@ export async function auditRejection(
 export async function readAuditEntry(db: BffDatabase, id: string): Promise<AuditRow | null> {
 	const source = db.withSession ? db.withSession('first-primary') : db;
 	return source.prepare(`SELECT * FROM bff_audit_log WHERE id = ?`).bind(id).first<AuditRow>();
+}
+
+/**
+ * The audit row a mutation writes once it has DECIDED — accepted, upstream-failed,
+ * or a refusal it answers itself (`delete-record`'s two 409s).
+ * Seven operations wrote the same twelve fields by hand; the only things that
+ * actually varied were `outcome`, `detail`, and — for the two page routes — a
+ * `pageId`. `meta` is the operation's own fixed metadata, the same object
+ * `rejectMutation` takes, so a route's accepted and rejected rows cannot disagree
+ * about what action or path they name.
+ *
+ * There is deliberately NO try/catch here, and this matches what the ten call sites
+ * did before they were collapsed — none of them caught. The reasoning is the write
+ * path's: if the Apex write landed and the audit row did not, the caller must not be
+ * told everything is fine. Note that two of the ten (`delete-record`'s 409s) are
+ * refusals, where `rejectMutation`'s opposite rule would apply — they are here
+ * because that is where they already were, not because the rule above fits them.
+ */
+export async function auditOutcome(
+	ctx: BffContext,
+	meta: { action: string; method: string; path: string; requestId?: string | null },
+	actor: { email: string; sub: string | null },
+	fields: {
+		outcome: AuditEntry['outcome'];
+		detail?: Record<string, unknown>;
+		pageId?: string | null;
+	}
+): Promise<void> {
+	if (!ctx.db) return;
+	await appendAuditEntry(ctx.db, {
+		id: crypto.randomUUID(),
+		occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
+		actorEmail: actor.email,
+		actorSub: actor.sub,
+		action: meta.action,
+		method: meta.method,
+		path: meta.path,
+		accountId: ctx.accountId ?? null,
+		pageId: fields.pageId ?? null,
+		requestId: meta.requestId ?? null,
+		outcome: fields.outcome,
+		...(fields.detail ? { detail: fields.detail } : {})
+	});
 }

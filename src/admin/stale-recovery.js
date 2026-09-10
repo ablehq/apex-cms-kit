@@ -28,7 +28,16 @@
 // minimum is not.
 
 /**
- * @typedef {import('../transcript-contract/contract.js').TranscriptDocument} TranscriptDocument
+ * The shape this module actually reads, declared STRUCTURALLY rather than imported.
+ * It used to say `import('../transcript-contract/contract.js')`, a path that exists
+ * in no repo — the contract module stayed in GLC when this file moved here — so
+ * `TranscriptDocument` silently resolved to `any` and every annotation below meant
+ * nothing. Only `sections[].title` and `sections[].rows[].{id,text,startSeconds}`
+ * are touched, so that is what the typedef says.
+ *
+ * @typedef {{ id?: string, text?: string, startSeconds?: number | null }} TranscriptRow
+ * @typedef {{ title?: string, rows?: TranscriptRow[] }} TranscriptSection
+ * @typedef {{ sections?: TranscriptSection[] }} TranscriptDocument
  * @typedef {{ rowId: string, sectionTitle: string, startSeconds: number | null, mine: string, theirs: string | null }} LostRow
  */
 

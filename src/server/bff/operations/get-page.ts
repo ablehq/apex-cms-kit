@@ -1,3 +1,4 @@
+import { unwrapArchetypeRecord } from '../archetype-record';
 import { z } from 'zod';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
@@ -18,16 +19,6 @@ export const pageIdSchema = z
 	.string()
 	.regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu);
 
-/** Exported so the draft preview unwraps Apex's envelope the same way this route does. */
-export function unwrapPage(body: unknown): Record<string, unknown> | null {
-	if (body && typeof body === 'object') {
-		const maybe = body as { data?: unknown };
-		if (maybe.data && typeof maybe.data === 'object') return maybe.data as Record<string, unknown>;
-		if ('id' in (body as object)) return body as Record<string, unknown>;
-	}
-	return null;
-}
-
 export async function handleGetPage(
 	request: Request,
 	ctx: BffContext,
@@ -42,7 +33,7 @@ export async function handleGetPage(
 	const apexResponse = await guard.apex.getPage(idResult.data);
 	if (!apexResponse.ok) return bffError(502, 'upstream error');
 
-	const page = unwrapPage(apexResponse.body);
+	const page = unwrapArchetypeRecord(apexResponse.body);
 	if (!page) return bffError(502, 'unexpected upstream shape');
 
 	const version = await computePageVersion(page);

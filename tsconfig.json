@@ -5,7 +5,9 @@
 		"moduleResolution": "bundler",
 		"strict": true,
 		"allowJs": true,
-		"checkJs": false,
+		"checkJs": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
 		"skipLibCheck": true,
 		"noEmit": true,
 		"types": ["node"]
