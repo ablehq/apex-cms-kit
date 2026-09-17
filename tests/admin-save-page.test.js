@@ -17,6 +17,7 @@ import {
 	getBlocks
 } from '../src/admin/page-draft.js';
 import { savePage, STALE_MESSAGE } from '../src/admin/save-page.js';
+import { RESERVED_SLUG_MESSAGE } from '../src/admin/field-errors.js';
 
 const PAGE_ID = '9f06e386-86b3-4ddf-9466-d4ca325ada86';
 const ET_HEADING = 'f867796b-c70c-47e4-8f6b-ad122832367b';
@@ -170,6 +171,49 @@ describe('savePage (M1 explicit save)', () => {
 		assert.equal(result.ok, false);
 		assert.equal(result.stage, 'structure');
 		assert.ok(!client.calls.some((c) => c[0] === 'changePageStatus'));
+	});
+
+	/**
+	 * K41 / K67, the editor-facing half. `save-page-structure.ts` refuses a rename
+	 * onto a route the site generates, onto the chrome or onto the home page with
+	 * `400 reserved-slug` — the human reason goes to the audit table and only the
+	 * CODE comes back to the browser (`bff-client.js`'s `mutate` spreads the body,
+	 * then pins `ok`/`status`, so `result.error` is on the object `messageFor`
+	 * gets). Without a branch on that code the editor is told "Saving the page
+	 * layout failed. Save again to retry." — a sentence about the layout, naming
+	 * neither the slug nor the address, advising a retry that can never succeed.
+	 *
+	 * MUTATION (run): drop the `result?.error === 'reserved-slug'` branch from
+	 * `messageFor` → this test goes RED.
+	 */
+	it('a refused slug is reported as the create form reports it, not as a layout failure', async () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		reorderBlocks(draft, 0, 1);
+		const client = makeClient({
+			serverVersion: 'baseline-v',
+			results: { structure: () => ({ ok: false, status: 400, error: 'reserved-slug' }) }
+		});
+		const result = await savePage(draft, client);
+		assert.equal(result.ok, false);
+		assert.equal(result.stage, 'structure');
+		assert.equal(result.status, 400);
+		// The SAME sentence `pageCreateError` / `PageList.svelte` show for the same
+		// refusal — one rule, one wording, shared from `field-errors.js`.
+		assert.equal(result.message, RESERVED_SLUG_MESSAGE);
+		assert.doesNotMatch(result.message, /Save again to retry/u);
+	});
+
+	it('any OTHER 400 on the structure save still reads as a layout failure', async () => {
+		// The branch is on the code, not on the status: `invalid body`, `foreign id`
+		// and the rest are 400s the editor cannot fix by choosing a new address.
+		const draft = createDraft(samplePage(), 'baseline-v');
+		reorderBlocks(draft, 0, 1);
+		const client = makeClient({
+			serverVersion: 'baseline-v',
+			results: { structure: () => ({ ok: false, status: 400, error: 'invalid body' }) }
+		});
+		const result = await savePage(draft, client);
+		assert.match(result.message, /Saving the page layout failed/u);
 	});
 
 	it('the composite version guard detects a stale save and dispatches NOTHING', async () => {

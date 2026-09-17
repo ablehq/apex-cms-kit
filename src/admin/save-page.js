@@ -3,6 +3,7 @@
 // behavior is covered by tests/admin-save-page.test.js + tests/bff-realapex.test.js.
 import { dirtyEntityPatches, structurePayload, reconcile } from './page-draft.js';
 import { isTempId } from './block-serialize.js';
+import { RESERVED_SLUG_MESSAGE } from './field-errors.js';
 
 // The one explicit save (plan §8, 3a M1, "One explicit savePage() — no autosave, no
 // coordinator"). This is the WHOLE persistence path: no debounce helper, no
@@ -36,6 +37,15 @@ function messageFor(stage, result) {
 		return 'The new section was added, but its fields could not be saved. Open it, check its values and Save again.';
 	}
 	if (stage === 'structure') {
+		// The CODE before the status. `save-page-structure.ts` refuses a rename onto
+		// a route the site generates, onto the chrome or onto the home page with
+		// `400 reserved-slug`; the human reason goes to the audit row and only the
+		// code comes back here. Without this branch the editor is told "Saving the
+		// page layout failed. Save again to retry." — about the layout, not the
+		// address, and advising a retry that is guaranteed to fail forever. The
+		// sentence is the create form's own, shared from `field-errors.js`, because
+		// it is the same rule refusing for the same reason.
+		if (result?.error === 'reserved-slug') return RESERVED_SLUG_MESSAGE;
 		return status === 422
 			? 'The page layout was rejected. Your field edits were saved; fix the layout and Save again.'
 			: 'Saving the page layout failed. Save again to retry.';

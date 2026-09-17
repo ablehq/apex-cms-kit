@@ -19,6 +19,23 @@
 export const NO_FIELD_NAMED = 'A field was rejected, but Apex did not say which.';
 
 /**
+ * The shared wording for a `400 reserved-slug` — the ONE refusal two different
+ * screens can now produce for the same reason, so it lives here with the rest of
+ * the shared wording rather than in either of them.
+ *
+ * It was written for the page-create form (`pageCreateError`, and Poovayya's
+ * `createError`, which say this sentence today) and it is what the structure save
+ * says as well (`save-page.js`), because an editor who renames a page in Details
+ * and one who types the address into the create dialog have hit the same rule and
+ * need the same next step. The alternative was the structure save's generic
+ * "Saving the page layout failed. Save again to retry." — a sentence about the
+ * layout, naming neither the slug nor the address, telling the editor to repeat
+ * an action that can never succeed.
+ */
+export const RESERVED_SLUG_MESSAGE =
+	'That address is a route the site generates, not a page. Choose a different one.';
+
+/**
  * The messages, one string per rejected attribute, in Apex's order. Empty when
  * the body carries no usable errors.
  * @param {any} res
