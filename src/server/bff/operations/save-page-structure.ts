@@ -205,12 +205,37 @@ function isChromeSlug(slug: string): boolean {
  * compare would let `/team-members` through as "unchanged" and then store a
  * different string than the one that was measured safe.
  *
- * THE `__` RULE IS EXTRA, AND IT IS NOT IN `getPageSlugValidationError`.
- * That function deliberately returns '' for a `__` slug — they are reserved from
- * public ROUTING, not from being created, and the chrome singletons depend on
- * being creatable. Refusing the RENAME is the narrower rule: a page already under
- * `__` may still be renamed within it (`__header` → `__footer`), and a page that
- * is not there may not move onto it.
+ * TWO RULES ARE EXTRA, AND NEITHER IS IN `getPageSlugValidationError`, because
+ * that function answers "may this slug be CREATED?" and a rename is a different
+ * question — the page already exists somewhere, and the move is what costs.
+ *
+ * THE `__` RULE. `getPageSlugValidationError` deliberately returns '' for a `__`
+ * slug: they are reserved from public ROUTING, not from being created, and the
+ * chrome singletons (`ensureFixedPage`) depend on being creatable. A RENAME is
+ * refused in BOTH directions, and on the NORMALIZED path (so `/__header` and
+ * `__Header` are chrome too, which is how `isCmsPageRoutable` and `chromePage`
+ * will read them downstream):
+ *   - a page stored under `__` cannot be renamed to ANY other slug. `__header` →
+ *     `__footer` leaves the site with no header and two footers; `__header` →
+ *     `about-the-firm` publishes the header's own blocks at a public address and
+ *     drops the navigation. Neither is a thing an editor means to do, and no UI
+ *     on any of the three sites offers it (the chrome editor sends no slug).
+ *   - a page NOT stored under `__` cannot be renamed onto it — it would become
+ *     the site's chrome while vanishing from its own address and the Pages list.
+ * A chrome page reordering its own blocks re-sends its own slug and returns at
+ * the raw-equality line above, so the rule never blocks an ordinary save.
+ *
+ * THE ROOT RULE. `getPageSlugValidationError` returns '' for `/` on purpose —
+ * "the home page", which is right for CREATE, where Apex's duplicate-slug 422
+ * protects the one that exists. It is wrong for a RENAME: `''`, `/`, `//` and
+ * `///` all normalize to the home key, so a rename onto any of them puts a
+ * second page on the site's front door (`_pageSlugKey` collapses them and the
+ * lookup takes whichever row Apex lists first), and `''` additionally makes the
+ * page unroutable — a silent unpublish reported to the editor as success. The
+ * body schema refuses `''` outright (`+`, matching `create-page`'s `.min(1)`);
+ * this refuses the rest. BOTH SIDES ARE NORMALIZED for this test and for the
+ * `__` test — and only for those two — so a home page stored as `/` (Poovayya's)
+ * keeps reordering while `about-us` → `//` is refused.
  *
  * Throws (from `getPageSlugValidationError`) when the site never bound its
  * reserved routes — the caller turns that into the same fail-closed 500
@@ -224,8 +249,32 @@ export function refuseRenamedSlug(
 	incomingSlug: string | undefined
 ): string | null {
 	if (incomingSlug === undefined) return null;
-	// Not a rename: the editor sent back what is already stored.
+	// Not a rename: the editor sent back what is already stored. RAW, and only
+	// here — see the docblock. The normalized compares below are the two equality
+	// tests that must agree with how the renderer reads a slug, not with how it
+	// was spelled.
 	if (typeof storedSlug === 'string' && incomingSlug === storedSlug) return null;
+
+	const stored = typeof storedSlug === 'string' ? storedSlug : undefined;
+
+	// The chrome, both ways. A page that lives there cannot leave; a page that
+	// does not cannot arrive.
+	if (stored !== undefined && isChromeSlug(stored)) {
+		return `"${normalizeSlugPath(stored)}" is the site's own chrome — it cannot be renamed.`;
+	}
+	if (isChromeSlug(incomingSlug)) {
+		return `"${normalizeSlugPath(incomingSlug)}" is reserved for the site's own chrome — an existing page cannot be renamed onto it.`;
+	}
+
+	// The home page. A page already stored at the root may keep saving (its own
+	// slug, however it is spelled, normalizes to the same path); nothing else may
+	// move onto it. A stored slug Apex did not return is `null` here, NOT `/` —
+	// `normalizeSlugPath(undefined)` is `/`, and reading it that way would fail
+	// OPEN on exactly the case the rest of this function fails closed on.
+	const storedPath = stored === undefined ? null : normalizeSlugPath(stored);
+	if (normalizeSlugPath(incomingSlug) === '/' && storedPath !== '/') {
+		return '"/" is the site\'s home page — an existing page cannot be renamed onto it.';
+	}
 
 	// The same guard `create-page.ts` runs, on the same function, so the two paths
 	// cannot drift: reserved prefixes, the site's generated trees and exact routes,
@@ -233,20 +282,21 @@ export function refuseRenamedSlug(
 	const reserved = getPageSlugValidationError(incomingSlug);
 	if (reserved) return reserved;
 
-	if (isChromeSlug(incomingSlug) && !(typeof storedSlug === 'string' && isChromeSlug(storedSlug))) {
-		return `"${normalizeSlugPath(incomingSlug)}" is reserved for the site's own chrome — an existing page cannot be renamed onto it.`;
-	}
-
 	return null;
 }
 
 export const savePageStructureBodySchema = z
 	.object({
 		title: z.string().max(300).optional(),
+		// `+`, not `*`: an empty slug is not a slug. `create-page.ts`'s schema has
+		// always said `.min(1)`, and this one said `*` — the one input on which the
+		// two paths could still drift. Rails reads a blank slug as an INSTRUCTION
+		// (`before_validation :generate_slug, if: proc { slug.blank? }`) and derives
+		// one from the title, unvalidated, past every check in this file.
 		slug: z
 			.string()
 			.max(300)
-			.regex(/^[a-z0-9/_-]*$/iu)
+			.regex(/^[a-z0-9/_-]+$/iu)
 			.optional(),
 		summary: z.string().max(5000).optional(),
 		blocks_attributes: z.array(jsonRecord).max(200).optional(),
