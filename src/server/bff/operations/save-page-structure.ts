@@ -2,7 +2,7 @@ import { unwrapArchetypeRecord } from '../archetype-record';
 import { z } from 'zod';
 import { appendAuditEntry } from '../audit';
 import { containsReviewOnlyField } from '../authorization';
-import { noStoreJson } from '../boundary';
+import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
 import {
 	refuseOversizedFields,
@@ -11,6 +11,11 @@ import {
 	rejectMutation
 } from '../reject';
 import { sanitizeFieldValue } from '../../../sanitize/write-boundary';
+import {
+	getPageSlugValidationError,
+	normalizeSlugPath
+} from '../../../cms/page-slug-validation.js';
+import { RESERVED_SLUG_PREFIX } from '../../../cms/slug.js';
 import { pageIdSchema } from './get-page';
 import { computePageVersion } from '../page-version';
 import type { BffContext } from '../context';
@@ -173,6 +178,68 @@ export function structureValueFields(body: unknown): Record<string, unknown> {
 	return values;
 }
 
+/** Does this slug sit under the `__` prefix that is reserved from public routing? */
+function isChromeSlug(slug: string): boolean {
+	return normalizeSlugPath(slug).slice(1).startsWith(RESERVED_SLUG_PREFIX);
+}
+
+/**
+ * K41 / K67 — THE RESERVED-SLUG GUARD ON A RENAME.
+ *
+ * `create-page.ts` refuses a slug the site reserves; this route did not, and the
+ * page editor's Details tab writes the slug THROUGH THIS ROUTE. Measured
+ * 2026-09-09 and again live 2026-09-10: `create` refused `team-members`,
+ * `/team-members`, `practice-areas`, `admin/x` and `About-Us`; the structure save
+ * accepted every one of them, plus a rename onto `__footer`. A SvelteKit
+ * filesystem route outranks `[[slug]]`, so the renamed page then renders NOTHING,
+ * forever, with nothing saying why — and a page renamed onto `__footer` becomes
+ * the site's footer while vanishing from its own address and from the Pages list.
+ *
+ * THE COMPARISON IS AGAINST THE STORED SLUG, AND IT IS RAW. A structure save
+ * re-sends the page's current slug on every reorder/add/remove, and Poovayya
+ * production has a legitimate CMS page at `/team-members` — a path the site now
+ * reserves. Validating the slug on every save would make that page unsaveable.
+ * So an UNCHANGED slug is not checked at all: an existing page at a now-reserved
+ * address keeps working until someone tries to MOVE it. The compare is on the
+ * exact stored string rather than the normalized path, because a normalized
+ * compare would let `/team-members` through as "unchanged" and then store a
+ * different string than the one that was measured safe.
+ *
+ * THE `__` RULE IS EXTRA, AND IT IS NOT IN `getPageSlugValidationError`.
+ * That function deliberately returns '' for a `__` slug — they are reserved from
+ * public ROUTING, not from being created, and the chrome singletons depend on
+ * being creatable. Refusing the RENAME is the narrower rule: a page already under
+ * `__` may still be renamed within it (`__header` → `__footer`), and a page that
+ * is not there may not move onto it.
+ *
+ * Throws (from `getPageSlugValidationError`) when the site never bound its
+ * reserved routes — the caller turns that into the same fail-closed 500
+ * `create-page.ts` answers, because nothing here can say whether the slug is safe
+ * and a page that silently never renders is the worse answer.
+ *
+ * @returns the reason to refuse, or `null` when the save may proceed.
+ */
+export function refuseRenamedSlug(
+	storedSlug: unknown,
+	incomingSlug: string | undefined
+): string | null {
+	if (incomingSlug === undefined) return null;
+	// Not a rename: the editor sent back what is already stored.
+	if (typeof storedSlug === 'string' && incomingSlug === storedSlug) return null;
+
+	// The same guard `create-page.ts` runs, on the same function, so the two paths
+	// cannot drift: reserved prefixes, the site's generated trees and exact routes,
+	// and the lowercase-hyphen path grammar that refuses `About-Us`.
+	const reserved = getPageSlugValidationError(incomingSlug);
+	if (reserved) return reserved;
+
+	if (isChromeSlug(incomingSlug) && !(typeof storedSlug === 'string' && isChromeSlug(storedSlug))) {
+		return `"${normalizeSlugPath(incomingSlug)}" is reserved for the site's own chrome — an existing page cannot be renamed onto it.`;
+	}
+
+	return null;
+}
+
 export const savePageStructureBodySchema = z
 	.object({
 		title: z.string().max(300).optional(),
@@ -271,6 +338,22 @@ export async function handleSavePageStructure(
 			'block not on this page',
 			'foreign id'
 		);
+	}
+
+	// K41 / K67 — the reserved-slug guard, on a RENAME only, against the slug Apex
+	// just returned. It sits here and not with the other body checks because it is
+	// the only one that needs the STORED value; see `refuseRenamedSlug`. Refused
+	// before the PATCH, so nothing is written.
+	let slugRefusal: string | null;
+	try {
+		slugRefusal = refuseRenamedSlug(currentPage.slug, parsed.data.slug);
+	} catch {
+		// The site never bound its reserved routes — the same fail-closed answer
+		// `create-page.ts` gives, for the same reason.
+		return bffError(500, 'reserved routes not bound');
+	}
+	if (slugRefusal) {
+		return rejectMutation(ctx, validMeta, 400, 'reserved-slug', slugRefusal);
 	}
 
 	// The third rule the siblings run, and the last one this path was missing.
