@@ -36,6 +36,24 @@ export const RESERVED_SLUG_MESSAGE =
 	'That address is a route the site generates, not a page. Choose a different one.';
 
 /**
+ * The shared wording for a `400 invalid-slug` — the OTHER address refusal the
+ * structure save can produce, and it needs its own sentence because the fix is
+ * the opposite one: `RESERVED_SLUG_MESSAGE` says "choose a different address",
+ * which is no help at all to an editor who has cleared the field and has no
+ * address to choose differently from.
+ *
+ * Clearing the Slug field is ordinary editor behaviour — none of the three sites
+ * marks that input `required` — and until `save-page-structure.ts` named it, the
+ * answer was a schema `400 invalid body`, which this module's caller could only
+ * report as "Saving the page layout failed. Save again to retry.": a sentence
+ * about the layout, for a failure of the address, advising a retry that is
+ * guaranteed to fail forever. It names the field and gives a next step that can
+ * actually succeed.
+ */
+export const BLANK_SLUG_MESSAGE =
+	'A page needs an address. Type a slug (for example "about-us") and Save again.';
+
+/**
  * The messages, one string per rejected attribute, in Apex's order. Empty when
  * the body carries no usable errors.
  * @param {any} res

@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 
 import {
 	handleSavePageStructure,
+	refuseBlankSlug,
 	refuseRenamedSlug
 } from '../src/server/bff/operations/save-page-structure.ts';
 import { bindReservedRoutes } from '../src/cms/page-slug-validation.js';
@@ -41,8 +42,15 @@ import { createMemorySessionStore } from './harness/session-store.ts';
  *   7. read a missing stored slug as the root (`normalizeSlugPath(stored)` rather
  *      than `null`) → "a page whose stored slug Apex did not return cannot take the
  *      home page" goes RED.
- *   8. put the `*` back in the body schema's slug regex → "an empty slug is refused
- *      by the schema, before the guard ever runs" goes RED.
+ *   8. make the root rule one-way again — drop the FROM-root clause, refusing only
+ *      a move onto `/`, as it was until 2026-09-18 → "the home page cannot be
+ *      renamed to an ordinary address" goes RED.
+ *   9. drop `refuseBlankSlug`'s call in `handleSavePageStructure` (leave it in
+ *      `refuseRenamedSlug`) → "a cleared slug is refused as `invalid-slug`" goes
+ *      RED on the code, because the blank falls through to the root rule and
+ *      answers `reserved-slug`.
+ *  10. drop the blank rule from `refuseRenamedSlug` → "a blank slug is refused
+ *      before the reorder compare" goes RED.
  */
 const ORIGIN = 'https://site.test';
 const CSRF = 'csrf-slug-guard';
@@ -338,21 +346,37 @@ describe('K67 — the `__` prefix, in both directions', () => {
 	});
 });
 
-describe('the home page cannot be taken over by renaming a page onto it', () => {
+describe('the home page can be neither taken over nor renamed away', () => {
 	/**
 	 * `getPageSlugValidationError` returns '' for `/` — "the home page", right for
 	 * CREATE (Apex's duplicate-slug 422 protects the one that exists) and wrong for
 	 * a RENAME. On Poovayya the home page IS a CMS page (`[[slug]]` serves it), and
 	 * `_pageSlugKey` collapses `''`, `/`, `//` and `///` onto the same key: a second
-	 * page on that key makes the site's front door whichever row Apex lists first.
+	 * page on that key makes the site's front door whichever row Apex lists first,
+	 * and NO page on that key makes the front door a 404.
 	 *
-	 * MUTATION 8: put the `*` back in the body schema's slug regex. This goes RED.
+	 * MUTATION 9: drop `refuseBlankSlug`'s call in the handler. This goes RED on the
+	 * code — the blank slug falls through to the root rule and says `reserved-slug`,
+	 * which tells an editor with an emptied field to "choose a different one".
 	 */
-	it('an empty slug is refused by the schema, before the guard ever runs', async () => {
-		// Not `reserved-slug`: an empty string is not a slug at all, and Rails reads
-		// it as an instruction to derive one from the TITLE — past every check here.
-		// `create-page`'s schema has always said `.min(1)`; this one now agrees.
-		const { res, patches } = await rename('about-us', '');
+	it('a cleared slug is refused as `invalid-slug`, not as a layout failure', async () => {
+		// It used to be the schema's `400 invalid body`, which is true and useless:
+		// the browser mapper can only report that as "Saving the page layout failed.
+		// Save again to retry." Clearing the Slug field is ordinary editor behaviour
+		// and the retry can never succeed, so the server names the address instead.
+		for (const slug of ['', '   ']) {
+			const { res, patches } = await rename('about-us', slug);
+			assert.equal(res.status, 400, `${JSON.stringify(slug)}: ${await res.clone().text()}`);
+			assert.deepEqual(await res.json(), { error: 'invalid-slug' });
+			assert.deepEqual(patches, [], 'a blank slug must never reach Apex');
+		}
+	});
+
+	it('a slug that is neither blank nor a slug is still a shape error', async () => {
+		// The charset half of the schema still bites. `about us?` is not an address
+		// the editor can be told how to fix by name, and the relaxed regex must not
+		// have opened it.
+		const { res, patches } = await rename('about-us', 'about us?');
 		assert.equal(res.status, 400, await res.clone().text());
 		assert.deepEqual(await res.json(), { error: 'invalid body' });
 		assert.deepEqual(patches, []);
@@ -377,19 +401,39 @@ describe('the home page cannot be taken over by renaming a page onto it', () => 
 		assert.equal(patches[0][2].slug, '/');
 	});
 
-	it('and it keeps saving when only the SPELLING of the root changes', async () => {
-		// Both sides normalize to `/`, which is the whole reason this test compares
-		// normalized paths rather than the raw strings the rename test uses.
-		const { res, patches } = await save('/', bodyFor('//'));
-		assert.equal(res.status, 200, await res.clone().text());
-		assert.equal(patches.length, 1);
+	/**
+	 * MUTATION 8: drop the FROM-root clause, leaving the rule one-way as it was
+	 * until 2026-09-18. Both of these go RED.
+	 *
+	 * The inverse of these two assertions is what this file required until today,
+	 * and codex F1 is why: Poovayya's home page IS a CMS page stored at `/`, its
+	 * loader finds it by the page whose normalized key is empty, and renaming it
+	 * away leaves that lookup with nothing — the site's front door 404s, reported
+	 * to the editor as a successful save.
+	 */
+	it('the home page cannot be renamed to an ordinary address', async () => {
+		const { res, patches } = await save('/', bodyFor('about-the-firm'));
+		assert.equal(res.status, 400, await res.clone().text());
+		assert.deepEqual(await res.json(), { error: 'reserved-slug' });
+		assert.deepEqual(patches, [], 'the front door must never move');
 	});
 
-	it('the home page may still be renamed to an ordinary address', async () => {
-		// The rule is about what may move ONTO the root, not about the page there.
-		const { res, patches } = await save('/', bodyFor('about-the-firm'));
-		assert.equal(res.status, 200, await res.clone().text());
-		assert.equal(patches.length, 1);
+	it('and not even RESPELLED, because the raw spelling is read downstream', async () => {
+		// `//` still normalizes to the home key, so the page stays routable — and
+		// then fails every raw `page.slug === '/'` check the loader makes.
+		const { res, patches } = await save('/', bodyFor('//'));
+		assert.equal(res.status, 400, await res.clone().text());
+		assert.deepEqual(await res.json(), { error: 'reserved-slug' });
+		assert.deepEqual(patches, []);
+	});
+
+	it('a home page stored under a ROOT SPELLING is protected too', async () => {
+		// The from-side is normalized, like the `__` rule: a page Apex stores as `//`
+		// is the front door as much as one stored as `/`.
+		const { res, patches } = await save('//', bodyFor('about-the-firm'));
+		assert.equal(res.status, 400, await res.clone().text());
+		assert.deepEqual(await res.json(), { error: 'reserved-slug' });
+		assert.deepEqual(patches, []);
 	});
 });
 
@@ -427,7 +471,6 @@ describe('refuseRenamedSlug — the rule on its own', () => {
 
 	it('names the home page and the chrome by the reason, not by the spelling', () => {
 		assert.match(refuseRenamedSlug('about-us', '//'), /home page/u);
-		assert.match(refuseRenamedSlug('about-us', ''), /home page/u);
 		// Both directions of the `__` rule say "chrome", so one branch in
 		// `save-page.js` covers the whole refusal.
 		assert.match(refuseRenamedSlug('__header', '__footer'), /site's own chrome/u);
@@ -435,10 +478,32 @@ describe('refuseRenamedSlug — the rule on its own', () => {
 		assert.match(refuseRenamedSlug('/__header', 'about-the-firm'), /site's own chrome/u);
 	});
 
+	it('refuses a move AWAY from the root as well as onto it', () => {
+		assert.match(refuseRenamedSlug('/', 'about-the-firm'), /home page/u);
+		assert.match(refuseRenamedSlug('/', '//'), /home page/u);
+		assert.match(refuseRenamedSlug('//', 'about-the-firm'), /home page/u);
+		assert.match(refuseRenamedSlug('', 'about-the-firm'), /home page/u);
+	});
+
 	it('still says nothing about the pages that legitimately keep saving', () => {
 		assert.equal(refuseRenamedSlug('/', '/'), null);
-		assert.equal(refuseRenamedSlug('/', '//'), null);
-		assert.equal(refuseRenamedSlug('/', 'about-the-firm'), null);
+		assert.equal(refuseRenamedSlug('//', '//'), null);
 		assert.equal(refuseRenamedSlug('__header', '__header'), null);
+		assert.equal(refuseRenamedSlug('about-us', 'about-the-firm'), null);
+	});
+
+	/**
+	 * MUTATION 10: drop the blank branch from `refuseRenamedSlug`. This goes RED —
+	 * an empty slug would be read as a rename onto the home page, and a blank slug
+	 * equal to the stored one as a no-op reorder.
+	 */
+	it('refuses a blank slug before the reorder compare, by its own reason', () => {
+		assert.match(refuseRenamedSlug('about-us', ''), /cannot be empty/u);
+		assert.match(refuseRenamedSlug('about-us', '   '), /cannot be empty/u);
+		// Even when it is what is STORED: Rails reads a blank slug as an instruction
+		// to derive one from the title, so re-sending it is not a no-op.
+		assert.match(refuseRenamedSlug('', ''), /cannot be empty/u);
+		assert.equal(refuseBlankSlug(undefined), null);
+		assert.equal(refuseBlankSlug('about-us'), null);
 	});
 });

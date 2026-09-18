@@ -3,7 +3,7 @@
 // behavior is covered by tests/admin-save-page.test.js + tests/bff-realapex.test.js.
 import { dirtyEntityPatches, structurePayload, reconcile } from './page-draft.js';
 import { isTempId } from './block-serialize.js';
-import { RESERVED_SLUG_MESSAGE } from './field-errors.js';
+import { BLANK_SLUG_MESSAGE, RESERVED_SLUG_MESSAGE } from './field-errors.js';
 
 // The one explicit save (plan §8, 3a M1, "One explicit savePage() — no autosave, no
 // coordinator"). This is the WHOLE persistence path: no debounce helper, no
@@ -38,14 +38,17 @@ function messageFor(stage, result) {
 	}
 	if (stage === 'structure') {
 		// The CODE before the status. `save-page-structure.ts` refuses a rename onto
-		// a route the site generates, onto the chrome or onto the home page with
-		// `400 reserved-slug`; the human reason goes to the audit row and only the
-		// code comes back here. Without this branch the editor is told "Saving the
-		// page layout failed. Save again to retry." — about the layout, not the
-		// address, and advising a retry that is guaranteed to fail forever. The
-		// sentence is the create form's own, shared from `field-errors.js`, because
-		// it is the same rule refusing for the same reason.
+		// a route the site generates, onto the chrome or onto (or away from) the home
+		// page with `400 reserved-slug`, and a BLANK slug with `400 invalid-slug`; the
+		// human reason goes to the audit row and only the code comes back here.
+		// Without these branches the editor is told "Saving the page layout failed.
+		// Save again to retry." — about the layout, not the address, and advising a
+		// retry that is guaranteed to fail forever. The reserved sentence is the
+		// create form's own, shared from `field-errors.js`, because it is the same
+		// rule refusing for the same reason; the blank one is its own, because
+		// "choose a different one" is no instruction for an emptied field.
 		if (result?.error === 'reserved-slug') return RESERVED_SLUG_MESSAGE;
+		if (result?.error === 'invalid-slug') return BLANK_SLUG_MESSAGE;
 		return status === 422
 			? 'The page layout was rejected. Your field edits were saved; fix the layout and Save again.'
 			: 'Saving the page layout failed. Save again to retry.';

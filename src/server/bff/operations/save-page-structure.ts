@@ -184,6 +184,30 @@ function isChromeSlug(slug: string): boolean {
 }
 
 /**
+ * The blank-slug rule, on its own because it earns its own response code.
+ *
+ * `''` and `'   '` are what an editor produces by CLEARING the Slug field — an
+ * ordinary thing to do in a text input that no site marks `required`. It is not a
+ * rename onto the home page, however it normalizes: Rails would read it as an
+ * instruction to regenerate the slug from the title, so what gets stored is a
+ * string nothing in this file ever measured. It is refused before the rename
+ * question is even asked, and it is refused as `400 invalid-slug` rather than
+ * `400 reserved-slug` so the editor is told what is actually wrong — the address
+ * is missing, not taken.
+ *
+ * `refuseRenamedSlug` calls this first, so the rule holds for every caller of the
+ * rule; `handleSavePageStructure` calls it separately, so the refusal keeps its
+ * own code.
+ *
+ * @returns the reason to refuse, or `null` when the slug is not blank.
+ */
+export function refuseBlankSlug(incomingSlug: string | undefined): string | null {
+	if (incomingSlug === undefined) return null;
+	if (incomingSlug.trim() !== '') return null;
+	return 'A page needs an address — the slug cannot be empty.';
+}
+
+/**
  * K41 / K67 — THE RESERVED-SLUG GUARD ON A RENAME.
  *
  * `create-page.ts` refuses a slug the site reserves; this route did not, and the
@@ -225,17 +249,37 @@ function isChromeSlug(slug: string): boolean {
  * A chrome page reordering its own blocks re-sends its own slug and returns at
  * the raw-equality line above, so the rule never blocks an ordinary save.
  *
- * THE ROOT RULE. `getPageSlugValidationError` returns '' for `/` on purpose —
- * "the home page", which is right for CREATE, where Apex's duplicate-slug 422
- * protects the one that exists. It is wrong for a RENAME: `''`, `/`, `//` and
- * `///` all normalize to the home key, so a rename onto any of them puts a
- * second page on the site's front door (`_pageSlugKey` collapses them and the
- * lookup takes whichever row Apex lists first), and `''` additionally makes the
- * page unroutable — a silent unpublish reported to the editor as success. The
- * body schema refuses `''` outright (`+`, matching `create-page`'s `.min(1)`);
- * this refuses the rest. BOTH SIDES ARE NORMALIZED for this test and for the
- * `__` test — and only for those two — so a home page stored as `/` (Poovayya's)
- * keeps reordering while `about-us` → `//` is refused.
+ * THE ROOT RULE, AND IT IS SYMMETRIC — the same shape as the `__` rule above,
+ * for the same reason. `getPageSlugValidationError` returns '' for `/` on purpose
+ * — "the home page", which is right for CREATE, where Apex's duplicate-slug 422
+ * protects the one that exists. It is wrong for a RENAME, in both directions:
+ *   - ONTO the root: `''`, `/`, `//` and `///` all normalize to the home key, so
+ *     a rename onto any of them puts a SECOND page on the site's front door
+ *     (`_pageSlugKey` collapses them and the lookup takes whichever row Apex
+ *     lists first).
+ *   - AWAY FROM the root: Poovayya's home page IS a CMS page stored at `/`, and
+ *     its `[[slug]]` loader finds it by looking for the page whose normalized key
+ *     is empty. `/` → `about-the-firm` leaves that lookup with nothing and the
+ *     site's front door answers 404. A root RESPELLING (`/` → `//`) is no safer:
+ *     it stays routable but fails the raw `page.slug === '/'` checks the loader
+ *     makes downstream. Neither is a thing an editor means by "rename a page",
+ *     and no site has a second page to promote into the gap.
+ * BOTH SIDES ARE NORMALIZED for this test and for the `__` test — and only for
+ * those two — so the home page stored as `/` keeps REORDERING (it re-sends its
+ * own slug and returns at the raw-equality line above) while every actual move,
+ * in either direction, is refused.
+ *
+ * THE BLANK RULE, checked FIRST — before even the raw-equality reorder, because a
+ * blank slug is not a no-op to re-send. Rails reads a blank slug as an
+ * INSTRUCTION (`before_validation :generate_slug, if: proc { slug.blank? }`) and
+ * derives one from the title, unvalidated, past every check in this file. The body
+ * schema used to refuse `''` outright as `invalid body`, which is true but
+ * useless: the browser mapper turned it into "Saving the page layout failed. Save
+ * again to retry." — about the layout, not the address, advising a retry that can
+ * never succeed, for what an editor produces by clearing the Slug field. The
+ * schema now ACCEPTS a blank string by shape so this rule can refuse it by NAME,
+ * as `400 invalid-slug`; `refuseBlankSlug` is the rule, and the handler calls it
+ * separately only to give that refusal its own code.
  *
  * Throws (from `getPageSlugValidationError`) when the site never bound its
  * reserved routes — the caller turns that into the same fail-closed 500
@@ -249,6 +293,12 @@ export function refuseRenamedSlug(
 	incomingSlug: string | undefined
 ): string | null {
 	if (incomingSlug === undefined) return null;
+	// Blank FIRST — see the docblock. Not a rename question at all: Rails reads a
+	// blank slug as an instruction to derive one from the title, so it is refused
+	// even when the stored slug is blank too and the raw compare below would call
+	// it a no-op.
+	const blank = refuseBlankSlug(incomingSlug);
+	if (blank) return blank;
 	// Not a rename: the editor sent back what is already stored. RAW, and only
 	// here — see the docblock. The normalized compares below are the two equality
 	// tests that must agree with how the renderer reads a slug, not with how it
@@ -266,13 +316,20 @@ export function refuseRenamedSlug(
 		return `"${normalizeSlugPath(incomingSlug)}" is reserved for the site's own chrome — an existing page cannot be renamed onto it.`;
 	}
 
-	// The home page. A page already stored at the root may keep saving (its own
-	// slug, however it is spelled, normalizes to the same path); nothing else may
-	// move onto it. A stored slug Apex did not return is `null` here, NOT `/` —
-	// `normalizeSlugPath(undefined)` is `/`, and reading it that way would fail
-	// OPEN on exactly the case the rest of this function fails closed on.
+	// The home page, both ways. A page that lives there cannot leave; a page that
+	// does not cannot arrive. The root page's own REORDER returned at the
+	// raw-equality line above, so this never blocks an ordinary save.
+	//
+	// A stored slug Apex did not return is `null` here, NOT `/` —
+	// `normalizeSlugPath(undefined)` is `/`, and reading it that way would both
+	// fail OPEN on the move onto the root (the case the rest of this function
+	// fails closed on) and fail CLOSED on every other rename, freezing every page
+	// whose slug Apex omitted.
 	const storedPath = stored === undefined ? null : normalizeSlugPath(stored);
-	if (normalizeSlugPath(incomingSlug) === '/' && storedPath !== '/') {
+	if (storedPath === '/') {
+		return '"/" is the site\'s home page — it cannot be renamed.';
+	}
+	if (normalizeSlugPath(incomingSlug) === '/') {
 		return '"/" is the site\'s home page — an existing page cannot be renamed onto it.';
 	}
 
@@ -288,15 +345,20 @@ export function refuseRenamedSlug(
 export const savePageStructureBodySchema = z
 	.object({
 		title: z.string().max(300).optional(),
-		// `+`, not `*`: an empty slug is not a slug. `create-page.ts`'s schema has
-		// always said `.min(1)`, and this one said `*` — the one input on which the
-		// two paths could still drift. Rails reads a blank slug as an INSTRUCTION
-		// (`before_validation :generate_slug, if: proc { slug.blank? }`) and derives
-		// one from the title, unvalidated, past every check in this file.
+		// BLANK OR A SLUG, nothing in between. An empty slug is not a slug — Rails
+		// reads it as an INSTRUCTION (`before_validation :generate_slug, if: proc {
+		// slug.blank? }`) and derives one from the title, unvalidated, past every
+		// check in this file — but refusing it HERE answers `400 invalid body`, which
+		// the browser mapper can only report as "Saving the page layout failed. Save
+		// again to retry.": a permanent failure dressed as a transient one, for what
+		// an editor does by clearing the Slug field. So the shape admits a blank
+		// string and `refuseBlankSlug` refuses it by name as `400 invalid-slug`. The
+		// charset half still bites: a slug with a space or a `?` in it is a shape
+		// error, not an address the editor can be told how to fix.
 		slug: z
 			.string()
 			.max(300)
-			.regex(/^[a-z0-9/_-]+$/iu)
+			.regex(/^\s*$|^[a-z0-9/_-]+$/iu)
 			.optional(),
 		summary: z.string().max(5000).optional(),
 		blocks_attributes: z.array(jsonRecord).max(200).optional(),
@@ -394,6 +456,13 @@ export async function handleSavePageStructure(
 	// just returned. It sits here and not with the other body checks because it is
 	// the only one that needs the STORED value; see `refuseRenamedSlug`. Refused
 	// before the PATCH, so nothing is written.
+	// The blank half of the same rule, called here only to give it its own code:
+	// `invalid-slug`, not `reserved-slug`, because the address is missing rather
+	// than taken and the editor needs a different sentence. `refuseRenamedSlug`
+	// checks it too, so the rule is complete for every other caller.
+	const blankSlug = refuseBlankSlug(parsed.data.slug);
+	if (blankSlug) return rejectMutation(ctx, validMeta, 400, 'invalid-slug', blankSlug);
+
 	let slugRefusal: string | null;
 	try {
 		slugRefusal = refuseRenamedSlug(currentPage.slug, parsed.data.slug);

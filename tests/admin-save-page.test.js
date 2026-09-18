@@ -17,7 +17,7 @@ import {
 	getBlocks
 } from '../src/admin/page-draft.js';
 import { savePage, STALE_MESSAGE } from '../src/admin/save-page.js';
-import { RESERVED_SLUG_MESSAGE } from '../src/admin/field-errors.js';
+import { BLANK_SLUG_MESSAGE, RESERVED_SLUG_MESSAGE } from '../src/admin/field-errors.js';
 
 const PAGE_ID = '9f06e386-86b3-4ddf-9466-d4ca325ada86';
 const ET_HEADING = 'f867796b-c70c-47e4-8f6b-ad122832367b';
@@ -200,6 +200,36 @@ describe('savePage (M1 explicit save)', () => {
 		// The SAME sentence `pageCreateError` / `PageList.svelte` show for the same
 		// refusal — one rule, one wording, shared from `field-errors.js`.
 		assert.equal(result.message, RESERVED_SLUG_MESSAGE);
+		assert.doesNotMatch(result.message, /Save again to retry/u);
+	});
+
+	/**
+	 * The OTHER address refusal (codex F3). `save-page-structure.ts` answers
+	 * `400 invalid-slug` when the slug sent is blank — what an editor produces by
+	 * clearing the Slug field, which no site's input marks `required`. Until it had
+	 * its own code it was the schema's `400 invalid body`, and this mapper could
+	 * only report it as "Saving the page layout failed. Save again to retry.": the
+	 * layout named for a failure of the address, and a retry that cannot succeed.
+	 *
+	 * It is NOT `RESERVED_SLUG_MESSAGE`: "choose a different one" is no instruction
+	 * for a field with nothing in it.
+	 *
+	 * MUTATION (run): drop the `result?.error === 'invalid-slug'` branch from
+	 * `messageFor` → this test goes RED with the retry sentence.
+	 */
+	it('a cleared slug is named as a missing address, not as a layout failure', async () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		reorderBlocks(draft, 0, 1);
+		const client = makeClient({
+			serverVersion: 'baseline-v',
+			results: { structure: () => ({ ok: false, status: 400, error: 'invalid-slug' }) }
+		});
+		const result = await savePage(draft, client);
+		assert.equal(result.ok, false);
+		assert.equal(result.stage, 'structure');
+		assert.equal(result.status, 400);
+		assert.equal(result.message, BLANK_SLUG_MESSAGE);
+		assert.notEqual(result.message, RESERVED_SLUG_MESSAGE);
 		assert.doesNotMatch(result.message, /Save again to retry/u);
 	});
 

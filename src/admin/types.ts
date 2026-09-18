@@ -373,7 +373,10 @@ export interface BffClient {
 		entityId: string,
 		fieldsData: Record<string, unknown>
 	): Promise<BffMutationResult>;
-	/** `400 reserved-slug` is a refusal here too, on a RENAME — `save-page.js` names it. */
+	/**
+	 * `400 reserved-slug` is a refusal here too, on a RENAME, and `400 invalid-slug`
+	 * is the blank-slug one — `save-page.js` names both.
+	 */
 	savePageStructure(pageId: string, payload: unknown): Promise<BffMutationResult>;
 	changePageStatus(pageId: string, statusEvent: AdminStatusEvent): Promise<BffMutationResult>;
 	/**
