@@ -9,6 +9,8 @@ import {
 	reorderBlocks,
 	setBlockOrder,
 	addTemplateBlock,
+	addSpacerBlock,
+	setSpacerKind,
 	removeBlock,
 	isDirty,
 	canEditFields,
@@ -373,6 +375,84 @@ describe('a duplicated section — the fields the editor seeded on a temp entity
 });
 
 describe('page-draft local model', () => {
+	it('adds a medium spacer locally and serializes it without server ids', () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		const block = addSpacerBlock(draft);
+		const blocks = getBlocks(draft);
+
+		assert.equal(block.id.startsWith('temp-'), true);
+		assert.equal(block.label, null);
+		assert.equal(block.blockable_type, 'Cms::PageBlock::Spacer');
+		assert.deepEqual(block.blockable, { kind: 'medium' });
+		assert.equal(block.position, blocks.indexOf(block));
+		assert.equal(isDirty(draft), true);
+
+		const attr = structurePayload(draft).blocks_attributes[block.position];
+		assert.equal(Object.hasOwn(attr, 'id'), false);
+		assert.equal(attr.blockable_type, 'Cms::PageBlock::Spacer');
+		assert.deepEqual(attr.blockable_attributes, { kind: 'medium' });
+		assert.equal(attr._destroy, false);
+	});
+
+	it('sets and serializes a hydrated spacer kind with its existing ids', () => {
+		const page = samplePage();
+		page.blocks.push({
+			id: 'b1',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::Spacer',
+			blockable: { id: 's1', kind: 'medium', created_at: '2026-09-19T00:00:00.000Z' }
+		});
+		const draft = createDraft(page, 'baseline-v');
+
+		assert.equal(setSpacerKind(draft, 'b1', 'large'), true);
+		assert.equal(isDirty(draft), true);
+		const attr = structurePayload(draft).blocks_attributes.find((block) => block.id === 'b1');
+		assert.equal(attr.id, 'b1');
+		assert.equal(attr.blockable_attributes.id, 's1');
+		assert.equal(attr.blockable_attributes.kind, 'large');
+	});
+
+	it('refuses invalid spacer kinds and missing blockable records without dirtying the draft', () => {
+		const page = samplePage();
+		page.blocks.push(
+			{
+				id: 'spacer',
+				position: 2,
+				blockable_type: 'Cms::PageBlock::Spacer',
+				blockable: { id: 'spacer-record', kind: 'medium' }
+			},
+			{
+				id: 'empty-spacer',
+				position: 3,
+				blockable_type: 'Cms::PageBlock::Spacer',
+				blockable: null
+			}
+		);
+		const draft = createDraft(page, 'baseline-v');
+
+		for (const kind of ['huge', '', null]) {
+			assert.equal(setSpacerKind(draft, 'spacer', kind), false);
+		}
+		assert.equal(setSpacerKind(draft, 'block-heading', 'large'), false);
+		assert.equal(setSpacerKind(draft, 'unknown', 'large'), false);
+		assert.equal(setSpacerKind(draft, 'empty-spacer', 'large'), false);
+		assert.equal(setSpacerKind(draft, 'spacer', 'medium'), true);
+		assert.equal(isDirty(draft), false);
+		assert.equal(getBlocks(draft).find((block) => block.id === 'empty-spacer').blockable, null);
+	});
+
+	it('saves a new spacer through the structure route without patching entity fields', async () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		addSpacerBlock(draft);
+		const client = makeClient({ serverVersion: 'baseline-v' });
+
+		const result = await savePage(draft, client);
+
+		assert.equal(result.ok, true);
+		assert.equal(client.calls.filter((call) => call[0] === 'savePageStructure').length, 1);
+		assert.equal(client.calls.filter((call) => call[0] === 'patchEntityFields').length, 0);
+	});
+
 	it('reorder mutates the draft only and NEVER calls the client', async () => {
 		const draft = createDraft(samplePage(), 'baseline-v');
 		const before = getBlocks(draft).map((b) => b.id);

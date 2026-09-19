@@ -12,6 +12,15 @@ import { isTempId, serializeBlocksForSave } from './block-serialize.js';
  * @typedef {import('./types').AdminPageDraft} AdminPageDraft
  */
 
+/** Apex's delegated type for a spacer. */
+export const SPACER_BLOCKABLE = 'Cms::PageBlock::Spacer';
+/** The sizes `Cms::PageBlock::Spacer` accepts (it validates `kind` in these; nil allowed). */
+export const SPACER_KINDS = Object.freeze(['small', 'medium', 'large']);
+
+export function isSpacerBlock(block) {
+	return block?.blockable_type === SPACER_BLOCKABLE;
+}
+
 // Local page-draft state (plan §8, 3a M1). Edits mutate THIS, not Apex. There is no
 // autosave, no debounce, no coordinator — a single explicit `savePage()` (save-page.js)
 // reads the dirty set off a draft and writes it. The draft is a plain object graph
@@ -225,6 +234,45 @@ export function addTemplateBlock(
 	applyPositions(draft);
 	draft.structureDirty = true;
 	return block;
+}
+
+/**
+ * Append a medium spacer with no blockable id, so Apex builds the delegated record.
+ *
+ * @param {AdminPageDraft} draft
+ * @returns {AdminPageBlock}
+ */
+export function addSpacerBlock(draft) {
+	const block = {
+		id: nextTempId('block'),
+		label: null,
+		position: draft.page.blocks.length,
+		blockable_type: SPACER_BLOCKABLE,
+		blockable: { kind: 'medium' }
+	};
+	draft.page.blocks.push(block);
+	applyPositions(draft);
+	draft.structureDirty = true;
+	return block;
+}
+
+/**
+ * Set a spacer's size without creating a missing delegated record.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {unknown} kind
+ * @returns {boolean}
+ */
+export function setSpacerKind(draft, blockId, kind) {
+	const block = findBlock(draft, blockId);
+	if (!isSpacerBlock(block) || !block.blockable || typeof block.blockable !== 'object')
+		return false;
+	if (!SPACER_KINDS.includes(kind)) return false;
+	if (block.blockable.kind === kind) return true;
+	block.blockable.kind = kind;
+	draft.structureDirty = true;
+	return true;
 }
 
 /**
