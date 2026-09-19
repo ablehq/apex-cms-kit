@@ -285,6 +285,24 @@ describe('savePage (M1 explicit save)', () => {
 		assert.equal(isDirty(draft), false);
 		assert.equal(draft.baselineVersion, 'v-refreshed');
 	});
+
+	it('after a structure save re-baselines from the fresh GET, not the PATCH response', async () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		reorderBlocks(draft, 0, 1);
+		const client = makeClient({
+			serverVersion: 'baseline-v',
+			results: {
+				structure: () => ({ ok: true, page: samplePage(), version: 'from-patch' })
+			}
+		});
+		client.getPage = async () => {
+			client.calls.push(['getPage']);
+			return { page: samplePage(), version: 'from-get' };
+		};
+
+		assert.equal((await savePage(draft, client)).ok, true);
+		assert.equal(draft.baselineVersion, 'from-get');
+	});
 });
 
 describe('a duplicated section — the fields the editor seeded on a temp entity', () => {
@@ -347,8 +365,8 @@ describe('a duplicated section — the fields the editor seeded on a temp entity
 		assert.equal((await savePage(draft, client)).ok, true);
 		assert.deepEqual(
 			client.calls.map((c) => c[0]),
-			['readVersion', 'savePageStructure'],
-			"nothing to copy: no PATCH, and the structure save's page is baseline enough"
+			['readVersion', 'savePageStructure', 'getPage'],
+			'nothing to copy: no PATCH, then a fresh read for the baseline'
 		);
 	});
 
@@ -511,7 +529,7 @@ describe('page-draft local model', () => {
 			entityTypeId: ET_PROSE,
 			fieldsData: { body: { editor: 'tiptap', html: '', content: {} } }
 		});
-		// The structure save returns a server page where the new block has real ids.
+		// The fresh read after the structure save returns the new block with real ids.
 		const realized = () => {
 			const page = samplePage();
 			page.blocks.push({

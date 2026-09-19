@@ -535,8 +535,8 @@ export async function handleSavePageStructure(
 		return noStoreJson({ error: 'upstream error', status: apexResponse.status }, status);
 	}
 
-	// Return the fresh page + its new version so `savePage()` re-baselines the stale
-	// guard and reconciles temp-id blocks to their server ids in one round-trip.
+	// Return the PATCH response page so `savePage()` can reconcile temp-id blocks to
+	// their server ids before it re-baselines from a fresh GET.
 	//
 	// A malformed envelope here answers 200 with `page: null`, NOT 502 — unlike
 	// `get-page` and `preview-page`, which do 502 on the same shape. The difference is
