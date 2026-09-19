@@ -75,11 +75,8 @@ function projectBlockable(blockable: BlockableLike | null | undefined): unknown 
 /** Reduce a hydrated Apex page to the version-sensitive projection described above. */
 export function projectPageForVersion(page: PageLike): unknown {
 	const blocks = Array.isArray(page?.blocks) ? page.blocks : [];
-	return {
-		id: page?.id ?? null,
-		status: page?.status ?? null,
-		updated_at: page?.updated_at ?? null,
-		blocks: blocks.map((block) => ({
+	const projectedBlocks = blocks
+		.map((block) => ({
 			id: block?.id ?? null,
 			position: block?.position ?? null,
 			label: block?.label ?? null,
@@ -87,6 +84,19 @@ export function projectPageForVersion(page: PageLike): unknown {
 			updated_at: block?.updated_at ?? null,
 			blockable: projectBlockable(block?.blockable)
 		}))
+		.sort((a, b) => {
+			const aId = String(a.id ?? '');
+			const bId = String(b.id ?? '');
+			return aId < bId ? -1 : aId > bId ? 1 : 0;
+		});
+	// Cms::Page's has_many :blocks has no order, so Apex can return heap order and make a
+	// PATCH response differ from a fresh GET without a content change. Position remains in
+	// each projection so an editor reorder still changes the version.
+	return {
+		id: page?.id ?? null,
+		status: page?.status ?? null,
+		updated_at: page?.updated_at ?? null,
+		blocks: projectedBlocks
 	};
 }
 
@@ -102,8 +112,8 @@ function toHex(buffer: ArrayBuffer): string {
 /**
  * Compute the composite version token: a hex SHA-256 over the canonical JSON of the
  * projection (object keys sorted so key-order jitter from Apex never changes the
- * hash; array order preserved so a reorder DOES). Web-standard `crypto.subtle`, so
- * the identical token is produced in workerd and Node.
+ * hash; each block's projected position makes a reorder change it). Web-standard
+ * `crypto.subtle`, so the identical token is produced in workerd and Node.
  */
 export async function computePageVersion(page: PageLike): Promise<string> {
 	const canonical = JSON.stringify(canonicalize(projectPageForVersion(page)));

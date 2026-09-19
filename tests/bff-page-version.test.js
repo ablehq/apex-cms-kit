@@ -83,6 +83,13 @@ describe('composite page version', () => {
 		assert.notEqual(base, after);
 	});
 
+	it('is stable when Apex returns the same blocks in a different array order', async () => {
+		const base = await computePageVersion(page());
+		const permuted = page();
+		permuted.blocks.reverse();
+		assert.equal(base, await computePageVersion(permuted));
+	});
+
 	it('CHANGES when a block is added or removed', async () => {
 		const base = await computePageVersion(page());
 		const removed = page();
