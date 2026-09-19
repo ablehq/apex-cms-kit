@@ -81,7 +81,6 @@ export function projectPageForVersion(page: PageLike): unknown {
 			position: block?.position ?? null,
 			label: block?.label ?? null,
 			blockable_type: block?.blockable_type ?? null,
-			updated_at: block?.updated_at ?? null,
 			blockable: projectBlockable(block?.blockable)
 		}))
 		.sort((a, b) => {
@@ -89,9 +88,15 @@ export function projectPageForVersion(page: PageLike): unknown {
 			const bId = String(b.id ?? '');
 			return aId < bId ? -1 : aId > bId ? 1 : 0;
 		});
-	// Cms::Page's has_many :blocks has no order, so Apex can return heap order and make a
-	// PATCH response differ from a fresh GET without a content change. Position remains in
-	// each projection so an editor reorder still changes the version.
+	// Two things a structure save's PATCH response gets "wrong" against a fresh GET, with
+	// nothing changed, and both are left out so the save can re-baseline from it:
+	// - ORDER. Cms::Page's has_many :blocks has no order, so Apex lists blocks in heap order.
+	//   Position stays in each projection, so a real reorder still changes the version.
+	// - THE BLOCK'S updated_at. Cms::PageBlockable declares has_one :block, touch: true, so a
+	//   blockable update (a spacer resize) bumps the block row through a different instance
+	//   and the response keeps the old value. It adds no detection: every other block column
+	//   (label, position, blockable_type, blockable_id) is projected, and the same touch
+	//   moves the blockable's own updated_at, which is.
 	return {
 		id: page?.id ?? null,
 		status: page?.status ?? null,
