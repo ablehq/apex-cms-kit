@@ -20,8 +20,6 @@ import { BLANK_SLUG_MESSAGE, RESERVED_SLUG_MESSAGE } from './field-errors.js';
 //       its source's fields on a temp entity; Rails permits no `fields_data` under
 //       `entity_attributes`, so they are PATCHed once the entity has a real id).
 //   4. Status event (publish / unpublish), only when asked; never after any failure.
-//   5. Fresh GET and reconcile: a PATCH response is not a fresh read, so it cannot
-//      be the stale guard's next baseline.
 // Publish is the SAME function with `statusEvent: 'publish'` — it awaits every prior
 // step and never dispatches the status if an earlier step failed (plan M1).
 
@@ -123,7 +121,8 @@ export async function savePage(draft, client, options = {}) {
 	}
 
 	// 3. Page structure — only if it changed. Carries block order / add / remove.
-	let structurePage = null;
+	let freshPage = null;
+	let freshVersion = null;
 	// Captured BEFORE the structure save: after it, `reconcile` replaces the tree.
 	const seeded = draft.structureDirty ? seededNewBlockFields(draft) : [];
 	if (draft.structureDirty || draft.deletedBlockIds.length > 0) {
@@ -136,18 +135,17 @@ export async function savePage(draft, client, options = {}) {
 				message: messageFor('structure', res)
 			};
 		}
-		// This PATCH response is only a source of ids for step 3b. It is not a
-		// fresh read and must not become the stale guard's next baseline.
-		structurePage = res.page ?? null;
+		freshPage = res.page ?? null;
+		freshVersion = res.version ?? null;
 	}
 
-	// 3b. The fields of the blocks the structure save just minted. The response page
+	// 3b. The fields of the blocks the structure save just minted. The fresh page
 	// carries their real entity ids at the same positions; PATCH each, in order,
 	// and STOP on the first failure — the section exists, its fields do not, and
 	// the message says exactly that. Runs BEFORE the status event so a publish
 	// never goes out over a half-copied section.
 	if (seeded.length > 0) {
-		let minted = structurePage;
+		let minted = freshPage;
 		if (!minted) {
 			try {
 				minted = (await client.getPage(pageId)).page;
@@ -173,27 +171,35 @@ export async function savePage(draft, client, options = {}) {
 				};
 			}
 		}
+		// Those PATCHes moved the composite version; the page the structure save
+		// returned is now behind it. Re-read below so the baseline is honest.
+		freshPage = null;
 	}
 
 	// 4. Status event — only when asked (Publish / Unpublish). Never reached if any
-	// step above returned.
+	// step above returned. A status change invalidates the structure snapshot, so we
+	// force a fresh read below.
 	if (statusEvent) {
 		const res = await client.changePageStatus(pageId, statusEvent);
 		if (!res.ok) {
 			return { ok: false, stage: 'status', status: res.status, message: messageFor('status', res) };
 		}
+		freshPage = null;
 	}
 
-	// 5. Re-baseline from the same kind of fresh GET the stale guard compares
-	// against. A Spacer update touches its block through a different model instance,
-	// so the PATCH response can carry the block's stale `updated_at`.
-	try {
-		const { page, version } = await client.getPage(pageId);
-		reconcile(draft, page, version);
-	} catch {
-		// The writes succeeded; only the refresh failed. Report success but flag
-		// that the draft may be behind, so the UI can prompt a reload.
-		return { ok: true, refreshed: false };
+	// 5. Re-baseline. Prefer the page the structure save already returned; otherwise
+	// read it fresh so the draft (and the stale guard's baseline) match the server.
+	if (freshPage && freshVersion) {
+		reconcile(draft, freshPage, freshVersion);
+	} else {
+		try {
+			const { page, version } = await client.getPage(pageId);
+			reconcile(draft, page, version);
+		} catch {
+			// The writes succeeded; only the refresh failed. Report success but flag
+			// that the draft may be behind, so the UI can prompt a reload.
+			return { ok: true, refreshed: false };
+		}
 	}
 	return { ok: true, refreshed: true };
 }
