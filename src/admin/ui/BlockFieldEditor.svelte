@@ -15,6 +15,7 @@
 	Legacy Svelte mode.
 -->
 <script>
+	import { tick } from 'svelte';
 	import RichTextField from './RichTextField.svelte';
 
 	/** @type {import('../types').AdminFieldDef[]} */
@@ -133,6 +134,37 @@
 	/** @type {((name: string) => void) | null} */
 	export let onPickMedia = null;
 
+	/** @type {HTMLDivElement | null} */
+	let fieldsElement = null;
+	/** @type {HTMLElement | null} */
+	let focusedBeforeDisable = null;
+	let wasDisabled = disabled;
+
+	function rememberFocusedElement() {
+		focusedBeforeDisable = null;
+		if (typeof document === 'undefined' || !fieldsElement) return;
+		const active = document.activeElement;
+		if (active instanceof HTMLElement && fieldsElement.contains(active)) {
+			focusedBeforeDisable = active;
+		}
+	}
+
+	async function restoreFocusedElement() {
+		const target = focusedBeforeDisable;
+		await tick();
+		if (typeof document !== 'undefined' && !disabled && target && document.contains(target)) {
+			const active = document.activeElement;
+			if (active === document.body || fieldsElement?.contains(active)) target.focus();
+		}
+		if (focusedBeforeDisable === target) focusedBeforeDisable = null;
+	}
+
+	$: if (disabled !== wasDisabled) {
+		if (disabled) rememberFocusedElement();
+		else restoreFocusedElement();
+		wasDisabled = disabled;
+	}
+
 	// Which plain-text fields are machine-facing, and so set in the mono face. The
 	// prototype's rule, applied by name because that is what the contract gives us.
 	const MACHINE = /(^|_)(anchor_id|href|url|key|slug|id|refs|count)$/u;
@@ -207,7 +239,7 @@
 {:else if fieldDefs.length === 0}
 	<p class="notice">This section has no editable fields.</p>
 {:else}
-	<div class="fields" inert={disabled}>
+	<div class="fields" inert={disabled} bind:this={fieldsElement}>
 		{#each fieldDefs as def (def.field_name)}
 			<div class="f">
 				{#if def.validator_kind === 'boolean'}
