@@ -21,15 +21,6 @@
  */
 
 /**
- * The reserved invariant (plan §8, 3a): ONLY a dedicated human-review route may
- * set `transcript_reviewed=true`. That route is not built in the 3a scaffold; this
- * constant records the field name so the mutation routes that DO ship can assert
- * they never send it, and so the review route has one place to reference when it
- * lands.
- */
-export const REVIEW_ONLY_FIELDS = Object.freeze(['transcript_reviewed'] as const);
-
-/**
  * The second data invariant, added for phase 3d, and the same class of thing as the
  * review-only rule above: a property of the DATA that must hold no matter who is
  * calling.
@@ -92,11 +83,29 @@ export function containsNullPrimitive(
  */
 const MAX_STRUCTURAL_DEPTH = 64;
 
+/**
+ * The same body as `archetype-record.ts`'s `isRecord`, deliberately NOT imported.
+ * This module has no imports at all, and that is worth more than three saved lines:
+ * the write invariants here must not be able to change because a record-parsing
+ * module changed.
+ */
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 /**
+ * The review-only RULE lives here; the review-only FIELD NAMES do not.
+ *
+ * The invariant is generic: only a dedicated human-review route may set a
+ * review-only field, so every other mutation route must refuse a body that even
+ * NAMES one. Which fields those are is a property of a site's content model —
+ * `transcript_reviewed` is a GLC sermon field, and Godrej has no equivalent — so
+ * the list arrives on `BffContext.reviewOnlyFields`, set by the site.
+ *
+ * `fields` is REQUIRED and has no default, deliberately. A default of `[]` would
+ * turn this predicate into one that always returns `false`: a security guard that
+ * silently passes. Required means `tsc` fails any caller that forgets it.
+ *
  * The page-structure save carries a nested, recursive `blocks_attributes` tree that
  * can include `entity_attributes.fields_data` for newly added blocks — so a shallow
  * key check is not enough to keep the review-only invariant. This walks the body's
@@ -118,14 +127,26 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
  *   - it fails CLOSED past `MAX_STRUCTURAL_DEPTH`, so a pathological structural payload
  *     can never walk off the end and fail open.
  */
-export function containsReviewOnlyField(value: unknown, depth = 0): boolean {
+export function containsReviewOnlyField(
+	value: unknown,
+	fields: readonly string[],
+	depth = 0
+): boolean {
+	// TypeScript makes `fields` required, but a JS caller can still omit it. Say what
+	// is wrong rather than dying on `undefined.includes` three frames down.
+	if (!Array.isArray(fields)) {
+		throw new TypeError(
+			'containsReviewOnlyField: `fields` is required (BffContext.reviewOnlyFields)'
+		);
+	}
 	if (value === null || typeof value !== 'object') return false;
 	// Fail CLOSED past the structural cap. The field-value skip below means the only
 	// thing that can grow `depth` is genuine attribute nesting, never rich-text content.
 	if (depth > MAX_STRUCTURAL_DEPTH) return true;
-	if (Array.isArray(value)) return value.some((item) => containsReviewOnlyField(item, depth + 1));
+	if (Array.isArray(value))
+		return value.some((item) => containsReviewOnlyField(item, fields, depth + 1));
 	for (const [key, nested] of Object.entries(value)) {
-		if ((REVIEW_ONLY_FIELDS as readonly string[]).includes(key)) return true;
+		if (fields.includes(key)) return true;
 		// A `fields_data` map: its KEYS are field/attribute names (scan them), but its
 		// VALUES are opaque field CONTENT — do NOT descend, so a rich-text tiptap value
 		// is never mistaken for structure and a deep document never trips the cap.
@@ -142,11 +163,11 @@ export function containsReviewOnlyField(value: unknown, depth = 0): boolean {
 		// either keep `__proto__` out of the parsed output or make this walk descend.
 		if (key === 'fields_data' && isPlainObject(nested)) {
 			for (const fieldName of Object.keys(nested)) {
-				if ((REVIEW_ONLY_FIELDS as readonly string[]).includes(fieldName)) return true;
+				if (fields.includes(fieldName)) return true;
 			}
 			continue;
 		}
-		if (containsReviewOnlyField(nested, depth + 1)) return true;
+		if (containsReviewOnlyField(nested, fields, depth + 1)) return true;
 	}
 	return false;
 }

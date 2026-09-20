@@ -8,7 +8,11 @@ import {
 	noStoreJson,
 	parseAllowedOrigins
 } from '../src/server/bff/boundary.ts';
-import { createApexAdminClient } from '../src/server/bff/apex-admin-client.ts';
+import {
+	ApexTransportError,
+	assertEntityTypeRef,
+	createApexAdminClient
+} from '../src/server/bff/apex-admin-client.ts';
 
 const ORIGIN = 'https://gospellife.in';
 const origins = [ORIGIN];
@@ -131,6 +135,37 @@ describe('no-store responses', () => {
 // and tests/bff-harness.test.js), and every Apex call afterwards carries that
 // person's own token.
 
+describe('the path-segment shape checks accept only what they say they accept', () => {
+	/**
+	 * P4 review, finding 4. Both were `/…/iu`, and UNICODE CASE FOLDING under `i`
+	 * puts two non-ASCII characters inside `[a-z]`: U+212A KELVIN SIGN folds to `k`
+	 * and U+017F LATIN SMALL LETTER LONG S folds to `s`. So a check whose entire job
+	 * is "the ASCII slug alphabet, nothing that could carry a separator or an
+	 * encoding" accepted characters that are not ASCII at all.
+	 *
+	 * Harmless downstream — the value is `encodeURIComponent`'d into one path
+	 * segment and Apex answers 404 — but a shape check that accepts what it says it
+	 * refuses is the wrong thing to leave in a security boundary.
+	 *
+	 * MUTATION: put the `i` flag back on the regex and the matching case here stops
+	 * throwing. (`assertSchemaItemSlug` carried the same rule and the same test until
+	 * the items endpoint it guarded was deleted with the child-list transport.)
+	 */
+	it('refuses the two characters unicode case folding smuggled into [a-z]', () => {
+		assert.throws(() => assertEntityTypeRef('\u212a'), /invalid entity type/u);
+		assert.throws(() => assertEntityTypeRef('quote-\u017fitem'), /invalid entity type/u);
+	});
+
+	it('refuses an UPPERCASE spelling, which Apex never mints', () => {
+		assert.throws(() => assertEntityTypeRef('Quote-Item'), /invalid entity type/u);
+	});
+
+	it('still accepts the slugs and uuids every site actually uses', () => {
+		assert.doesNotThrow(() => assertEntityTypeRef('quote-item'));
+		assert.doesNotThrow(() => assertEntityTypeRef('5c9f0a21-1b2c-4d3e-8f40-a1b2c3d4e5f6'));
+	});
+});
+
 describe('per-editor Apex client', () => {
 	const UUID = 'ce776750-ce9f-474d-a103-5256ea228517';
 
@@ -190,6 +225,75 @@ describe('per-editor Apex client', () => {
 		});
 		await assert.rejects(() => client.changePageStatus('../evil', 'publish'));
 		await assert.rejects(() => client.changePageStatus('not-a-uuid', 'publish'));
+	});
+
+	/**
+	 * A RESPONSE WHOSE BODY DIES MID-STREAM. codex on the P3 fix pass, finding 4:
+	 * `await response.json().catch(() => null)` swallowed a reset or an abort during
+	 * body consumption as `body: null`, so a 2xx came back `ok: true` over an
+	 * INCOMPLETE response — a write reported as succeeded-and-returned-nothing.
+	 * Malformed JSON must stay a shape error; only the stream failure is a fault.
+	 */
+	function bodyFailsMidStream() {
+		return new Response(
+			new ReadableStream({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode('{"data":'));
+					controller.error(new TypeError('terminated'));
+				}
+			}),
+			{ status: 200, headers: { 'content-type': 'application/json' } }
+		);
+	}
+
+	it('a body stream that fails is a transport error, not an ok:true with body:null', async () => {
+		const client = createApexAdminClient({
+			baseUrl: 'https://apex.internal',
+			token: 'bff-token',
+			fetchImpl: async () => bodyFailsMidStream()
+		});
+		await assert.rejects(
+			() => client.listPages({ page: 1 }),
+			(error) => {
+				assert.ok(error instanceof ApexTransportError, `got ${error?.name}: ${error?.message}`);
+				return true;
+			}
+		);
+	});
+
+	it('on the signal-carrying path it is a typed failure that KEEPS the http status', async () => {
+		// The ingest path takes typed failures rather than exceptions. The status is
+		// preserved here and not zeroed as it is for a pre-response fault: we know what
+		// Apex answered, we only failed to finish reading it, and a caller deciding
+		// whether a write may have committed wants that difference.
+		const client = createApexAdminClient({
+			baseUrl: 'https://apex.internal',
+			token: 'bff-token',
+			signal: new AbortController().signal,
+			fetchImpl: async () => bodyFailsMidStream()
+		});
+		const result = await client.listPages({ page: 1 });
+		assert.equal(result.ok, false, 'an incomplete body is not a success');
+		assert.equal(result.networkError, true);
+		assert.equal(result.status, 200, 'the status Apex actually sent');
+		assert.equal(result.body, null);
+	});
+
+	it('malformed JSON is still a shape error, not a transport failure', async () => {
+		const client = createApexAdminClient({
+			baseUrl: 'https://apex.internal',
+			token: 'bff-token',
+			fetchImpl: async () =>
+				new Response('not json at all', {
+					status: 200,
+					headers: { 'content-type': 'application/json' }
+				})
+		});
+		const result = await client.listPages({ page: 1 });
+		assert.equal(result.ok, true, 'the response arrived complete');
+		assert.equal(result.status, 200);
+		assert.equal(result.body, null);
+		assert.equal(result.networkError, undefined);
 	});
 
 	it('does not follow an upstream redirect', async () => {

@@ -1,9 +1,9 @@
 import { z } from 'zod';
-import { appendAuditEntry } from '../audit';
+import { auditOutcome } from '../audit';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
-import { findImage, imageIdSchema } from './list-gallery-images';
+import { rejectGuardFailure, rejectMutation } from '../reject';
+import { findImage, imageIdSchema, GALLERY_NAMES } from './list-gallery-images';
 import type { BffContext } from '../context';
 
 /**
@@ -42,17 +42,37 @@ export const updateImageBodySchema = z
 export async function handleUpdateImage(
 	request: Request,
 	ctx: BffContext,
-	params: { imageId: string }
+	params: { imageId: string },
+	options: { gallery?: string } = {}
 ): Promise<Response> {
+	const gallery = options.gallery ?? 'images';
+	/**
+	 * NEITHER AUDIT COLUMN TAKES A CALLER'S STRING.
+	 *
+	 * This meta is built BEFORE `imageIdSchema` runs, so `${params.imageId}` in the
+	 * path wrote an arbitrary caller-supplied value into `bff_audit_log.path` on every
+	 * refused request — the rule `reject.ts` states and every other operation follows.
+	 * `gallery` is the same hazard one step removed: Godrej's route wrapper validates
+	 * it against `isLibraryGallery` before delegating, but this operation is the one
+	 * that WRITES the row and must not depend on a caller doing that.
+	 *
+	 * So the path is the route TEMPLATE and `action` is narrowed to a name this kit
+	 * actually serves. The validated id goes in `detail` once there is one.
+	 */
+	const known = (GALLERY_NAMES as readonly string[]).includes(gallery);
 	const meta = {
-		action: 'images.update',
+		// The audit row names the gallery actually addressed — never "images" for a file.
+		action: `${known ? gallery : 'gallery'}.update`,
 		method: 'PATCH',
-		path: `/api/admin/images/${params.imageId}`,
+		path:
+			known && gallery === 'images'
+				? '/api/admin/images/[imageId]'
+				: '/api/admin/galleries/[gallery]/[imageId]',
 		requestId: request.headers.get('cf-ray')
 	};
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 
 	const actorMeta = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 
@@ -73,31 +93,22 @@ export async function handleUpdateImage(
 		return rejectMutation(ctx, actorMeta, 400, 'invalid body', 'invalid body');
 	}
 
-	const existing = await findImage(guard.apex, idResult.data);
+	if (!(GALLERY_NAMES as readonly string[]).includes(gallery)) {
+		return rejectMutation(ctx, actorMeta, 404, 'not found', 'no such gallery');
+	}
+	const existing = await findImage(guard.apex, idResult.data, '', gallery);
 	if (!existing) return rejectMutation(ctx, actorMeta, 404, 'not found', 'no such image');
 
 	const apexResponse = await guard.apex.updateGalleryItem(idResult.data, parsed.data);
 
-	if (ctx.db) {
-		await appendAuditEntry(ctx.db, {
-			id: crypto.randomUUID(),
-			occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-			actorEmail: guard.actor.email,
-			actorSub: guard.actor.sub,
-			action: 'images.update',
-			method: 'PATCH',
-			path: actorMeta.path,
-			accountId: ctx.accountId ?? null,
-			pageId: null,
-			requestId: request.headers.get('cf-ray'),
-			outcome: apexResponse.ok ? 'accepted' : 'apex_error',
-			detail: {
-				imageId: idResult.data,
-				fields: Object.keys(parsed.data),
-				apexStatus: apexResponse.status
-			}
-		});
-	}
+	await auditOutcome(ctx, meta, guard.actor, {
+		outcome: apexResponse.ok ? 'accepted' : 'apex_error',
+		detail: {
+			imageId: idResult.data,
+			fields: Object.keys(parsed.data),
+			apexStatus: apexResponse.status
+		}
+	});
 
 	if (!apexResponse.ok) {
 		const status =
@@ -109,7 +120,9 @@ export async function handleUpdateImage(
 	// Apex answered 200 to and dropped on the floor (phase 3b) and one that 422'd for
 	// months behind a stub, so a status code does not count as evidence anywhere in
 	// this codebase: the value is written when the READ surface shows it.
-	const image = await findImage(guard.apex, idResult.data);
+	// Re-read from the SAME gallery the write was addressed to. Reading images here for
+	// a files item would find nothing and answer 502 after the write had landed.
+	const image = await findImage(guard.apex, idResult.data, ctx.assetsPrefix ?? '', gallery);
 	if (!image) return noStoreJson({ error: 'unexpected upstream shape' }, 502);
 
 	return noStoreJson({ image });

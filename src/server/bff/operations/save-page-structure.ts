@@ -1,9 +1,21 @@
+import { unwrapArchetypeRecord } from '../archetype-record';
 import { z } from 'zod';
 import { appendAuditEntry } from '../audit';
 import { containsReviewOnlyField } from '../authorization';
-import { noStoreJson } from '../boundary';
+import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
+import {
+	refuseOversizedFields,
+	refuseUnreadableUrls,
+	rejectGuardFailure,
+	rejectMutation
+} from '../reject';
+import { sanitizeFieldValue } from '../../../sanitize/write-boundary';
+import {
+	getPageSlugValidationError,
+	normalizeSlugPath
+} from '../../../cms/page-slug-validation.js';
+import { RESERVED_SLUG_PREFIX } from '../../../cms/slug.js';
 import { pageIdSchema } from './get-page';
 import { computePageVersion } from '../page-version';
 import type { BffContext } from '../context';
@@ -18,35 +30,341 @@ import type { PageStructureBody } from '../apex-admin-client';
  *
  * The top-level schema is `.strict()` (unknown keys fail closed). `blocks_attributes`
  * is a passthrough array — it is a deep, recursive Apex-shaped payload the client
- * serialized — but the whole body is walked for the review-only invariant first, so
- * a `transcript_reviewed` smuggled inside a nested `entity_attributes.fields_data`
- * is rejected. On success the fresh page's version token is returned so `savePage()`
- * can re-baseline without a second round-trip.
+ * serialized — but the whole body is walked TWICE before Apex sees it: for the
+ * review-only invariant (a `transcript_reviewed` smuggled inside a nested
+ * `entity_attributes.fields_data` is rejected), and for ownership (every `id`,
+ * `blockable_id`, `parent_template_instance_id` and
+ * `group_member_template_instance_ids[]` must be an id of the addressed page's
+ * freshly-read tree — else 400 `block not on this page`, no write). On success the
+ * fresh page's version token is returned so `savePage()` can re-baseline without a
+ * second round-trip.
  */
 const jsonRecord = z.record(z.string(), z.unknown());
+
+/**
+ * Every id in a page's tree, as Apex just returned it: the page, its blocks, their
+ * blockables, entities, child template instances, display meta properties and the
+ * page's own meta properties — any `id` string at any depth. This is the set a
+ * structure save may name; nothing outside it belongs to this page.
+ */
+export function collectPageIds(page: unknown): Set<string> {
+	const ids = new Set<string>();
+	const walk = (value: unknown, depth: number) => {
+		if (depth > 32 || value === null || typeof value !== 'object') return;
+		if (Array.isArray(value)) {
+			for (const item of value) walk(item, depth + 1);
+			return;
+		}
+		const record = value as Record<string, unknown>;
+		if (typeof record.id === 'string' && record.id !== '') ids.add(record.id);
+		for (const child of Object.values(record)) walk(child, depth + 1);
+	};
+	walk(page, 0);
+	return ids;
+}
+
+/** The keys under which a structure body names an existing row. */
+const OWNED_ID_KEYS = ['id', 'blockable_id', 'parent_template_instance_id'] as const;
+const OWNED_ID_LIST_KEYS = ['group_member_template_instance_ids'] as const;
+
+/**
+ * The first id in `body` that is not one of `owned` — `null` when every id the body
+ * names belongs to the addressed page. Walks the whole body (blocks, nested
+ * blockable/entity/child attributes, `_destroy` rows, meta properties): Rails
+ * permits `blockable_id` and nested `blockable_attributes.id`, and
+ * `Cms::PageBlock accepts_nested_attributes_for :blockable`, so a body naming
+ * another page's blockable id plus nested attributes would rewrite THAT page's
+ * content. The editor never sends `blockable_id`, and every `id` it sends came
+ * from this page's own tree (block-serialize.js strips temp ids), so an honest
+ * save never trips this; a new block simply names no ids.
+ */
+export function findForeignId(body: unknown, owned: Set<string>): { key: string } | null {
+	const walk = (value: unknown, depth: number): { key: string } | null => {
+		if (depth > 32 || value === null || typeof value !== 'object') return null;
+		if (Array.isArray(value)) {
+			for (const item of value) {
+				const found = walk(item, depth + 1);
+				if (found) return found;
+			}
+			return null;
+		}
+		const record = value as Record<string, unknown>;
+		for (const key of OWNED_ID_KEYS) {
+			const id = record[key];
+			if (id === undefined || id === null) continue;
+			if (typeof id !== 'string' || !owned.has(id)) return { key };
+		}
+		for (const key of OWNED_ID_LIST_KEYS) {
+			const list = record[key];
+			if (list === undefined || list === null) continue;
+			if (!Array.isArray(list)) return { key };
+			for (const id of list) if (typeof id !== 'string' || !owned.has(id)) return { key };
+		}
+		for (const child of Object.values(record)) {
+			const found = walk(child, depth + 1);
+			if (found) return found;
+		}
+		return null;
+	};
+	return walk(body, 0);
+}
+
+/**
+ * The keys under which a structure body carries a BAG OF FIELD VALUES rather than
+ * structure. Apex's page permit spells `fields_data` as `property_set_attributes.info`
+ * (`ContentLibrary::Entity` reads its `fields_data` out of `property_set.info_object.rows`),
+ * so both names address the same thing and both are measured entry by entry.
+ */
+const FIELD_VALUE_BAGS = new Set(['fields_data', 'info']);
+
+/**
+ * The caller-supplied VALUES inside a structure body, flattened to `path -> value` so
+ * that the two refusals every other write path already runs can run here too.
+ *
+ * WHY THIS EXISTS. `blocks_attributes` is `z.array(jsonRecord)` — a deliberate
+ * passthrough for the Apex-shaped tree, which is walked twice already (for
+ * review-only keys, and for id ownership) and both of those walks are about KEYS.
+ * Nothing looked at the values, so this was the one write path in the BFF with no
+ * ceiling and no URL judge: `patch-entity-fields`, `create-entity`, `create-record`,
+ * `update-record`, `create-post`, `update-post-archetype` and `save-post-body` all
+ * run both, and this one ran neither.
+ *
+ * MEASURED THE SAME WAY THE SIBLINGS MEASURE, deliberately, so this route is not held
+ * to a tighter rule than the rest of the boundary. A field bag is measured ENTRY BY
+ * ENTRY — a structured field value (a Quill delta, a rich-text envelope) is measured
+ * whole, exactly as `patch-entity-fields` measures one `fields_data` entry — and every
+ * other string leaf is measured on its own. The whole block is NOT measured as one
+ * value: that would be a ceiling no other path imposes, and a legitimately long page
+ * would trip it.
+ *
+ * Keyed by PATH (`blocks_attributes[3].blockable_attributes.content_html`) because the
+ * refusals name the field they refuse, and "content_html" alone would send an editor
+ * bisecting a 200-block page to find which one.
+ */
+export function structureValueFields(body: unknown): Record<string, unknown> {
+	const values: Record<string, unknown> = {};
+	const walk = (value: unknown, path: string, depth: number) => {
+		if (depth > 32) return;
+		// A string is a value wherever it sits — INCLUDING inside an array. An earlier
+		// draft of this walk descended into arrays but only recorded strings found as
+		// object properties, so `group_member_template_instance_ids: [<200k chars>]`
+		// measured nothing at all.
+		if (typeof value === 'string') {
+			values[path] = value;
+			return;
+		}
+		if (value === null || typeof value !== 'object') return;
+		if (Array.isArray(value)) {
+			value.forEach((item, index) => walk(item, `${path}[${index}]`, depth + 1));
+			return;
+		}
+		for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+			const here = path ? `${path}.${key}` : key;
+			if (
+				FIELD_VALUE_BAGS.has(key) &&
+				nested &&
+				typeof nested === 'object' &&
+				!Array.isArray(nested)
+			) {
+				for (const [name, fieldValue] of Object.entries(nested as Record<string, unknown>)) {
+					values[`${here}.${name}`] = fieldValue;
+				}
+				continue;
+			}
+			walk(nested, here, depth + 1);
+		}
+	};
+	walk(body, '', 0);
+	return values;
+}
+
+/** Does this slug sit under the `__` prefix that is reserved from public routing? */
+function isChromeSlug(slug: string): boolean {
+	return normalizeSlugPath(slug).slice(1).startsWith(RESERVED_SLUG_PREFIX);
+}
+
+/**
+ * The blank-slug rule, on its own because it earns its own response code.
+ *
+ * `''` and `'   '` are what an editor produces by CLEARING the Slug field — an
+ * ordinary thing to do in a text input that no site marks `required`. It is not a
+ * rename onto the home page, however it normalizes: Rails would read it as an
+ * instruction to regenerate the slug from the title, so what gets stored is a
+ * string nothing in this file ever measured. It is refused before the rename
+ * question is even asked, and it is refused as `400 invalid-slug` rather than
+ * `400 reserved-slug` so the editor is told what is actually wrong — the address
+ * is missing, not taken.
+ *
+ * `refuseRenamedSlug` calls this first, so the rule holds for every caller of the
+ * rule; `handleSavePageStructure` calls it separately, so the refusal keeps its
+ * own code.
+ *
+ * @returns the reason to refuse, or `null` when the slug is not blank.
+ */
+export function refuseBlankSlug(incomingSlug: string | undefined): string | null {
+	if (incomingSlug === undefined) return null;
+	if (incomingSlug.trim() !== '') return null;
+	return 'A page needs an address — the slug cannot be empty.';
+}
+
+/**
+ * K41 / K67 — THE RESERVED-SLUG GUARD ON A RENAME.
+ *
+ * `create-page.ts` refuses a slug the site reserves; this route did not, and the
+ * page editor's Details tab writes the slug THROUGH THIS ROUTE. Measured
+ * 2026-09-09 and again live 2026-09-10: `create` refused `team-members`,
+ * `/team-members`, `practice-areas`, `admin/x` and `About-Us`; the structure save
+ * accepted every one of them, plus a rename onto `__footer`. A SvelteKit
+ * filesystem route outranks `[[slug]]`, so the renamed page then renders NOTHING,
+ * forever, with nothing saying why — and a page renamed onto `__footer` becomes
+ * the site's footer while vanishing from its own address and from the Pages list.
+ *
+ * THE COMPARISON IS AGAINST THE STORED SLUG, AND IT IS RAW. A structure save
+ * re-sends the page's current slug on every reorder/add/remove, and Poovayya
+ * production has a legitimate CMS page at `/team-members` — a path the site now
+ * reserves. Validating the slug on every save would make that page unsaveable.
+ * So an UNCHANGED slug is not checked at all: an existing page at a now-reserved
+ * address keeps working until someone tries to MOVE it. The compare is on the
+ * exact stored string rather than the normalized path, because a normalized
+ * compare would let `/team-members` through as "unchanged" and then store a
+ * different string than the one that was measured safe.
+ *
+ * TWO RULES ARE EXTRA, AND NEITHER IS IN `getPageSlugValidationError`, because
+ * that function answers "may this slug be CREATED?" and a rename is a different
+ * question — the page already exists somewhere, and the move is what costs.
+ *
+ * THE `__` RULE. `getPageSlugValidationError` deliberately returns '' for a `__`
+ * slug: they are reserved from public ROUTING, not from being created, and the
+ * chrome singletons (`ensureFixedPage`) depend on being creatable. A RENAME is
+ * refused in BOTH directions, and on the NORMALIZED path (so `/__header` and
+ * `__Header` are chrome too, which is how `isCmsPageRoutable` and `chromePage`
+ * will read them downstream):
+ *   - a page stored under `__` cannot be renamed to ANY other slug. `__header` →
+ *     `__footer` leaves the site with no header and two footers; `__header` →
+ *     `about-the-firm` publishes the header's own blocks at a public address and
+ *     drops the navigation. Neither is a thing an editor means to do, and no UI
+ *     on any of the three sites offers it (the chrome editor sends no slug).
+ *   - a page NOT stored under `__` cannot be renamed onto it — it would become
+ *     the site's chrome while vanishing from its own address and the Pages list.
+ * A chrome page reordering its own blocks re-sends its own slug and returns at
+ * the raw-equality line above, so the rule never blocks an ordinary save.
+ *
+ * THE ROOT RULE, AND IT IS SYMMETRIC — the same shape as the `__` rule above,
+ * for the same reason. `getPageSlugValidationError` returns '' for `/` on purpose
+ * — "the home page", which is right for CREATE, where Apex's duplicate-slug 422
+ * protects the one that exists. It is wrong for a RENAME, in both directions:
+ *   - ONTO the root: `''`, `/`, `//` and `///` all normalize to the home key, so
+ *     a rename onto any of them puts a SECOND page on the site's front door
+ *     (`_pageSlugKey` collapses them and the lookup takes whichever row Apex
+ *     lists first).
+ *   - AWAY FROM the root: Poovayya's home page IS a CMS page stored at `/`, and
+ *     its `[[slug]]` loader finds it by looking for the page whose normalized key
+ *     is empty. `/` → `about-the-firm` leaves that lookup with nothing and the
+ *     site's front door answers 404. A root RESPELLING (`/` → `//`) is no safer:
+ *     it stays routable but fails the raw `page.slug === '/'` checks the loader
+ *     makes downstream. Neither is a thing an editor means by "rename a page",
+ *     and no site has a second page to promote into the gap.
+ * BOTH SIDES ARE NORMALIZED for this test and for the `__` test — and only for
+ * those two — so the home page stored as `/` keeps REORDERING (it re-sends its
+ * own slug and returns at the raw-equality line above) while every actual move,
+ * in either direction, is refused.
+ *
+ * THE BLANK RULE, checked FIRST — before even the raw-equality reorder, because a
+ * blank slug is not a no-op to re-send. Rails reads a blank slug as an
+ * INSTRUCTION (`before_validation :generate_slug, if: proc { slug.blank? }`) and
+ * derives one from the title, unvalidated, past every check in this file. The body
+ * schema used to refuse `''` outright as `invalid body`, which is true but
+ * useless: the browser mapper turned it into "Saving the page layout failed. Save
+ * again to retry." — about the layout, not the address, advising a retry that can
+ * never succeed, for what an editor produces by clearing the Slug field. The
+ * schema now ACCEPTS a blank string by shape so this rule can refuse it by NAME,
+ * as `400 invalid-slug`; `refuseBlankSlug` is the rule, and the handler calls it
+ * separately only to give that refusal its own code.
+ *
+ * Throws (from `getPageSlugValidationError`) when the site never bound its
+ * reserved routes — the caller turns that into the same fail-closed 500
+ * `create-page.ts` answers, because nothing here can say whether the slug is safe
+ * and a page that silently never renders is the worse answer.
+ *
+ * @returns the reason to refuse, or `null` when the save may proceed.
+ */
+export function refuseRenamedSlug(
+	storedSlug: unknown,
+	incomingSlug: string | undefined
+): string | null {
+	if (incomingSlug === undefined) return null;
+	// Blank FIRST — see the docblock. Not a rename question at all: Rails reads a
+	// blank slug as an instruction to derive one from the title, so it is refused
+	// even when the stored slug is blank too and the raw compare below would call
+	// it a no-op.
+	const blank = refuseBlankSlug(incomingSlug);
+	if (blank) return blank;
+	// Not a rename: the editor sent back what is already stored. RAW, and only
+	// here — see the docblock. The normalized compares below are the two equality
+	// tests that must agree with how the renderer reads a slug, not with how it
+	// was spelled.
+	if (typeof storedSlug === 'string' && incomingSlug === storedSlug) return null;
+
+	const stored = typeof storedSlug === 'string' ? storedSlug : undefined;
+
+	// The chrome, both ways. A page that lives there cannot leave; a page that
+	// does not cannot arrive.
+	if (stored !== undefined && isChromeSlug(stored)) {
+		return `"${normalizeSlugPath(stored)}" is the site's own chrome — it cannot be renamed.`;
+	}
+	if (isChromeSlug(incomingSlug)) {
+		return `"${normalizeSlugPath(incomingSlug)}" is reserved for the site's own chrome — an existing page cannot be renamed onto it.`;
+	}
+
+	// The home page, both ways. A page that lives there cannot leave; a page that
+	// does not cannot arrive. The root page's own REORDER returned at the
+	// raw-equality line above, so this never blocks an ordinary save.
+	//
+	// A stored slug Apex did not return is `null` here, NOT `/` —
+	// `normalizeSlugPath(undefined)` is `/`, and reading it that way would both
+	// fail OPEN on the move onto the root (the case the rest of this function
+	// fails closed on) and fail CLOSED on every other rename, freezing every page
+	// whose slug Apex omitted.
+	const storedPath = stored === undefined ? null : normalizeSlugPath(stored);
+	if (storedPath === '/') {
+		return '"/" is the site\'s home page — it cannot be renamed.';
+	}
+	if (normalizeSlugPath(incomingSlug) === '/') {
+		return '"/" is the site\'s home page — an existing page cannot be renamed onto it.';
+	}
+
+	// The same guard `create-page.ts` runs, on the same function, so the two paths
+	// cannot drift: reserved prefixes, the site's generated trees and exact routes,
+	// and the lowercase-hyphen path grammar that refuses `About-Us`.
+	const reserved = getPageSlugValidationError(incomingSlug);
+	if (reserved) return reserved;
+
+	return null;
+}
 
 export const savePageStructureBodySchema = z
 	.object({
 		title: z.string().max(300).optional(),
+		// BLANK OR A SLUG, nothing in between. An empty slug is not a slug — Rails
+		// reads it as an INSTRUCTION (`before_validation :generate_slug, if: proc {
+		// slug.blank? }`) and derives one from the title, unvalidated, past every
+		// check in this file — but refusing it HERE answers `400 invalid body`, which
+		// the browser mapper can only report as "Saving the page layout failed. Save
+		// again to retry.": a permanent failure dressed as a transient one, for what
+		// an editor does by clearing the Slug field. So the shape admits a blank
+		// string and `refuseBlankSlug` refuses it by name as `400 invalid-slug`. The
+		// charset half still bites: a slug with a space or a `?` in it is a shape
+		// error, not an address the editor can be told how to fix.
 		slug: z
 			.string()
 			.max(300)
-			.regex(/^[a-z0-9/_-]*$/iu)
+			.regex(/^\s*$|^[a-z0-9/_-]+$/iu)
 			.optional(),
 		summary: z.string().max(5000).optional(),
 		blocks_attributes: z.array(jsonRecord).max(200).optional(),
 		meta_properties_attributes: z.array(jsonRecord).max(50).optional()
 	})
 	.strict();
-
-function unwrapPage(body: unknown): Record<string, unknown> | null {
-	if (body && typeof body === 'object') {
-		const maybe = body as { data?: unknown };
-		if (maybe.data && typeof maybe.data === 'object') return maybe.data as Record<string, unknown>;
-		if ('id' in (body as object)) return body as Record<string, unknown>;
-	}
-	return null;
-}
 
 export async function handleSavePageStructure(
 	request: Request,
@@ -56,37 +374,138 @@ export async function handleSavePageStructure(
 	const meta = {
 		action: 'pages.structure.save',
 		method: 'PATCH',
-		path: `/api/admin/pages/${params.pageId}/structure`,
-		pageId: params.pageId,
+		// The route TEMPLATE, not the request's own path. `reject.ts` states the rule
+		// and `postRouteMeta` already follows it: a route parameter is
+		// attacker-controlled until validated, and this meta is built BEFORE the
+		// validation, so interpolating it would write an arbitrary caller string into
+		// the audit table's `path` on every refused request. The validated values go
+		// in `detail`.
+		path: '/api/admin/pages/[pageId]/structure',
+		// NO `pageId` HERE. `auditRejection` writes it to its own indexed column, and
+		// this meta is built before `pageIdSchema` runs — so an unvalidated route
+		// parameter reached that column on every guard failure. It is added below, once
+		// there is a validated id to add.
 		requestId: request.headers.get('cf-ray')
 	};
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 
 	const actorMeta = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 
 	const idResult = pageIdSchema.safeParse(params.pageId);
 	if (!idResult.success)
 		return rejectMutation(ctx, actorMeta, 400, 'invalid page id', 'invalid page id');
+	// From here the id HAS been validated, so it may go in the column it belongs in.
+	const validMeta = { ...actorMeta, pageId: idResult.data };
 
 	let bodyJson: unknown;
 	try {
 		bodyJson = await request.json();
 	} catch {
-		return rejectMutation(ctx, actorMeta, 400, 'invalid json', 'invalid json');
+		return rejectMutation(ctx, validMeta, 400, 'invalid json', 'invalid json');
 	}
 
-	if (containsReviewOnlyField(bodyJson)) {
-		return rejectMutation(ctx, actorMeta, 400, 'field not allowed', 'review-only field');
+	if (containsReviewOnlyField(bodyJson, ctx.reviewOnlyFields)) {
+		return rejectMutation(ctx, validMeta, 400, 'field not allowed', 'review-only field');
 	}
 
 	const parsed = savePageStructureBodySchema.safeParse(bodyJson);
-	if (!parsed.success) return rejectMutation(ctx, actorMeta, 400, 'invalid body', 'invalid body');
+	if (!parsed.success) return rejectMutation(ctx, validMeta, 400, 'invalid body', 'invalid body');
+
+	// The same two rules `patch-entity-fields.ts:109-115` runs, in the same place —
+	// after the schema, before any Apex round-trip. Both name the offending field
+	// rather than collapsing into `invalid body`, because an editor who pasted a
+	// document into one of a page's blocks should not find it by bisection.
+	//
+	// The ceiling is the half that bites today. `MAX_FIELD_VALUE_CHARS`'s own docblock
+	// calls it "a MECHANIC, not a screen's preference", and describes this route
+	// exactly: without one, a single authenticated POST pushes an unbounded string
+	// through the BFF into Apex and into the published snapshot — where `publishContent`
+	// then refuses the whole snapshot as `too_large`, blocking publishing SITE-WIDE for
+	// every collection, with nothing pointing at the block that caused it.
+	const structureValues = structureValueFields(parsed.data);
+	const tooLarge = await refuseOversizedFields(ctx, validMeta, structureValues);
+	if (tooLarge) return tooLarge;
+	const unreadable = await refuseUnreadableUrls(ctx, validMeta, structureValues);
+	if (unreadable) return unreadable;
+
+	// Ownership: every id the body names must be in the addressed page's tree, read
+	// FRESH here (never from the body). Anything else is refused before the PATCH,
+	// with zero writes — see `findForeignId` for what Rails would otherwise permit.
+	const current = await guard.apex.getPage(idResult.data);
+	if (!current.ok) {
+		return noStoreJson({ error: 'upstream error', status: current.status }, 502);
+	}
+	const currentPage = unwrapArchetypeRecord(current.body);
+	if (!currentPage) return noStoreJson({ error: 'upstream error' }, 502);
+	const owned = collectPageIds(currentPage);
+	owned.add(idResult.data);
+	const foreign = findForeignId(parsed.data, owned);
+	if (foreign) {
+		return rejectMutation(
+			ctx,
+			{ ...validMeta, detail: { key: foreign.key } },
+			400,
+			'block not on this page',
+			'foreign id'
+		);
+	}
+
+	// K41 / K67 — the reserved-slug guard, on a RENAME only, against the slug Apex
+	// just returned. It sits here and not with the other body checks because it is
+	// the only one that needs the STORED value; see `refuseRenamedSlug`. Refused
+	// before the PATCH, so nothing is written.
+	// The blank half of the same rule, called here only to give it its own code:
+	// `invalid-slug`, not `reserved-slug`, because the address is missing rather
+	// than taken and the editor needs a different sentence. `refuseRenamedSlug`
+	// checks it too, so the rule is complete for every other caller.
+	const blankSlug = refuseBlankSlug(parsed.data.slug);
+	if (blankSlug) return rejectMutation(ctx, validMeta, 400, 'invalid-slug', blankSlug);
+
+	let slugRefusal: string | null;
+	try {
+		slugRefusal = refuseRenamedSlug(currentPage.slug, parsed.data.slug);
+	} catch {
+		// The site never bound its reserved routes — the same fail-closed answer
+		// `create-page.ts` gives, for the same reason.
+		return bffError(500, 'reserved routes not bound');
+	}
+	if (slugRefusal) {
+		return rejectMutation(ctx, validMeta, 400, 'reserved-slug', slugRefusal);
+	}
+
+	// The third rule the siblings run, and the last one this path was missing.
+	// `sanitizeFieldValue` is the SAME call `patch-entity-fields.ts:119` makes over one
+	// entity's `fields_data`; here it walks the block tree, which carries field bags of
+	// its own (`entities_attributes[].property_set_attributes.info` IS `fields_data`)
+	// plus `blockable_attributes.content_html`, the raw HTML column on
+	// `Cms::PageBlock::RichText`.
+	//
+	// It is `sanitizeWriteHtml` underneath, NOT the render allowlist: it removes
+	// executable elements and dangerous attributes and leaves everything else exactly
+	// as the editor wrote it. A string with no `<` in it is returned by reference, so
+	// ids, slugs and positions are untouched — the identity contract that file
+	// documents holds for the whole tree.
+	//
+	// Not an XSS fix. `content_html` is sanitized again at projection by GLC and
+	// Poovayya, and Godrej's loader never renders it. This is the write boundary doing
+	// at the boundary what three sites currently each do downstream.
+	const sanitizedBody = {
+		...parsed.data,
+		...(parsed.data.blocks_attributes
+			? { blocks_attributes: sanitizeFieldValue(parsed.data.blocks_attributes) }
+			: {}),
+		...(parsed.data.meta_properties_attributes
+			? {
+					meta_properties_attributes: sanitizeFieldValue(parsed.data.meta_properties_attributes)
+				}
+			: {})
+	};
 
 	const apexResponse = await guard.apex.updatePageStructure(
 		idResult.data,
-		parsed.data as PageStructureBody
+		sanitizedBody as PageStructureBody
 	);
 	const outcome = apexResponse.ok ? 'accepted' : 'apex_error';
 
@@ -118,7 +537,15 @@ export async function handleSavePageStructure(
 
 	// Return the fresh page + its new version so `savePage()` re-baselines the stale
 	// guard and reconciles temp-id blocks to their server ids in one round-trip.
-	const page = unwrapPage(apexResponse.body);
+	//
+	// A malformed envelope here answers 200 with `page: null`, NOT 502 — unlike
+	// `get-page` and `preview-page`, which do 502 on the same shape. The difference is
+	// deliberate: by this line the PATCH has already landed upstream, so a 502 would
+	// tell the editor a completed write failed and `savePage()` would retry it. Null
+	// is the honest answer, and `save-page.js` is written for it — it falls back to a
+	// fresh `getPage()` and, if that fails too, returns `{ ok: true, refreshed: false }`
+	// so the UI can prompt a reload. Do not "fix" this into a 502.
+	const page = unwrapArchetypeRecord(apexResponse.body);
 	const version = page ? await computePageVersion(page) : null;
 	return noStoreJson({ ok: true, page, version });
 }

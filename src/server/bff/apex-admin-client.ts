@@ -17,6 +17,58 @@ export interface ApexAdminClientOptions {
 	 * content-library methods. Omitted: no narrowing (GLC's behaviour today).
 	 */
 	allowedSchemaSlugs?: readonly string[];
+	/**
+	 * The POST archetype schema slugs this site may address through the post
+	 * methods (`listPosts`, `listPostArchetypes`, `getPostArchetype`, `createPost`,
+	 * `updatePostArchetype`, `deletePost`) and, by extension, `updatePostFields`.
+	 *
+	 * A SEPARATE allowlist from `allowedSchemaSlugs`, deliberately: a post's own
+	 * fields must never be written on the content-library surface (its slug 422s
+	 * there — `Slug has already been taken`), and a content-library record has no
+	 * `Cms::Post` to write. The two sets are disjoint by construction, and a site
+	 * that lists a slug in both has made a mistake this option cannot express.
+	 *
+	 * Omitted or empty: EVERY post method refuses. A site opts in by naming its
+	 * post schemas; GLC, which has its own article methods, names none.
+	 */
+	allowedPostSlugs?: readonly string[];
+	/**
+	 * The content-library ENTITY TYPES this site may CREATE entities of.
+	 *
+	 * A third allowlist, and it follows `allowedPostSlugs`' REFUSE-WHEN-ABSENT shape,
+	 * not `allowedSchemaSlugs`' allow-when-absent one. That difference is the whole
+	 * security property of `createEntity`: this is a general-purpose writer into the
+	 * content library, and a site that has not said which types it mints must not have
+	 * one. Godrej and GLC name none and cannot reach the method at all — their entities
+	 * are created by the page structure, and neither has an `array_ref` field.
+	 *
+	 * Poovayya derives its list from `childListFields()` across `CONTENT_LIBRARY_SLUGS`
+	 * — the child types its record screens can add a row to, and nothing else.
+	 *
+	 * A type is a uuid or a slug (`entity_types/:id_or_slug`); the list holds whichever
+	 * spelling the site's screens use, and the comparison is exact.
+	 */
+	allowedEntityTypes?: readonly string[];
+}
+
+/**
+ * The fetch to Apex failed before any answer — DNS, TLS, a reset, a refused
+ * connection.
+ *
+ * It exists so a CALLER can tell that apart from every other throw this client can
+ * make, and the distinction is not cosmetic. `contentLibrarySlug`, `postSlug` and
+ * `assertUuid` all throw too; an operation that wraps a client call in `try/catch`
+ * and records "Apex never answered" for every one of them writes a fiction into the
+ * audit row. The runtime's own error is kept as `cause`.
+ *
+ * Only the signal-less path throws this: a call carrying an abort signal gets the
+ * typed `{status: 0, networkError: true}` response instead (see `call`).
+ */
+export class ApexTransportError extends Error {
+	constructor(cause: unknown) {
+		super('the Apex request failed before any answer', { cause });
+		this.name = 'ApexTransportError';
+	}
 }
 
 export interface ApexResponse {
@@ -24,15 +76,21 @@ export interface ApexResponse {
 	ok: boolean;
 	body: unknown;
 	/**
-	 * True only when the shared deadline aborted this call (status is 0). A typed
-	 * failure, not an exception, so a route maps it to its own error code without
-	 * a try/catch at every call site. Absent on every non-aborted response.
+	 * True only when the shared deadline aborted this call. A typed failure, not an
+	 * exception, so a route maps it to its own error code without a try/catch at
+	 * every call site. Absent on every non-aborted response.
+	 *
+	 * `status` is 0 when the abort landed before any response arrived; it is the
+	 * REAL HTTP STATUS when the response arrived and the abort interrupted the body
+	 * stream. `ok` is false either way — a body we could not finish reading is not a
+	 * success, whatever the status line said.
 	 */
 	aborted?: boolean;
 	/**
 	 * True when the fetch itself failed (DNS, TLS, reset) on a signal-carrying
-	 * call (status is 0). Same typed-failure discipline as `aborted`; callers
-	 * without a signal see the exception instead, unchanged.
+	 * call. Same typed-failure discipline as `aborted`; callers without a signal see
+	 * the exception instead, unchanged. `status` follows the same rule as `aborted`:
+	 * 0 before a response, the real status when the BODY stream failed.
 	 */
 	networkError?: boolean;
 }
@@ -118,6 +176,24 @@ export interface SignedUploadFile {
 	checksum: string;
 }
 
+/**
+ * The `Cms::Post` half of a post — the ONLY surface its own fields may be written
+ * on (`PATCH /cms/posts/:id`). Exactly what `posts_controller#permitted_params`
+ * permits, read 2026-09-05: the four columns, the SEO rows and the shared gallery
+ * items (the cover). Both nested lists are `accepts_nested_attributes_for` with
+ * ordinary Rails semantics — an entry WITHOUT an id creates a second row, an entry
+ * with one updates it, `_destroy` removes it — so the operations build them from
+ * ids Apex already gave back, never from the browser.
+ */
+export interface PostFields {
+	title?: string;
+	slug?: string;
+	summary?: string;
+	published_date?: string;
+	meta_properties_attributes?: unknown[];
+	shared_gallery_items_attributes?: unknown[];
+}
+
 /** The `Cms::GalleryItem` fields the images screen may write (probe G3). */
 export interface GalleryItemFields {
 	caption?: string;
@@ -126,18 +202,42 @@ export interface GalleryItemFields {
 }
 
 /**
- * Read the record out of an Apex envelope: `{ data: {...} }`, or the object
- * itself when Apex answered flat. Lived in `operations/media.ts` while it was
- * the only caller; `operations/ingest-audio.ts` is the second use, so it moves
- * here — one reader, so the two cannot drift about what an Apex body is.
+ * An entity TYPE, which Apex addresses by uuid OR by slug.
+ *
+ * `content_library/entities_controller.rb:10-11` resolves `:entity_type_id` with
+ * `where(id: …).or(where(slug: …))`, so both are legal upstream — and one of the two
+ * sites on this kit has no entity-type uuids to give: Poovayya's `array_ref`
+ * validator names the child type by SLUG (`array_ref/entity-type/quote-item`) and its
+ * committed contract carries no ids at all. A uuid-only check here would have made
+ * the kit's entity write unreachable from that site.
+ *
+ * Still a closed shape, not a free string: the same alphabet a slug or a uuid can be
+ * spelled in, so nothing carrying a path separator, a dot segment or a
+ * percent-encoding reaches the URL.
  */
-export function unwrapData(body: unknown): Record<string, unknown> | null {
-	if (body && typeof body === 'object') {
-		const maybe = body as { data?: unknown };
-		if (maybe.data && typeof maybe.data === 'object') return maybe.data as Record<string, unknown>;
-		if ('id' in (body as object)) return body as Record<string, unknown>;
-	}
-	return null;
+/**
+ * THE one entity-type-ref shape, exported so the ROUTES parse with it too.
+ *
+ * NO `i` FLAG, and the reason is not style. Under `iu`, unicode case folding puts
+ * U+212A (KELVIN SIGN) and U+017F (LATIN SMALL LETTER LONG S) inside `[a-z]`, so two
+ * characters that are not ASCII at all satisfy a check whose whole job is "ASCII slug
+ * alphabet". Both a slug and a uuid are lower case everywhere Apex mints them, so
+ * nothing legitimate needed the flag, and a shape check that accepts what it says it
+ * refuses is the wrong thing to leave behind (P4 review, finding 4 — recorded on
+ * `assertSchemaItemSlug` until the items endpoint it guarded was deleted).
+ *
+ * It is exported because the two operations that take an entity type had SPELLED
+ * THEIR OWN, with the `i` — so `entity_types/K` (KELVIN SIGN, which unicode case
+ * folding puts inside `[a-z]`) and `Quote-Item` passed route validation and were then
+ * REFUSED BY THIS CLIENT with a thrown `Error`. A throw out of an operation is a
+ * framework 500 with no audit row, where the route's own refusal would have been an
+ * audited 400. The route and the client disagreeing about what is valid is not a
+ * thing to fix twice (codex's P5 fix review, 2026-09-08).
+ */
+export const ENTITY_TYPE_REF = /^[0-9a-z][0-9a-z-]{0,119}$/u;
+
+export function assertEntityTypeRef(ref: string): void {
+	if (!ENTITY_TYPE_REF.test(ref)) throw new Error('invalid entity type');
 }
 
 export function assertUuid(id: string): void {
@@ -173,16 +273,63 @@ export interface PageStructureBody {
 	meta_properties_attributes?: unknown[];
 }
 
+/** What `POST /cms/pages` takes — the three columns the pages controller permits on a create. */
+export interface PageCreateBody {
+	title: string;
+	slug: string;
+	summary?: string;
+}
+
 export interface ApexAdminClient {
 	listPages(query: Record<string, string | number>): Promise<ApexResponse>;
 	listPageBlockTemplates(): Promise<ApexResponse>;
 	getPage(pageId: string): Promise<ApexResponse>;
+	/**
+	 * Mint a page (plan 04, G3). Measured 2026-09-05: one POST creates a `draft`
+	 * page with its `web` SEO triple and no blocks; a duplicate slug is a 422; and
+	 * Apex ACCEPTS a slug the site reserves (`/admin`), so the operation above
+	 * this refuses those itself.
+	 */
+	createPage(body: PageCreateBody): Promise<ApexResponse>;
 	updatePageStructure(pageId: string, body: PageStructureBody): Promise<ApexResponse>;
 	updateEntityFields(
 		entityTypeId: string,
 		entityId: string,
 		fieldsData: Record<string, unknown>
 	): Promise<ApexResponse>;
+	/**
+	 * May this client create entities of `entityType`? The BOOLEAN half of
+	 * `allowedEntityTypes`, so an operation can answer 404 for a type this site does
+	 * not mint instead of catching the throw `createEntity` raises on the same input.
+	 * Two spellings of one rule, reading the same option.
+	 */
+	allowsEntityType(entityType: string): boolean;
+	/**
+	 * Mint ONE content-library entity, returning Apex's `{data: {id, fields_data}}`.
+	 *
+	 * `POST /content_library/entity_types/:ref/entities` — the SAME endpoint
+	 * `updateEntityFields` PATCHes, and deliberately not `entity_models`: one
+	 * `permitted_params` on `entities_controller` serves create and update
+	 * (`:113-115`), arrays are permitted for `text_array` / `number_array` /
+	 * `array_ref/*` on both (`entity_data_model.rb:32-50`), and `entity_models` takes a
+	 * FLAT payload with different unknown-key behaviour and a different creation path.
+	 *
+	 * WHY THIS EXISTS. An `array_ref` field's value is a list of ids of entities that
+	 * ALREADY EXIST — the validator resolves each element against
+	 * `ContentLibrary::Entity` and errors if the row is absent
+	 * (`content_library/property_set_form_helper.rb:143`). There is no create-on-write,
+	 * so a row an editor just added by pressing "+ Add item" has no id, and putting it
+	 * in the parent's array is a validation error rather than an insert. The child is
+	 * created first, its id adopted, and only then does the parent's array mention it.
+	 *
+	 * THERE IS NO DELETE COUNTERPART, deliberately. Removing an array reference drops
+	 * the id from the parent's list and leaves the child entity in place, because that
+	 * is what removing a reference IS; the cost is that removed-and-never-re-added
+	 * children accumulate unreferenced. That is the correct trade for not destroying
+	 * data on a mis-click, and deletion is the top-level `content_library/entities/:id`
+	 * — a separate, deliberate act.
+	 */
+	createEntity(entityType: string, fieldsData: Record<string, unknown>): Promise<ApexResponse>;
 	changePageStatus(pageId: string, statusEvent: PageStatusEvent): Promise<ApexResponse>;
 	createGalleryItem(galleryId: string, caption: string, alt: string): Promise<ApexResponse>;
 	createSignedUploadUrl(file: SignedUploadFile): Promise<ApexResponse>;
@@ -225,19 +372,109 @@ export interface ApexAdminClient {
 		fields: ContentLibraryFields,
 		references?: Record<string, HasManyEntry[] | string | null>
 	): Promise<ApexResponse>;
+	/**
+	 * `position` is the archetype's own ordering COLUMN and travels at the root of
+	 * the body beside the field names, which is where Apex permits it. It is a
+	 * separate parameter rather than a key in `fields` because `ContentLibraryFields`
+	 * forbids `null` — correctly, for primitives — and `null` on this column is the
+	 * legitimate "unset". `undefined` means "not part of this write".
+	 *
+	 * ── THIS METHOD DOES NOT CARRY THE PARTIAL-WRITE GUARD ───────────────────
+	 * A direct caller needs to know it, which is why this sits above the signature
+	 * rather than below it. `handleUpdateRecord` reads the record first and refuses a
+	 * partial field write to one whose `primitives` no `archetype_item` accounts for,
+	 * because on such a record the upstream rebuild deletes every unsent field. A
+	 * caller that reaches this method directly — GLC's `handleUpdateAuthor`,
+	 * `handleUpdateResource` and `handlePutIngestResource` all do — does not get it.
+	 * Nor does such a caller get the KIND-AWARE ARRAY REFUSAL, which lives in
+	 * `recordBodySchema` and needs a contract this method has no access to: the flat
+	 * surface stores a list only for a single-field Primitive of an array kind and
+	 * reduces every other array to `[]`. The three GLC operations above send
+	 * `z.string()` bodies and cannot express an array at all, so nothing reaches this
+	 * method that the refusal would have caught.
+	 *
+	 * DELIBERATE, and now RULED rather than asserted: plan 07's **P3b** node, "GLC
+	 * exemption, ruled 2026-09-07". The bypass stands because GLC's records are
+	 * created through the API (`seed-content.js`) and so are item-backed from birth,
+	 * and because its operations do not send partial field sets to unbacked records;
+	 * the hazard needs a record whose `primitives` were written directly, which no
+	 * GLC path produces. `ingest-resource.ts` additionally documents a considered
+	 * "write first, never read" design — a failed read cannot tell "deleted" from
+	 * "Apex is down", and reading it as absent creates a duplicate.
+	 *
+	 * MEASURED, not assumed: one paginated GET per GLC content-library schema
+	 * against local Apex, counting records with `primitives` keys and no Primitive
+	 * item row — see the fix-pass-2 entry in plan 07 §10 for the numbers. The
+	 * PRODUCTION count joins the deferred census (plan 07 §0.1); until it is taken,
+	 * this exemption is a decision about a database nobody has looked at.
+	 *
+	 * A caller that DOES need the protection should route through
+	 * `handleUpdateRecord`, or call `unbackedPrimitiveKeys` (`archetype-record.ts`)
+	 * on its own pre-write read; it is exported for that.
+	 */
 	updateContentLibraryRecord(
 		slug: string,
 		id: string,
 		fields: ContentLibraryFields,
-		references?: Record<string, HasManyEntry[] | string | null>
+		references?: Record<string, HasManyEntry[] | string | null>,
+		position?: number | null
 	): Promise<ApexResponse>;
 	deleteContentLibraryRecord(slug: string, id: string): Promise<ApexResponse>;
 	getDocument(documentId: string): Promise<ApexResponse>;
 	updateDocumentBlocks(documentId: string, blocks: unknown[]): Promise<ApexResponse>;
 	changePostStatus(postId: string, statusEvent: PostStatusEvent): Promise<ApexResponse>;
 
+	// ── Posts, schema-scoped (plan 04, G1) ────────────────────────────────────
+	//
+	// A post is THREE records addressed in TWO id spaces, and every method below
+	// says which it takes. The `slug` is checked against `allowedPostSlugs` first
+	// and last: a caller cannot widen the catalogue with its own filter, and a
+	// site that has not opted in cannot reach any of them.
+	//
+	//   archetype id  → `getPostArchetype`, `updatePostArchetype`, `deletePost`
+	//                   (kind, author, focus_area, partner; delete cascades)
+	//   post id       → `updatePostFields`, `changePostStatus`
+	//                   (title, slug, summary, published_date, SEO, cover; status)
+	//   document id   → `getDocument`, `updateDocumentBlocks` (the body)
+
+	/** The `post_archetype_views` for one schema: post fields, `archetype_id`, `document.id`, SEO, cover. */
+	listPosts(slug: string, query?: Record<string, string | number>): Promise<ApexResponse>;
+	/**
+	 * The ARCHETYPES for one post schema, with `archetype_items` and `taggings` —
+	 * the half the views do not carry (the view's `archetype` is stripped of its
+	 * items). One call for the whole list, so a list screen is not N+1, and the
+	 * read the reference count uses.
+	 */
+	listPostArchetypes(slug: string, query?: Record<string, string | number>): Promise<ApexResponse>;
+	getPostArchetype(slug: string, archetypeId: string): Promise<ApexResponse>;
+	/**
+	 * ONE call mints the archetype, its `Cms::Post`, an empty `Cms::Document` and
+	 * any primitive or reference sent beside `target_model_attributes` (measured
+	 * 2026-09-05: `kind` and a `focus_area` has_many both land on create). Apex
+	 * answers with the ARCHETYPE; the post id is its `target_model_id`.
+	 */
+	createPost(
+		slug: string,
+		targetModelAttributes: PostFields,
+		fields?: ContentLibraryFields,
+		references?: Record<string, HasManyEntry[] | string | null>
+	): Promise<ApexResponse>;
+	/** The archetype half: primitives (a story's `kind`) and references, FLAT on `archetype_models`. */
+	updatePostArchetype(
+		slug: string,
+		archetypeId: string,
+		fields: ContentLibraryFields,
+		references?: Record<string, HasManyEntry[] | string | null>
+	): Promise<ApexResponse>;
+	/** The ARCHETYPE id: deleting it cascades to the post and its document. */
+	deletePost(slug: string, archetypeId: string): Promise<ApexResponse>;
+	/** The `Cms::Post` half, by POST id. Refuses unless the client has any post slug enabled. */
+	updatePostFields(postId: string, fields: PostFields): Promise<ApexResponse>;
+
 	listTags(query?: Record<string, string | number>): Promise<ApexResponse>;
 	createTag(name: string): Promise<ApexResponse>;
+	/** Rename a tag. `PATCH /tags/:id` permits exactly `name`; uniqueness is per tenant and case-sensitive, so a collision is a 422. */
+	updateTag(tagId: string, name: string): Promise<ApexResponse>;
 	listTaggings(query?: Record<string, string | number>): Promise<ApexResponse>;
 	createTagging(tagId: string, taggableId: string): Promise<ApexResponse>;
 	deleteTagging(taggingId: string): Promise<ApexResponse>;
@@ -312,6 +549,38 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 		}
 		return encodeURIComponent(slug);
 	}
+	/**
+	 * The post-side twin of `contentLibrarySlug`: a slug the site has not named in
+	 * `allowedPostSlugs` is refused, and with no allowlist at all every post method
+	 * is unreachable. A thrown error rather than a 4xx, because reaching here with
+	 * the wrong slug is a programming error in the caller, not a request to answer.
+	 */
+	function postSlug(slug: string): string {
+		const allowed = options.allowedPostSlugs;
+		if (!allowed || !allowed.includes(slug)) {
+			throw new Error(`not an allowed post archetype schema: ${slug}`);
+		}
+		return encodeURIComponent(slug);
+	}
+	function assertPostsEnabled(): void {
+		if (!options.allowedPostSlugs || options.allowedPostSlugs.length === 0) {
+			throw new Error('post methods are not enabled for this client');
+		}
+	}
+	/**
+	 * The entity-type twin of `postSlug`, and it copies THAT shape rather than
+	 * `contentLibrarySlug`'s: a type the site has not named is refused, and with no
+	 * allowlist at all `createEntity` is unreachable. Getting this backwards would
+	 * ship a general-purpose content-library writer to two sites that pass no list.
+	 */
+	function entityTypeToCreate(entityType: string): string {
+		const allowed = options.allowedEntityTypes;
+		if (!allowed || !allowed.includes(entityType)) {
+			throw new Error(`not an allowed entity type: ${entityType}`);
+		}
+		assertEntityTypeRef(entityType);
+		return encodeURIComponent(entityType);
+	}
 	const fetchImpl = options.fetchImpl ?? globalThis.fetch;
 	if (!options.baseUrl) throw new Error('Apex base URL is not configured');
 	if (!options.token) throw new Error('Apex admin token is not configured');
@@ -358,12 +627,14 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			// connection reset — is a typed failure so the route answers its
 			// contracted 502 {"error":"upstream_error"} and writes its audit row,
 			// instead of leaking a framework 500 with neither. Callers that pass no
-			// signal (the admin) keep today's propagation, so their error handling
-			// is unchanged.
+			// signal (the admin) keep today's PROPAGATION — but the error is wrapped
+			// first, because "the fetch failed" and "this client refused the call" are
+			// different facts and only this frame can tell them apart. See
+			// `ApexTransportError`.
 			if (signal) {
 				return { status: 0, ok: false, body: null, networkError: true };
 			}
-			throw error;
+			throw new ApexTransportError(error);
 		}
 		// A 3xx from Apex is never followed — treat it as a failure rather than
 		// chase a redirect to who-knows-where.
@@ -373,7 +644,44 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 		let body: unknown = null;
 		const contentType = response.headers.get('content-type') ?? '';
 		if (contentType.includes('application/json')) {
-			body = await response.json().catch(() => null);
+			/**
+			 * THE BODY IS READ AND PARSED IN TWO STEPS, and the split is the point.
+			 *
+			 * `await response.json().catch(() => null)` conflated two different facts:
+			 * "Apex sent something that is not JSON" (a shape error — `body: null` is
+			 * the right answer, and the status still means what it says) and "the
+			 * connection died while we were reading the body" (a TRANSPORT failure —
+			 * the response is INCOMPLETE, and answering `ok: true` with `body: null`
+			 * tells the caller the write succeeded and returned nothing). A 2xx over a
+			 * reset body therefore read as success. Found by codex on the P3 fix pass
+			 * (finding 4): it was the one transport shape `ApexTransportError` and the
+			 * typed `networkError` still did not cover.
+			 *
+			 * Reading the text first isolates the stream failure; `JSON.parse` after it
+			 * keeps malformed JSON exactly as it was — a shape error, not a fault.
+			 *
+			 * THE HTTP STATUS IS PRESERVED in the failure shape, unlike the pre-response
+			 * failures above which have none: we know what Apex answered, we only failed
+			 * to read the rest of it, and a caller deciding whether to retry a write
+			 * wants that difference.
+			 */
+			let text: string;
+			try {
+				text = await response.text();
+			} catch (error) {
+				if (signal?.aborted) {
+					return { status: response.status, ok: false, body: null, aborted: true };
+				}
+				if (signal) {
+					return { status: response.status, ok: false, body: null, networkError: true };
+				}
+				throw new ApexTransportError(error);
+			}
+			try {
+				body = JSON.parse(text);
+			} catch {
+				body = null;
+			}
 		}
 		// Note: upstream Set-Cookie is intentionally never read or propagated.
 		return { status: response.status, ok: response.ok, body };
@@ -397,6 +705,19 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			assertUuid(pageId);
 			return call(`${PAGES_BASE}/${encodeURIComponent(pageId)}`, { method: 'GET' });
 		},
+		async createPage(body) {
+			// The keys are named ONE BY ONE rather than spread, so an extra key on the
+			// caller's object can never reach Apex — the operation's schema is `.strict()`
+			// on the same three, so the two ends agree by construction.
+			return call(PAGES_BASE, {
+				method: 'POST',
+				body: JSON.stringify({
+					title: body.title,
+					slug: body.slug,
+					...(body.summary === undefined ? {} : { summary: body.summary })
+				})
+			});
+		},
 		async updatePageStructure(pageId, body) {
 			assertUuid(pageId);
 			return call(`${PAGES_BASE}/${encodeURIComponent(pageId)}`, {
@@ -405,12 +726,24 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			});
 		},
 		async updateEntityFields(entityTypeId, entityId, fieldsData) {
-			assertUuid(entityTypeId);
+			// The TYPE may be a uuid or a slug (see `assertEntityTypeRef`); the ENTITY
+			// is always a uuid.
+			assertEntityTypeRef(entityTypeId);
 			assertUuid(entityId);
 			return call(
 				`${ENTITY_TYPES_BASE}/${encodeURIComponent(entityTypeId)}/entities/${encodeURIComponent(entityId)}`,
 				{ method: 'PATCH', body: JSON.stringify({ fields_data: fieldsData }) }
 			);
+		},
+		allowsEntityType(entityType) {
+			const allowed = options.allowedEntityTypes;
+			return Boolean(allowed && allowed.includes(entityType));
+		},
+		async createEntity(entityType, fieldsData) {
+			return call(`${ENTITY_TYPES_BASE}/${entityTypeToCreate(entityType)}/entities`, {
+				method: 'POST',
+				body: JSON.stringify({ fields_data: fieldsData })
+			});
 		},
 		async changePageStatus(pageId, statusEvent) {
 			assertUuid(pageId);
@@ -510,7 +843,7 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 				body: JSON.stringify({ ...fields, ...references })
 			});
 		},
-		async updateContentLibraryRecord(slug, id, fields, references = {}) {
+		async updateContentLibraryRecord(slug, id, fields, references = {}, position) {
 			assertUuid(id);
 			// FLAT keys on `archetype_models` — the one write of the five that persists
 			// (probes W1–W5). The other four are documented on `updateSermonTranscript`
@@ -519,8 +852,17 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 				`${ARCHETYPE_SCHEMAS_BASE}/${contentLibrarySlug(slug)}/archetype_models/${encodeURIComponent(id)}`,
 				// Reference values ride in the same body under their item name: a `has_one`
 				// is a bare id (or `null` to clear), a `has_many` the all-hash diff array
-				// documented on `HasManyEntry`.
-				{ method: 'PATCH', body: JSON.stringify({ ...fields, ...references }) }
+				// documented on `HasManyEntry`. `position` is the archetype's own column
+				// and rides at the root too — omitted entirely when the caller passed
+				// `undefined`, because sending `null` would CLEAR it.
+				{
+					method: 'PATCH',
+					body: JSON.stringify({
+						...fields,
+						...references,
+						...(position === undefined ? {} : { position })
+					})
+				}
 			);
 		},
 		async deleteContentLibraryRecord(slug, id) {
@@ -580,6 +922,73 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			});
 		},
 
+		// ── Posts, schema-scoped ────────────────────────────────────────────────
+
+		async listPosts(slug, query = {}) {
+			// The schema filter is set HERE and last, so a caller cannot widen the
+			// catalogue — and a post of another schema addressed by `q[id_eq]` simply
+			// finds nothing (measured: a story id through the update filter → 0 rows).
+			return call(
+				`${POST_VIEWS_BASE}/search_and_filter?${searchParams(query, {
+					'q[archetype_schema_slug_eq]': postSlug(slug)
+				})}`,
+				{ method: 'GET' }
+			);
+		},
+		async listPostArchetypes(slug, query = {}) {
+			return call(
+				`${ARCHETYPES_BASE}/search_and_filter?${searchParams(query, {
+					'q[archetype_schema_slug_eq]': postSlug(slug)
+				})}`,
+				{ method: 'GET' }
+			);
+		},
+		async getPostArchetype(slug, archetypeId) {
+			assertUuid(archetypeId);
+			return call(
+				`${ARCHETYPE_SCHEMAS_BASE}/${postSlug(slug)}/archetypes/${encodeURIComponent(archetypeId)}`,
+				{ method: 'GET' }
+			);
+		},
+		async createPost(slug, targetModelAttributes, fields = {}, references = {}) {
+			return call(`${ARCHETYPE_SCHEMAS_BASE}/${postSlug(slug)}/archetype_models`, {
+				method: 'POST',
+				body: JSON.stringify({
+					target_model_attributes: targetModelAttributes,
+					...fields,
+					...references
+				})
+			});
+		},
+		async updatePostArchetype(slug, archetypeId, fields, references = {}) {
+			assertUuid(archetypeId);
+			// FLAT keys on `archetype_models` — the one write that persists (the same
+			// pairing `updateContentLibraryRecord` documents). A has_one is a bare id
+			// or `null`; a has_many is the all-hash diff on `HasManyEntry`.
+			return call(
+				`${ARCHETYPE_SCHEMAS_BASE}/${postSlug(slug)}/archetype_models/${encodeURIComponent(archetypeId)}`,
+				{ method: 'PATCH', body: JSON.stringify({ ...fields, ...references }) }
+			);
+		},
+		async deletePost(slug, archetypeId) {
+			assertUuid(archetypeId);
+			return call(
+				`${ARCHETYPE_SCHEMAS_BASE}/${postSlug(slug)}/archetype_models/${encodeURIComponent(archetypeId)}`,
+				{ method: 'DELETE' }
+			);
+		},
+		async updatePostFields(postId, fields) {
+			assertPostsEnabled();
+			assertUuid(postId);
+			// `Cms::Post` DIRECTLY — routing a post's fields through `archetype_models`
+			// 422s with `Slug has already been taken`, because the service validates a
+			// freshly built post whose slug collides with the post's own.
+			return call(`${POSTS_BASE}/${encodeURIComponent(postId)}`, {
+				method: 'PATCH',
+				body: JSON.stringify(fields)
+			});
+		},
+
 		async listTags(query = {}) {
 			return call(`${TAGS_BASE}/search_and_filter?${searchParams(query)}`, { method: 'GET' });
 		},
@@ -589,6 +998,13 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 			// operation above this treats that 422 as "it already exists, adopt it" —
 			// list-then-create, adopt on 422 — never as an error to show an editor.
 			return call(TAGS_BASE, { method: 'POST', body: JSON.stringify({ name }) });
+		},
+		async updateTag(tagId, name) {
+			assertUuid(tagId);
+			return call(`${TAGS_BASE}/${encodeURIComponent(tagId)}`, {
+				method: 'PATCH',
+				body: JSON.stringify({ name })
+			});
 		},
 		async listTaggings(query = {}) {
 			return call(`${TAGGINGS_BASE}/search_and_filter?${searchParams(query)}`, { method: 'GET' });
@@ -622,13 +1038,32 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 
 		async listGalleryItems(galleryId) {
 			assertUuid(galleryId);
-			return call(
-				`${GALLERY_BASE}/search_and_filter?${searchParams(
-					{ per_page: 500 },
-					{ 'q[gallery_id_eq]': galleryId }
-				)}`,
-				{ method: 'GET' }
-			);
+			// Every page, not the first 500: the membership check that guards every edit
+			// and delete reads this list, and an item past the cap would be refused as
+			// "not found". Pages are merged into one envelope so callers are unchanged.
+			const page = (n: number) =>
+				call(
+					`${GALLERY_BASE}/search_and_filter?${searchParams(
+						{ per_page: 500, page: n },
+						{ 'q[gallery_id_eq]': galleryId }
+					)}`,
+					{ method: 'GET' }
+				);
+			const first = await page(1);
+			if (!first.ok) return first;
+			const body = first.body as { data?: unknown[]; pagination?: { total_pages?: number } } | null;
+			const totalPages = Number(body?.pagination?.total_pages ?? 1);
+			if (!Array.isArray(body?.data) || !(totalPages > 1)) return first;
+			// Typed, not inferred: under a consumer's `noImplicitAny: false` an untyped
+			// `[]` is `never[]`, and the spread below is then a type error in the site.
+			const rest: unknown[] = [];
+			for (let n = 2; n <= totalPages; n += 1) {
+				const next = await page(n);
+				if (!next.ok) return next;
+				const data = (next.body as { data?: unknown[] } | null)?.data;
+				if (Array.isArray(data)) rest.push(...data);
+			}
+			return { ...first, body: { ...body, data: [...body.data, ...rest] } };
 		},
 		async updateGalleryItem(galleryItemId, fields) {
 			assertUuid(galleryItemId);

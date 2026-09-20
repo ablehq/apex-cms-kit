@@ -6,9 +6,19 @@
 //
 // It is shorter than GLC's because a the site content-library record is ONE Apex
 // record. GLC's `saveEntity` also reconciles a resource's tags, and its
-// `saveArticle` sequences three endpoints; neither applies here. What replaces them
-// is a single PATCH that carries the dirty fields AND the reference selections
-// together, so a partially-saved record is not a state this screen can reach.
+// `saveArticle` sequences three endpoints; neither applies here.
+//
+// IT IS ONE PATCH AGAIN. It briefly was not: an array-shaped field could not ride
+// the flat surface (it answered 200 and stored `[]`), so the operation wrote the
+// scalars flat and then each list to its own `archetype_item`, and a failure after
+// the flat write left the record MIXED — which is what `child-list-write-failed`
+// existed to say. `ellipsis-backend` PR #1888 (`fix/archetype-model-array-fields`)
+// makes `archetype_models` permit a list, so the whole record travels in one write
+// and that refusal is gone with the transport that produced it.
+//
+// `fieldsMessage` below still exists, because `unbacked-record` remains: its
+// default "Nothing was changed — Save again to retry" promises something that
+// refusal cannot deliver.
 //
 // The reference DIFF is not computed here. The browser sends the set the editor
 // selected and the BFF diffs it against a read taken in the same request
@@ -23,7 +33,34 @@ import { entityPatch, hasEntityChanges, reconcileEntity } from './entity-draft.j
 export const STALE_MESSAGE =
 	'This was changed somewhere else since you opened it. Reload to get the latest version, then re-apply your changes.';
 
-function fieldsMessage(status) {
+/**
+ * What the editor is told when the record write is refused.
+ *
+ * The default sentence promises TWO things — nothing changed, and a retry will
+ * work — and `unbacked-record` breaks the second one outright: the refusal is a
+ * property of the record, so "Save again" is a loop with no exit.
+ *
+ * The BFF client's `mutate` spreads the response body onto its result, so `code`
+ * and `unbackedFields` are already here; this only has to read them. Every site that
+ * uses this helper — Godrej renders it verbatim in `RecordEditor.svelte` — inherits
+ * the wording from one place.
+ *
+ * @param {number|undefined} status
+ * @param {{code?: string, unbackedFields?: string[]}} [result]
+ */
+function fieldsMessage(status, result = {}) {
+	if (result.code === 'unbacked-record') {
+		// Retrying can NEVER work: the refusal is a property of the record, not of
+		// this request. Telling someone to Save again would loop them forever.
+		const fields = (result.unbackedFields ?? []).join(', ');
+		return (
+			'This record cannot be edited safely: it was imported without the rows a save ' +
+			'rebuilds from, so saving one field would delete the others' +
+			(fields ? ` (${fields})` : '') +
+			'. Nothing was changed. It needs repairing before it can be edited — Save again ' +
+			'will not help.'
+		);
+	}
 	return status === 422
 		? 'A field was rejected (check required values). Fix it and Save again.'
 		: 'Saving failed. Nothing was changed — Save again to retry.';
@@ -32,9 +69,20 @@ function fieldsMessage(status) {
 /**
  * Save one content-library record.
  *
- * @param {object} draft from `createEntityDraft`
- * @param {object} client the ONLY thing that touches the network
- * @returns {Promise<{ok: boolean, stage?: string, status?: number, stale?: boolean, message?: string, refreshed?: boolean}>}
+ * The two parameters were `{object}`, which types nothing — every property read off
+ * them was an error the moment `checkJs` was switched on. They now say what this
+ * function actually touches, and nothing more.
+ *
+ * @typedef {import('./entity-draft.js').EntityDraft} EntityDraftLike
+ * @typedef {{
+ *   readRecordVersion: (slug: string, id: string) => Promise<{ version?: unknown } | null>,
+ *   updateRecord: (slug: string, id: string, patch: unknown) => Promise<any>,
+ *   getRecord: (slug: string, id: string) => Promise<any>
+ * }} EntityClient
+ *
+ * @param {EntityDraftLike} draft from `createEntityDraft`
+ * @param {EntityClient} client the ONLY thing that touches the network
+ * @returns {Promise<{ok: boolean, stage?: string, status?: number, code?: string, retryable?: boolean, stale?: boolean, message?: string, refreshed?: boolean}>}
  */
 export async function saveEntity(draft, client) {
 	const { schemaSlug, entityId } = draft;
@@ -63,7 +111,11 @@ export async function saveEntity(draft, client) {
 				ok: false,
 				stage: 'fields',
 				status: result.status,
-				message: fieldsMessage(result.status)
+				code: result.code,
+				// False for the one refusal a retry can never fix, so a screen can hide
+				// its "Save again" affordance rather than offering a dead end.
+				retryable: result.code !== 'unbacked-record',
+				message: fieldsMessage(result.status, result)
 			};
 		}
 		// The update answers with the whole record, because a reference diff mints new

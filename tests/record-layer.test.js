@@ -2,16 +2,27 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { hasManyDiff, countReferencesTo } from '../src/server/bff/operations/record-shape.ts';
+import {
+	hasManyDiff,
+	countReferencesTo,
+	recordBodySchema,
+	referenceFieldNames,
+	summarizeRecord
+} from '../src/server/bff/operations/record-shape.ts';
+import { containsNullPrimitive } from '../src/server/bff/authorization.ts';
 import { handleDeleteRecord } from '../src/server/bff/operations/delete-record.ts';
 import { handleCreateRecord } from '../src/server/bff/operations/create-record.ts';
+import { handleUpdateRecord } from '../src/server/bff/operations/update-record.ts';
 import { createApexAdminClient } from '../src/server/bff/apex-admin-client.ts';
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
 import { createMemorySessionStore } from './harness/session-store.ts';
+import { createMigratedDatabase } from './harness/d1.ts';
 
 const ORIGIN = 'https://site.test';
 const CSRF = 'csrf-record';
+/** A uuid, because every record operation validates the id shape before using it. */
+const RECORD_ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 
 /**
  * A two-schema content model: `story` (a post, uncountable) and `partner` both point
@@ -28,7 +39,6 @@ const contract = {
 					items: []
 				}
 			: null,
-	schemas: () => ['focus_area', 'partner', 'story'].map((slug) => contract.schema(slug)),
 	isContentLibrarySlug: (slug) => slug === 'focus_area' || slug === 'partner',
 	primitiveFieldDefs: () => [],
 	referenceItems: (slug) =>
@@ -163,7 +173,7 @@ describe('countReferencesTo — fails closed', () => {
 });
 
 describe('DELETE /records/:schema/:id — the in-use refusal', () => {
-	function ctxWith(apex) {
+	function ctxWith(apex, db) {
 		return {
 			allowedOrigins: parseAllowedOrigins(ORIGIN),
 			sessions: createMemorySessionStore(),
@@ -180,6 +190,7 @@ describe('DELETE /records/:schema/:id — the in-use refusal', () => {
 				async revoke() {}
 			},
 			createApexClient: () => apex,
+			db,
 			contract
 		};
 	}
@@ -201,9 +212,15 @@ describe('DELETE /records/:schema/:id — the in-use refusal', () => {
 		});
 		return secret;
 	}
-	function req(session, { confirm = false } = {}) {
+	function req(session, { confirm = false, confirmReferenceCount } = {}) {
+		const query = new URLSearchParams();
+		if (confirm) query.set('confirm', '1');
+		if (confirmReferenceCount !== undefined) {
+			query.set('confirmReferenceCount', String(confirmReferenceCount));
+		}
+		const suffix = query.toString() ? `?${query.toString()}` : '';
 		return new Request(
-			`${ORIGIN}/api/admin/records/focus_area/8f14e45f-ceea-467a-9a3c-3f1a7c9d2b55${confirm ? '?confirm=1' : ''}`,
+			`${ORIGIN}/api/admin/records/focus_area/8f14e45f-ceea-467a-9a3c-3f1a7c9d2b55${suffix}`,
 			{
 				method: 'DELETE',
 				headers: {
@@ -285,6 +302,318 @@ describe('DELETE /records/:schema/:id — the in-use refusal', () => {
 		assert.equal(body.error, 'in-use');
 		assert.equal(body.referenceCount, 1);
 	});
+
+	/**
+	 * THE CONFIRMATION NAMES A NUMBER, AND THE NUMBER IS CHECKED.
+	 *
+	 * `?confirm=1` is a flag, and a flag cannot say WHAT was agreed to. Until
+	 * 2026-09-08 that was the whole guard on the confirmed leg: the count was
+	 * recomputed and then never compared, so a confirmation shown for ONE referrer
+	 * deleted just as happily once a second had appeared — stripping a reference
+	 * nobody was ever shown, with no error from Apex and no undo. The operation's own
+	 * docblock claimed the guarantee; the code did not have it (codex's P5 review).
+	 *
+	 * `deleteContentLibraryRecord` THROWS in the fixtures below wherever the delete
+	 * must not happen, so "it refused" is not something a 409 assertion could fake.
+	 */
+	describe('the confirmed leg must agree with the count that is true NOW', () => {
+		const countableOnly = {
+			...contract,
+			referrersTo: () => ({
+				countable: [{ slug: 'partner', displayName: 'partner', itemName: 'focus_area' }],
+				uncounted: []
+			})
+		};
+		/** An Apex whose focus_area is referenced by exactly `count` partners. */
+		function apexWithReferrers(count, { onDelete } = {}) {
+			return {
+				async listContentLibrary() {
+					return {
+						status: 200,
+						ok: true,
+						body: {
+							data: Array.from({ length: count }, (_unused, index) => ({
+								id: `p${index + 1}`,
+								archetype_items: [
+									{
+										id: `join-${index + 1}`,
+										relatable_type: 'Specification::Archetype',
+										archetype_schema_item: { name: 'focus_area' },
+										fields_data: { focus_area: '8f14e45f-ceea-467a-9a3c-3f1a7c9d2b55' }
+									}
+								]
+							})),
+							pagination: { total_count: count, current_page: 1, total_pages: 1 }
+						}
+					};
+				},
+				async deleteContentLibraryRecord() {
+					if (onDelete) return onDelete();
+					throw new Error('must not delete');
+				}
+			};
+		}
+		const params = {
+			schema: 'focus_area',
+			recordId: '8f14e45f-ceea-467a-9a3c-3f1a7c9d2b55'
+		};
+
+		it('a STALE count is refused, and the 409 carries the number that is true now', async () => {
+			// The editor was shown 1 and confirmed it; a second reference landed since.
+			const ctx = { ...ctxWith(apexWithReferrers(2)), contract: countableOnly };
+			const response = await handleDeleteRecord(
+				req(await signIn(ctx), { confirm: true, confirmReferenceCount: 1 }),
+				ctx,
+				params
+			);
+			assert.equal(response.status, 409);
+			const body = await response.json();
+			assert.equal(body.error, 'in-use');
+			assert.equal(body.referenceCount, 2, 'the CURRENT count, so the screen re-asks with it');
+		});
+
+		it('`confirm=1` with NO count named is not a confirmation', async () => {
+			const ctx = { ...ctxWith(apexWithReferrers(1)), contract: countableOnly };
+			const response = await handleDeleteRecord(
+				req(await signIn(ctx), { confirm: true }),
+				ctx,
+				params
+			);
+			assert.equal(response.status, 409);
+			assert.equal((await response.json()).error, 'in-use');
+		});
+
+		it('a malformed count confirms nothing — no coercion, in either direction', async () => {
+			// `Number('')` is 0 and `parseInt('1x')` is 1; either would turn a broken
+			// parameter into an agreement. Only a plain run of digits counts.
+			for (const claimed of ['', '1x', ' 1', '+1', '1.0', 'null']) {
+				const ctx = { ...ctxWith(apexWithReferrers(1)), contract: countableOnly };
+				const response = await handleDeleteRecord(
+					req(await signIn(ctx), { confirm: true, confirmReferenceCount: claimed }),
+					ctx,
+					params
+				);
+				assert.equal(response.status, 409, `“${claimed}” must not confirm`);
+			}
+		});
+
+		it('the MATCHING count deletes — the positive control', async () => {
+			let deleted = 0;
+			const apex = apexWithReferrers(2, {
+				onDelete: () => {
+					deleted += 1;
+					return { ok: true, status: 200, body: {} };
+				}
+			});
+			const ctx = { ...ctxWith(apex), contract: countableOnly };
+			const response = await handleDeleteRecord(
+				req(await signIn(ctx), { confirm: true, confirmReferenceCount: 2 }),
+				ctx,
+				params
+			);
+			assert.equal(response.status, 200, await response.clone().text());
+			assert.equal(deleted, 1, 'and it really did delete');
+		});
+
+		it('a record NOTHING references still deletes unconfirmed — no number to agree about', async () => {
+			let deleted = 0;
+			const apex = apexWithReferrers(0, {
+				onDelete: () => {
+					deleted += 1;
+					return { ok: true, status: 200, body: {} };
+				}
+			});
+			const ctx = { ...ctxWith(apex), contract: countableOnly };
+			const response = await handleDeleteRecord(req(await signIn(ctx)), ctx, params);
+			assert.equal(response.status, 200, await response.clone().text());
+			assert.equal(deleted, 1);
+		});
+
+		/**
+		 * A FIRST REFUSAL IS NOT A STALE ONE, AND THE 409 HAS TO SAY WHICH.
+		 *
+		 * Both answered with the same code and the same count, so both screens drew
+		 * "this changed since you looked" on the FIRST in-use response — the one where
+		 * nothing had changed. Telling an editor the world moved when it did not is how
+		 * a warning becomes something to click through (codex's P5 fix review,
+		 * 2026-09-08).
+		 *
+		 * MUTATION: `const confirmationMismatch = referenceCount > 0` (set it on the
+		 * first ask too) — the first case below fails.
+		 */
+		it('the FIRST in-use 409 carries no `confirmationMismatch`; a stale one does', async () => {
+			const first = { ...ctxWith(apexWithReferrers(2)), contract: countableOnly };
+			const firstBody = await (
+				await handleDeleteRecord(req(await signIn(first)), first, params)
+			).json();
+			assert.equal(firstBody.error, 'in-use');
+			assert.equal(firstBody.referenceCount, 2);
+			assert.equal(
+				firstBody.confirmationMismatch,
+				undefined,
+				'nothing changed — this is the first ask'
+			);
+
+			const stale = { ...ctxWith(apexWithReferrers(2)), contract: countableOnly };
+			const staleBody = await (
+				await handleDeleteRecord(
+					req(await signIn(stale), { confirm: true, confirmReferenceCount: 1 }),
+					stale,
+					params
+				)
+			).json();
+			assert.equal(staleBody.confirmationMismatch, true, 'the editor agreed to 1, it is 2');
+
+			// `confirm=1` with no usable number is an agreement that did not hold either.
+			const numberless = { ...ctxWith(apexWithReferrers(2)), contract: countableOnly };
+			const numberlessBody = await (
+				await handleDeleteRecord(
+					req(await signIn(numberless), { confirm: true }),
+					numberless,
+					params
+				)
+			).json();
+			assert.equal(numberlessBody.confirmationMismatch, true);
+		});
+
+		/**
+		 * WHAT THE AUDIT SAYS THE CALLER CLAIMED.
+		 *
+		 * MUTATIONS: drop `...claimDetail` from the ACCEPTED audit — the accepted case
+		 * fails; `confirmedCountMalformed: false` — the malformed case fails.
+		 */
+		it('audits the claim on the rejected AND the accepted row, malformed named as such', async () => {
+			async function auditRows(db) {
+				return db.sqlite
+					.prepare('SELECT outcome, detail FROM bff_audit_log ORDER BY occurred_at, rowid')
+					.all()
+					.map((row) => ({ ...row, detail: JSON.parse(row.detail) }));
+			}
+
+			// A confirmation whose number did not parse: an attempt, not a claim.
+			const malformedDb = await createMigratedDatabase();
+			const malformed = {
+				...ctxWith(apexWithReferrers(1), malformedDb),
+				contract: countableOnly
+			};
+			await handleDeleteRecord(
+				req(await signIn(malformed), { confirm: true, confirmReferenceCount: '1x' }),
+				malformed,
+				params
+			);
+			const [rejected] = await auditRows(malformedDb);
+			assert.equal(rejected.outcome, 'rejected');
+			assert.equal(rejected.detail.confirmationAttempted, true);
+			assert.equal(rejected.detail.confirmedReferenceCount, null, 'no usable number was named');
+			assert.equal(rejected.detail.confirmedCountMalformed, true, 'and it was not merely absent');
+			assert.equal(rejected.detail.confirmationMismatch, true);
+			malformedDb.close();
+
+			// The accepted row is the ONLY trace the stripped references leave anywhere,
+			// so it has to say what the delete was confirming.
+			const acceptedDb = await createMigratedDatabase();
+			const accepted = {
+				...ctxWith(
+					apexWithReferrers(2, { onDelete: () => ({ ok: true, status: 200, body: {} }) }),
+					acceptedDb
+				),
+				contract: countableOnly
+			};
+			const response = await handleDeleteRecord(
+				req(await signIn(accepted), { confirm: true, confirmReferenceCount: 2 }),
+				accepted,
+				params
+			);
+			assert.equal(response.status, 200);
+			const [row] = await auditRows(acceptedDb);
+			assert.equal(row.outcome, 'accepted');
+			assert.equal(row.detail.confirmationAttempted, true);
+			assert.equal(row.detail.confirmedReferenceCount, 2, 'the claim it was accepted on');
+			assert.equal(row.detail.confirmedCountMalformed, false);
+			assert.equal(row.detail.strippedReferences, 2);
+			acceptedDb.close();
+		});
+
+		/**
+		 * P5 fix 3, item 5. `claimDetail`'s docblock says it is on EVERY audit row this
+		 * request can write. It was not: the uncountable-referrer rejection omitted it,
+		 * and the reference-count failure — which goes through `rejectMutation` and so
+		 * carries only whatever `meta.detail` holds — omitted it AND the target schema
+		 * and id. That last one is the rejection an operator would actually come back
+		 * to, because it is the one where the record still exists and nobody knows how
+		 * many things point at it.
+		 *
+		 * MUTATIONS: drop `...claimDetail` from the uncountable rejection — the first
+		 * case fails; pass bare `actorMeta` to `rejectMutation` again — the second
+		 * fails.
+		 */
+		it('the two REFUSAL rows carry the claim too, and the second names its target', async () => {
+			async function auditRows(db) {
+				return db.sqlite
+					.prepare('SELECT outcome, detail FROM bff_audit_log ORDER BY occurred_at, rowid')
+					.all()
+					.map((row) => ({ ...row, detail: JSON.parse(row.detail) }));
+			}
+
+			// Uncountable referrer. The default contract has `story` uncounted.
+			const uncountableDb = await createMigratedDatabase();
+			const uncountable = ctxWith(
+				{
+					async listContentLibrary() {
+						throw new Error('must not read');
+					},
+					async deleteContentLibraryRecord() {
+						throw new Error('must not delete');
+					}
+				},
+				uncountableDb
+			);
+			const refused = await handleDeleteRecord(
+				req(await signIn(uncountable), { confirm: true, confirmReferenceCount: 2 }),
+				uncountable,
+				params
+			);
+			assert.equal(refused.status, 409);
+			const [uncountableRow] = await auditRows(uncountableDb);
+			assert.equal(uncountableRow.outcome, 'rejected');
+			assert.equal(uncountableRow.detail.reason, 'uncountable-references');
+			assert.equal(uncountableRow.detail.confirmationAttempted, true);
+			assert.equal(uncountableRow.detail.confirmedReferenceCount, 2);
+			assert.equal(uncountableRow.detail.confirmedCountMalformed, false);
+			uncountableDb.close();
+
+			// The count read itself failed: fail closed, and say what could not be counted.
+			const unreadableDb = await createMigratedDatabase();
+			const unreadable = {
+				...ctxWith(
+					{
+						async listContentLibrary() {
+							return { status: 500, ok: false, body: {} };
+						},
+						async deleteContentLibraryRecord() {
+							throw new Error('must not delete');
+						}
+					},
+					unreadableDb
+				),
+				contract: countableOnly
+			};
+			const failed = await handleDeleteRecord(
+				req(await signIn(unreadable), { confirm: true, confirmReferenceCount: 2 }),
+				unreadable,
+				params
+			);
+			assert.equal(failed.status, 502);
+			const [unreadableRow] = await auditRows(unreadableDb);
+			assert.equal(unreadableRow.outcome, 'rejected');
+			assert.equal(unreadableRow.detail.reason, 'reference-check-failed');
+			assert.equal(unreadableRow.detail.schema, params.schema, 'the target, which was missing');
+			assert.equal(unreadableRow.detail.recordId, params.recordId, 'and its id');
+			assert.equal(unreadableRow.detail.confirmationAttempted, true);
+			assert.equal(unreadableRow.detail.confirmedReferenceCount, 2);
+			unreadableDb.close();
+		});
+	});
 });
 
 describe('allowedSchemaSlugs — a post archetype is unreachable, not merely discouraged', () => {
@@ -330,13 +659,19 @@ describe('allowedSchemaSlugs — a post archetype is unreachable, not merely dis
 });
 
 describe('the write path refuses what must never reach Apex', () => {
-	function apexRecording() {
+	// `new-1` used to stand in for a created id here. Apex mints uuids — measured on
+	// local Apex across pages, archetype models and content-library entities — and
+	// since P5 fix 3 the create handler REFUSES anything else rather than putting it
+	// in the re-read URL, so the stub has to answer what Apex answers.
+	const NEW_RECORD = 'c0ffee00-1111-4222-8333-444444444444';
+	function apexRecording({ createdId = NEW_RECORD, rereadStatus = 200 } = {}) {
 		const writes = [];
 		return {
 			writes,
 			async createContentLibraryRecord(slug, fields) {
 				writes.push({ slug, fields });
-				return { status: 201, ok: true, body: { data: { id: 'new-1', updated_at: 'now' } } };
+				if (createdId === null) return { status: 201, ok: true, body: { data: {} } };
+				return { status: 201, ok: true, body: { data: { id: createdId, updated_at: 'now' } } };
 			},
 			async listContentLibrary() {
 				return {
@@ -346,7 +681,8 @@ describe('the write path refuses what must never reach Apex', () => {
 				};
 			},
 			async getContentLibraryRecord() {
-				return { status: 200, ok: true, body: { data: { id: 'new-1', updated_at: 'now' } } };
+				if (rereadStatus !== 200) return { status: rereadStatus, ok: false, body: {} };
+				return { status: 200, ok: true, body: { data: { id: NEW_RECORD, updated_at: 'now' } } };
 			}
 		};
 	}
@@ -368,8 +704,9 @@ describe('the write path refuses what must never reach Apex', () => {
 				: [],
 		referenceItems: () => []
 	};
-	function ctxWith(apex) {
+	function ctxWith(apex, db) {
 		return {
+			...(db ? { db } : {}),
 			allowedOrigins: parseAllowedOrigins(ORIGIN),
 			sessions: createMemorySessionStore(),
 			auth: {
@@ -447,6 +784,74 @@ describe('the write path refuses what must never reach Apex', () => {
 		assert.doesNotMatch(String(apex.writes[0].fields.title), /javascript:/);
 	});
 
+	/**
+	 * P5 fix 3, item 2 — the same rule `handleCreateEntity` got, applied here.
+	 *
+	 * `createRecord` wrote `accepted` before it knew the 2xx carried a usable id, and
+	 * could then answer 502 while the log said the operation had been accepted. The
+	 * id check was "nonempty string", so a non-uuid would have been interpolated
+	 * straight into the re-read URL below. And the post-create RE-READ could fail
+	 * with no trace at all: the write really did land, so `accepted` is true and
+	 * stays — but the 502 the editor was sent has to be in the log too.
+	 *
+	 * MUTATIONS: audit `apexResponse.ok ? 'accepted' : 'apex_error'` again — the
+	 * first two cases fail; drop the second `auditOutcome` in the re-read branch —
+	 * the third fails.
+	 */
+	it('a 2xx it cannot NAME is `upstream_shape_error`, and a failed re-read is logged', async () => {
+		async function rows(db) {
+			return db.sqlite
+				.prepare('SELECT outcome, detail FROM bff_audit_log ORDER BY occurred_at, rowid')
+				.all()
+				.map((row) => ({ ...row, detail: JSON.parse(row.detail) }));
+		}
+		async function create(options) {
+			const db = await createMigratedDatabase();
+			const ctx = ctxWith(apexRecording(options), db);
+			const response = await handleCreateRecord(
+				post(await signIn(ctx), { fields: { title: 'x' } }),
+				ctx,
+				{ schema: 'focus_area' }
+			);
+			const audit = await rows(db);
+			db.close();
+			return { response, audit };
+		}
+
+		const missing = await create({ createdId: null });
+		assert.equal(missing.response.status, 502);
+		assert.equal(missing.audit.length, 1);
+		assert.equal(missing.audit[0].outcome, 'upstream_shape_error');
+		assert.equal(missing.audit[0].detail.reason, 'missing-record-id');
+		assert.equal(missing.audit[0].detail.recordId, null);
+
+		const junk = await create({ createdId: 'new-1' });
+		assert.equal(junk.response.status, 502);
+		assert.equal(junk.audit[0].outcome, 'upstream_shape_error');
+		assert.equal(junk.audit[0].detail.reason, 'malformed-record-id');
+		assert.equal(junk.audit[0].detail.returnedId, 'new-1');
+
+		// The re-read failure: TWO rows. The create is genuinely accepted — the record
+		// exists and is named — and the second row is the only trace of the 502.
+		const unread = await create({ rereadStatus: 500 });
+		assert.equal(unread.response.status, 502);
+		assert.equal(unread.audit.length, 2);
+		assert.equal(unread.audit[0].outcome, 'accepted');
+		assert.equal(unread.audit[0].detail.recordId, NEW_RECORD);
+		assert.equal(unread.audit[1].outcome, 'apex_error');
+		assert.equal(unread.audit[1].detail.reason, 'post-create-read-failed');
+		assert.equal(unread.audit[1].detail.recordId, NEW_RECORD);
+		assert.equal(unread.audit[1].detail.apexStatus, 500);
+
+		// The control: one row, accepted, and the record named in it.
+		const good = await create();
+		assert.equal(good.response.status, 201);
+		assert.equal(good.audit.length, 1);
+		assert.equal(good.audit[0].outcome, 'accepted');
+		assert.equal(good.audit[0].detail.recordId, NEW_RECORD);
+		assert.ok(!('reason' in good.audit[0].detail));
+	});
+
 	it('answers a JSON 500 — not a framework error page — when no contract is configured', async () => {
 		const ctx = { ...ctxWith(apexRecording()), contract: undefined };
 		const response = await handleCreateRecord(post(await signIn(ctx), { fields: {} }), ctx, {
@@ -454,5 +859,269 @@ describe('the write path refuses what must never reach Apex', () => {
 		});
 		assert.equal(response.status, 500);
 		assert.equal(response.headers.get('content-type'), 'application/json');
+	});
+
+	it('refuses `position` on CREATE rather than dropping it', async () => {
+		// `recordBodySchema` accepts the key for the update path, so without an
+		// explicit refusal a create carrying one would parse, be ignored, and answer
+		// 201 — a create that silently did not do what it was asked.
+		const apex = apexRecording();
+		const ctx = ctxWith(apex);
+		const response = await handleCreateRecord(
+			post(await signIn(ctx), { fields: { title: 'x' }, position: 3 }),
+			ctx,
+			{ schema: 'focus_area' }
+		);
+		assert.equal(response.status, 400);
+		assert.equal(apex.writes.length, 0, 'nothing was written');
+	});
+
+	/**
+	 * RECORD `position` — the archetype's own ordering column (plan §2.1.2).
+	 *
+	 * The kit's record response omitted it and its write schema was `.strict()` over
+	 * `fields` and `references` only, so a site that sorts its public lists by
+	 * `position` — Poovayya does, in five places — could neither read nor write the
+	 * order its pages are drawn in. Ordering is not a schema primitive, so it could
+	 * not be added as a field.
+	 *
+	 * Proved LIVE against local Apex on 2026-09-07 as well as here: a `team_member`
+	 * read back `position: 12`, a PATCH of `{position: 77}` answered 200, and an
+	 * independent re-read returned 77.
+	 */
+	describe('record position', () => {
+		function apexWithPosition(record) {
+			const writes = [];
+			return {
+				writes,
+				async getContentLibraryRecord() {
+					return { status: 200, ok: true, body: { data: record } };
+				},
+				async updateContentLibraryRecord(slug, id, fields, references, position) {
+					writes.push({ slug, id, fields, references, position });
+					return { status: 200, ok: true, body: { data: record } };
+				}
+			};
+		}
+		function patch(session, body) {
+			return new Request(`${ORIGIN}/api/admin/records/focus_area/${RECORD_ID}`, {
+				method: 'PATCH',
+				headers: {
+					origin: ORIGIN,
+					'sec-fetch-site': 'same-origin',
+					'x-csrf-token': CSRF,
+					'content-type': 'application/json',
+					cookie: `apex_admin_session=${session}; apex_bff_csrf=${CSRF}`
+				},
+				body: JSON.stringify(body)
+			});
+		}
+
+		it('is read onto the record, and an absent one is null rather than 0', () => {
+			assert.equal(
+				summarizeRecord(fieldContract, 'focus_area', { id: 'a', position: 4 }).position,
+				4
+			);
+			assert.equal(summarizeRecord(fieldContract, 'focus_area', { id: 'a' }).position, null);
+			// `0` is a real ordering value; coercing an absent one to it would jump a
+			// record that never had a position to the front of every list.
+			assert.equal(
+				summarizeRecord(fieldContract, 'focus_area', { id: 'a', position: 0 }).position,
+				0
+			);
+			assert.equal(
+				summarizeRecord(fieldContract, 'focus_area', { id: 'a', position: '3' }).position,
+				null
+			);
+		});
+
+		it('travels at the ROOT of the write, not inside fields', async () => {
+			const apex = apexWithPosition({ id: RECORD_ID, position: 9, updated_at: 'then' });
+			const ctx = ctxWith(apex);
+			const response = await handleUpdateRecord(patch(await signIn(ctx), { position: 9 }), ctx, {
+				schema: 'focus_area',
+				recordId: RECORD_ID
+			});
+			assert.equal(response.status, 200, await response.clone().text());
+			assert.equal(apex.writes.length, 1);
+			assert.equal(apex.writes[0].position, 9);
+			assert.deepEqual(apex.writes[0].fields, {}, 'position is not a field');
+			assert.equal((await response.json()).record.position, 9);
+		});
+
+		it('a reorder-only patch is a real change, not an "empty patch"', async () => {
+			// The empty-patch check counts `position`. Left out of it, a patch carrying
+			// only a reorder would be refused 400 while the reorder is exactly the change
+			// an editor made.
+			const apex = apexWithPosition({ id: RECORD_ID, position: 2, updated_at: 'then' });
+			const ctx = ctxWith(apex);
+			const response = await handleUpdateRecord(patch(await signIn(ctx), { position: 2 }), ctx, {
+				schema: 'focus_area',
+				recordId: RECORD_ID
+			});
+			assert.equal(response.status, 200);
+		});
+
+		it('`null` clears it, and `undefined` is not sent at all', async () => {
+			const apex = apexWithPosition({ id: RECORD_ID, updated_at: 'then' });
+			const ctx = ctxWith(apex);
+			assert.equal(
+				(
+					await handleUpdateRecord(patch(await signIn(ctx), { position: null }), ctx, {
+						schema: 'focus_area',
+						recordId: RECORD_ID
+					})
+				).status,
+				200
+			);
+			assert.equal(apex.writes[0].position, null, 'null clears the column');
+
+			const other = apexWithPosition({ id: RECORD_ID, updated_at: 'then' });
+			const ctx2 = ctxWith(other);
+			await handleUpdateRecord(patch(await signIn(ctx2), { fields: { title: 'x' } }), ctx2, {
+				schema: 'focus_area',
+				recordId: RECORD_ID
+			});
+			assert.equal(other.writes[0].position, undefined, 'an untouched position is not written');
+		});
+
+		it('the client omits the key entirely for `undefined` and sends it for `null`', async () => {
+			// A `position: null` in the JSON body CLEARS the column upstream, so
+			// "unchanged" has to be an absent key rather than a null one. This is the
+			// only place that distinction is visible on the wire.
+			const bodies = [];
+			const client = createApexAdminClient({
+				baseUrl: 'https://apex.test',
+				token: 't',
+				fetchImpl: async (_url, init) => {
+					bodies.push(JSON.parse(init.body));
+					return new Response('{}', {
+						status: 200,
+						headers: { 'content-type': 'application/json' }
+					});
+				}
+			});
+			await client.updateContentLibraryRecord('focus_area', RECORD_ID, { title: 'a' });
+			await client.updateContentLibraryRecord('focus_area', RECORD_ID, {}, {}, null);
+			await client.updateContentLibraryRecord('focus_area', RECORD_ID, {}, {}, 5);
+			// A schema MAY carry a primitive field of its own called `position` — Apex
+			// permits `:position` at the root beside the field names, so the two share a
+			// key. An unpassed ordering must not clobber the field: spreading a bare
+			// `position` would write `undefined` over it and JSON.stringify would then
+			// drop the field entirely, silently discarding a value the editor typed.
+			await client.updateContentLibraryRecord('focus_area', RECORD_ID, { position: 'third' });
+			await client.updateContentLibraryRecord(
+				'focus_area',
+				RECORD_ID,
+				{ position: 'third' },
+				{},
+				7
+			);
+			assert.equal('position' in bodies[0], false);
+			assert.equal(bodies[1].position, null);
+			assert.equal(bodies[2].position, 5);
+			assert.equal(bodies[3].position, 'third', 'an unpassed ordering leaves the field alone');
+			assert.equal(bodies[4].position, 7, 'an explicit ordering wins');
+		});
+
+		it('refuses a position that is not an integer', async () => {
+			const apex = apexWithPosition({ id: RECORD_ID, updated_at: 'then' });
+			const ctx = ctxWith(apex);
+			for (const value of [1.5, '2', true]) {
+				const response = await handleUpdateRecord(
+					patch(await signIn(ctx), { position: value }),
+					ctx,
+					{
+						schema: 'focus_area',
+						recordId: RECORD_ID
+					}
+				);
+				assert.equal(response.status, 400, `position ${JSON.stringify(value)} is refused`);
+			}
+			assert.equal(apex.writes.length, 0);
+		});
+	});
+});
+
+describe('where a `null` is legitimate, and where it destroys a row (§3.6.4)', () => {
+	/**
+	 * Poovayya's own record operation called \`containsNullPrimitive\` with NO
+	 * reference list, so EVERY \`null\` in \`fields\` was refused. The kit passes
+	 * \`referenceFieldNames(...)\` and is more permissive — and this is exactly how much
+	 * more, because the input in question is the one that destroys data: a \`null\` on a
+	 * PRIMITIVE destroys that field's \`archetype_item\` row and strands the old value
+	 * in \`primitives\`, the exact key a public site renders.
+	 *
+	 * The rule is split across two checks on purpose, and both halves are here: the
+	 * predicate decides where a null is DESTRUCTIVE, and the contract-built body
+	 * schema decides where the key is legal at all. A null gets past the first only
+	 * to meet the second.
+	 */
+	const nullContract = {
+		...contract,
+		primitiveFieldDefs: (slug) =>
+			slug === 'partner'
+				? [
+						{
+							field_name: 'title',
+							display_name: 'Title',
+							validator_kind: null,
+							text_inclusion: null,
+							is_required: false,
+							place_holder: null,
+							default_value: null
+						}
+					]
+				: [],
+		referenceItems: (slug) =>
+			slug === 'partner'
+				? [
+						{
+							name: 'owner',
+							kind: 'reference',
+							position: 0,
+							field_defs: null,
+							relationship_kind: 'has_one',
+							target_schema: 'focus_area',
+							reference_display_field: null
+						},
+						{
+							name: 'focus_area',
+							kind: 'reference',
+							position: 1,
+							field_defs: null,
+							relationship_kind: 'has_many',
+							target_schema: 'focus_area',
+							reference_display_field: null
+						}
+					]
+				: []
+	};
+	const names = referenceFieldNames(nullContract, 'partner');
+	const schema = recordBodySchema(nullContract, 'partner');
+	const TARGET = '3f1b0c2e-0000-4000-8000-000000000000';
+
+	it('a null on a PRIMITIVE is destructive, and the predicate says so', () => {
+		assert.equal(containsNullPrimitive({ title: null }, names), true);
+		// And the site that passes no reference list at all refuses every null, which
+		// is what Poovayya did — stricter, never looser.
+		assert.equal(containsNullPrimitive({ owner: null }, []), true);
+	});
+
+	it('a null on a REFERENCE NAME is not destructive, but is not a field either', () => {
+		assert.equal(containsNullPrimitive({ owner: null }, names), false);
+		// It gets past the predicate and meets the schema, which is `.strict()` over
+		// the PRIMITIVE names — so `fields: { owner: null }` is still refused.
+		assert.equal(schema.safeParse({ fields: { owner: null } }).success, false);
+	});
+
+	it('a null on a has_one in `references` is ACCEPTED — the only way to clear one', () => {
+		assert.equal(schema.safeParse({ references: { owner: null } }).success, true);
+		assert.equal(schema.safeParse({ references: { owner: TARGET } }).success, true);
+	});
+
+	it('a null on a has_many is REFUSED — `[]` is how a desired set is cleared', () => {
+		assert.equal(schema.safeParse({ references: { focus_area: null } }).success, false);
+		assert.equal(schema.safeParse({ references: { focus_area: [] } }).success, true);
 	});
 });

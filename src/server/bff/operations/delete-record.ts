@@ -1,7 +1,7 @@
-import { appendAuditEntry } from '../audit';
+import { auditOutcome } from '../audit';
 import { noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
+import { rejectGuardFailure, rejectMutation } from '../reject';
 import { countReferencesTo } from './record-shape';
 import { recordIdSchema } from './get-record';
 import { contractOf, noContractResponse } from '../content-contract-guard';
@@ -20,32 +20,66 @@ import type { BffContext } from '../context';
  *
  *   1. count, FRESH, how many records reference this one — not trusting a number
  *      the browser sent or a list it loaded ten minutes ago;
- *   2. if that count is non-zero and the caller did not pass `?confirm=1`, refuse
+ *   2. if that count is non-zero and the caller did not confirm THAT COUNT, refuse
  *      with `409 {code:'in-use', referenceCount, …}` and touch nothing;
  *   3. only then delete, and report what it emptied so the screen can say what
  *      actually happened rather than "Deleted".
  *
- * The count is recomputed on the confirmed call too, because between the warning
- * and the confirmation somebody else may have added a reference — a confirmation
- * for "2 partners" must not silently strip 3.
+ * ── THE CONFIRMATION NAMES A NUMBER ──────────────────────────────────────────
+ * `?confirm=1` alone is not a confirmation, it is a flag, and a flag cannot say
+ * WHAT was agreed to. This paragraph used to claim the guarantee below and the code
+ * did not have it: the count was recomputed on the confirmed call and then never
+ * compared, so a `confirm=1` sent after a dialog that said "2 partners" deleted
+ * happily when a third had appeared in between — silently stripping a reference
+ * nobody was shown. Found by codex's P5 review, 2026-09-08.
  *
- * ── WHAT THE COUNT DOES AND DOES NOT COVER, AND WHY IT SAYS SO ─────────────────
- * It covers the content-library relations, which are readable through the generic
- * list. It does NOT cover `update` and `story`, which also reference authors, focus
- * areas and partners: a post archetype is not addressable on this surface (its
- * fields would 422 there) and the post screen is P2.
+ * So a confirmed delete carries `&confirmReferenceCount=N`, and N must EQUAL the
+ * fresh count. Anything else — a different number, or no number at all — is the same
+ * 409 as an unconfirmed call, carrying the CURRENT count, which is exactly what the
+ * screens' "this changed since you looked" branch already knew how to draw. The
+ * window is small and the action is unrecoverable (Apex strips the references with no
+ * error and no undo), which is the combination that makes it worth a round trip.
  *
- * That gap is REPORTED rather than papered over. A partial count reads as a
- * complete one, and "0 records use this" is precisely the sentence that talks an
- * editor into a delete. So the response carries `uncountedReferrers`, the screen
- * names them, and the confirm button says what it does not know.
+ * A record NOTHING references still deletes on an unconfirmed call: there is no
+ * number to agree about, so there is nothing to name.
  *
- * AND, SINCE IT CANNOT COUNT THEM, IT REFUSES. Naming the gap is not enough: a
- * confirmed delete of a focus area would have Apex strip it from every Update and
- * Story that referenced it, silently, and P1 cannot see — let alone report — what
- * it just emptied. So a non-empty `uncountedReferrers` is a 409 in its own right,
- * with no `?confirm=1` that gets past it. That refusal lifts when the post screens
- * land (P2) and those referrers move into the countable set.
+ * ── THE 409 SAYS WHICH KIND OF REFUSAL IT IS ─────────────────────────────────
+ * A first, unconfirmed ask and a confirmation that named a STALE number answer with
+ * the same code and the same count, and until now with nothing to tell them apart —
+ * so both screens drew "this changed since you looked" on the FIRST in-use response,
+ * where nothing had changed at all. An editor who is told the world moved under them
+ * when it did not learns to click through the warning, which is the one habit this
+ * guard cannot survive (codex's P5 fix review, 2026-09-08).
+ *
+ * `confirmationMismatch` is therefore `true` ONLY when the caller confirmed and the
+ * agreement did not hold — a different number, or `confirm=1` with no usable number
+ * at all. It is absent on a first ask. The count is the same in both cases; what
+ * differs is the sentence the screen should say.
+ *
+ * ── THE DELETE ITSELF IS NOT ATOMIC — AN ACCEPTED LIMITATION ─────────────────
+ * The count and the delete are two requests. A reference created between them is
+ * stripped by Apex unseen, exactly as if it had never been counted: this operation
+ * narrows the window to one round trip and cannot close it. Closing it needs
+ * something Apex does not have — a transactional delete-if-reference-count-equals,
+ * evaluated inside the same transaction as the destroy. Until that exists, the
+ * guarantee this operation offers is "no reference that existed at the moment of
+ * the count is stripped without being named", NOT "no reference is stripped
+ * unseen". Do not read the paragraphs above as more than that.
+ *
+ * ── WHAT THE COUNT COVERS, AND WHAT HAPPENS WHEN IT CANNOT ───────────────────
+ * It covers every referrer the site's contract names as `countable`: content-
+ * library schemas through the generic list, and post schemas (`update`, `story`)
+ * through `listPostArchetypes` once the site has enabled them on its client
+ * (`allowedPostSlugs`). Godrej counts all of them since plan 04 G1, so the
+ * in-use dialog says a real number.
+ *
+ * A referrer the contract still marks `uncounted` is REPORTED rather than papered
+ * over — a partial count reads as a complete one, and "0 records use this" is
+ * precisely the sentence that talks an editor into a delete — AND REFUSED: a
+ * confirmed delete would have Apex strip the record from every referrer,
+ * silently, and this operation could not see what it just emptied. So a non-empty
+ * `uncountedReferrers` is a 409 in its own right, with no `?confirm=1` that gets
+ * past it, until the site makes that referrer countable.
  */
 export async function handleDeleteRecord(
 	request: Request,
@@ -57,12 +91,18 @@ export async function handleDeleteRecord(
 	const meta = {
 		action: 'records.delete',
 		method: 'DELETE',
-		path: `/api/admin/records/${params.schema}/${params.recordId}`,
+		// The route TEMPLATE, not the request's own path. `reject.ts` states the rule
+		// and `postRouteMeta` already follows it: a route parameter is
+		// attacker-controlled until validated, and this meta is built BEFORE the
+		// validation, so interpolating it would write an arbitrary caller string into
+		// the audit table's `path` on every refused request. The validated values go
+		// in `detail`.
+		path: '/api/admin/records/[schema]/[recordId]',
 		requestId: request.headers.get('cf-ray')
 	};
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 
 	const actorMeta = { ...meta, actorEmail: guard.actor.email, actorSub: guard.actor.sub };
 
@@ -76,7 +116,35 @@ export async function handleDeleteRecord(
 
 	// Only the exact string `1`. A truthy-ish `?confirm=maybe` is not a
 	// confirmation, and this is not a parameter to be liberal about.
-	const confirmed = new URL(request.url).searchParams.get('confirm') === '1';
+	const query = new URL(request.url).searchParams;
+	const confirmed = query.get('confirm') === '1';
+	/**
+	 * The count the editor was actually shown, when the caller names one. Parsed
+	 * strictly for the same reason `confirm` is: `Number('')` is 0 and `parseInt('2x')`
+	 * is 2, and either would turn a malformed parameter into an agreement to delete
+	 * something. Only a plain run of digits counts; anything else is `null`, which
+	 * confirms nothing.
+	 */
+	const claimedRaw = query.get('confirmReferenceCount');
+	const claimedCount =
+		claimedRaw !== null && /^\d{1,9}$/u.test(claimedRaw) ? Number(claimedRaw) : null;
+	/**
+	 * What the caller CLAIMED, on every audit row this request can write — the
+	 * rejected one and the accepted one alike.
+	 *
+	 * The accepted row used to carry only the `confirmed` flag, so the audit could
+	 * say a delete was confirmed and not what it was confirming; and a
+	 * `confirmReferenceCount=2x` was indistinguishable in the log from naming no
+	 * number at all, though the two are different mistakes — one is a caller that
+	 * tried and is broken, the other a caller that did not try.
+	 */
+	const claimDetail = {
+		confirmationAttempted: confirmed,
+		/** The parsed claim. `null` is "named no usable number". */
+		confirmedReferenceCount: claimedCount,
+		/** A `confirmReferenceCount` WAS sent and did not parse. */
+		confirmedCountMalformed: claimedRaw !== null && claimedCount === null
+	};
 
 	const referrers = contract.referrersTo(params.schema);
 	const uncounted = referrers.uncounted.map((entry) => entry.displayName);
@@ -85,27 +153,22 @@ export async function handleDeleteRecord(
 	// is before the count read on purpose: the answer does not depend on it, and
 	// there is no version of this request that may proceed.
 	if (uncounted.length > 0) {
-		if (ctx.db) {
-			await appendAuditEntry(ctx.db, {
-				id: crypto.randomUUID(),
-				occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-				actorEmail: guard.actor.email,
-				actorSub: guard.actor.sub,
-				action: meta.action,
-				method: meta.method,
-				path: meta.path,
-				accountId: ctx.accountId ?? null,
-				pageId: null,
-				requestId: meta.requestId,
-				outcome: 'rejected',
-				detail: {
-					schema: params.schema,
-					recordId: idResult.data,
-					reason: 'uncountable-references',
-					uncountedReferrers: uncounted
-				}
-			});
-		}
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'rejected',
+			detail: {
+				schema: params.schema,
+				recordId: idResult.data,
+				reason: 'uncountable-references',
+				// The claim, on this row too. `claimDetail`'s docblock promises it is on
+				// EVERY row this request can write, and it was missing from this one and
+				// from the reference-count failure below — so the log could not tell a
+				// caller that sent `confirm=1&confirmReferenceCount=2` and was refused for
+				// an uncountable referrer from one that never confirmed anything
+				// (codex's P5 fix review, 2026-09-08).
+				...claimDetail,
+				uncountedReferrers: uncounted
+			}
+		});
 		return noStoreJson(
 			{
 				error: 'uncountable-references',
@@ -121,27 +184,52 @@ export async function handleDeleteRecord(
 		// Fail CLOSED. An unknown count is not zero: if a referring collection cannot
 		// be read, the one thing we cannot do is proceed as though nothing pointed at
 		// this record. The editor is told to try again; nothing is deleted.
-		return rejectMutation(ctx, actorMeta, 502, 'reference check failed', 'reference check failed');
+		//
+		// The row names the TARGET and the CLAIM. `rejectMutation` writes whatever
+		// `meta.detail` holds, and `actorMeta` holds none — so this row used to say
+		// only that a delete was rejected, not which record, in which collection, or
+		// what the caller had agreed to. That is the one rejection an operator would
+		// come back to, because it is the one where the record still exists and
+		// nobody knows how many things point at it.
+		return rejectMutation(
+			ctx,
+			{
+				...actorMeta,
+				detail: {
+					schema: params.schema,
+					recordId: idResult.data,
+					reason: 'reference-check-failed',
+					...claimDetail,
+					uncountedReferrers: uncounted
+				}
+			},
+			502,
+			'reference check failed',
+			'reference check failed'
+		);
 	}
 	const referenceCount = counted.count;
 
-	if (referenceCount > 0 && !confirmed) {
-		if (ctx.db) {
-			await appendAuditEntry(ctx.db, {
-				id: crypto.randomUUID(),
-				occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-				actorEmail: guard.actor.email,
-				actorSub: guard.actor.sub,
-				action: meta.action,
-				method: meta.method,
-				path: meta.path,
-				accountId: ctx.accountId ?? null,
-				pageId: null,
-				requestId: meta.requestId,
-				outcome: 'rejected',
-				detail: { schema: params.schema, recordId: idResult.data, reason: 'in-use', referenceCount }
-			});
-		}
+	// The confirmation has to name THIS count. `confirm=1` with no number, or with a
+	// stale one, is refused exactly like no confirmation at all — and the 409 below
+	// carries the number that is true now, so the screen can re-ask with it.
+	const agreed = confirmed && claimedCount === referenceCount;
+	// The caller AGREED TO A NUMBER AND THE NUMBER WAS WRONG — as opposed to not
+	// having been asked yet. Only this is "it changed since you looked".
+	const confirmationMismatch = confirmed && !agreed;
+
+	if (referenceCount > 0 && !agreed) {
+		await auditOutcome(ctx, meta, guard.actor, {
+			outcome: 'rejected',
+			detail: {
+				schema: params.schema,
+				recordId: idResult.data,
+				reason: 'in-use',
+				referenceCount,
+				confirmationMismatch,
+				...claimDetail
+			}
+		});
 		// A 409 with the count IN THE BODY, not a bare error code: the number is the
 		// whole message, and the screen re-asks the question with it.
 		return noStoreJson(
@@ -149,6 +237,9 @@ export async function handleDeleteRecord(
 				error: 'in-use',
 				code: 'in-use',
 				referenceCount,
+				// Absent on a first ask, so a caller that does not know about this field
+				// cannot read one into it. Present and `true` only for a stale agreement.
+				...(confirmationMismatch ? { confirmationMismatch: true } : {}),
 				referrers: referrers.countable.map((entry) => entry.displayName),
 				uncountedReferrers: uncounted
 			},
@@ -158,32 +249,24 @@ export async function handleDeleteRecord(
 
 	const apexResponse = await guard.apex.deleteContentLibraryRecord(params.schema, idResult.data);
 
-	if (ctx.db) {
-		await appendAuditEntry(ctx.db, {
-			id: crypto.randomUUID(),
-			occurredAt: new Date(ctx.now ?? Date.now()).toISOString(),
-			actorEmail: guard.actor.email,
-			actorSub: guard.actor.sub,
-			action: meta.action,
-			method: meta.method,
-			path: meta.path,
-			accountId: ctx.accountId ?? null,
-			pageId: null,
-			requestId: meta.requestId,
-			outcome: apexResponse.ok ? 'accepted' : 'apex_error',
-			// `strippedReferences` is recorded because it is the part of this action
-			// that leaves no other trace anywhere: the references are gone from Apex,
-			// and this row is the only place that says how many there were.
-			detail: {
-				schema: params.schema,
-				recordId: idResult.data,
-				confirmed,
-				strippedReferences: referenceCount,
-				uncountedReferrers: uncounted,
-				apexStatus: apexResponse.status
-			}
-		});
-	}
+	await auditOutcome(ctx, meta, guard.actor, {
+		outcome: apexResponse.ok ? 'accepted' : 'apex_error',
+		// `strippedReferences` is recorded because it is the part of this action that
+		// leaves no other trace anywhere: the references are gone from Apex, and this
+		// row is the only place that says how many there were.
+		detail: {
+			schema: params.schema,
+			recordId: idResult.data,
+			confirmed,
+			// The claim this delete was ACCEPTED on, which the accepted row omitted: a
+			// row saying only `confirmed: true` cannot say what was agreed to, and this
+			// row is the only trace the stripped references leave anywhere.
+			...claimDetail,
+			strippedReferences: referenceCount,
+			uncountedReferrers: uncounted,
+			apexStatus: apexResponse.status
+		}
+	});
 
 	if (!apexResponse.ok) {
 		const status =

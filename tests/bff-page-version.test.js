@@ -20,7 +20,7 @@ function page() {
 					id: 'i1',
 					updated_at: 't0',
 					page_block_template_id: 'tpl1',
-					entity: { id: 'e1', updated_at: 't0', fields_data: { title: 'A' } },
+					entity: { id: 'e1', updated_at: 't0', fields_data: { title: 'A', body: 'Z' } },
 					child_template_instances: []
 				}
 			},
@@ -46,10 +46,21 @@ describe('composite page version', () => {
 	it('is stable for identical trees and insensitive to object key order', async () => {
 		const a = await computePageVersion(page());
 		// Rebuild the same page with keys inserted in a different order.
+		//
+		// AN ACTUAL SWAP, and `fields_data` needs TWO keys for there to be one. This
+		// test spent its whole life unable to fail: the fixture had `{title: 'A'}`, and
+		// spreading a one-key object reproduces the same key in the same order, so
+		// `a === b` held whether or not the projection was canonicalized. Removing
+		// `canonicalize` — deleting the one property this test is NAMED after — left all
+		// 670 tests green.
+		//
+		// `fields_data` is the position that matters: it is the only sub-object in the
+		// projection carried VERBATIM from Apex (`page-version.ts:57`). Every other key
+		// is written in fixed literal order by `projectPageForVersion`, so no amount of
+		// jitter elsewhere can reorder anything.
 		const reordered = page();
-		reordered.blocks[0].blockable.entity.fields_data = {
-			...reordered.blocks[0].blockable.entity.fields_data
-		};
+		const fd = reordered.blocks[0].blockable.entity.fields_data;
+		reordered.blocks[0].blockable.entity.fields_data = { body: fd.body, title: fd.title };
 		const b = await computePageVersion(JSON.parse(JSON.stringify(reordered)));
 		assert.equal(a, b);
 	});
@@ -70,6 +81,25 @@ describe('composite page version', () => {
 		reordered.blocks.forEach((block, index) => (block.position = index));
 		const after = await computePageVersion(reordered);
 		assert.notEqual(base, after);
+	});
+
+	it('is stable when Apex returns the same blocks in a different array order', async () => {
+		const base = await computePageVersion(page());
+		const permuted = page();
+		permuted.blocks.reverse();
+		assert.equal(base, await computePageVersion(permuted));
+	});
+
+	it("is stable when only a block's own updated_at differs (the blockable's touch)", async () => {
+		// Resizing a spacer bumps its block row through `has_one :block, touch: true`, which
+		// the structure save's PATCH response does not see. The blockable's own updated_at
+		// moves too, and that one is still projected.
+		const base = await computePageVersion(page());
+		const touched = page();
+		touched.blocks[0].updated_at = 't1';
+		assert.equal(base, await computePageVersion(touched));
+		touched.blocks[0].blockable.updated_at = 't1';
+		assert.notEqual(base, await computePageVersion(touched));
 	});
 
 	it('CHANGES when a block is added or removed', async () => {

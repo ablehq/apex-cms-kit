@@ -9,6 +9,8 @@ import {
 	reorderBlocks,
 	setBlockOrder,
 	addTemplateBlock,
+	addSpacerBlock,
+	setSpacerKind,
 	removeBlock,
 	isDirty,
 	canEditFields,
@@ -16,7 +18,9 @@ import {
 	structurePayload,
 	getBlocks
 } from '../src/admin/page-draft.js';
+import { isTempId } from '../src/admin/block-serialize.js';
 import { savePage, STALE_MESSAGE } from '../src/admin/save-page.js';
+import { BLANK_SLUG_MESSAGE, RESERVED_SLUG_MESSAGE } from '../src/admin/field-errors.js';
 
 const PAGE_ID = '9f06e386-86b3-4ddf-9466-d4ca325ada86';
 const ET_HEADING = 'f867796b-c70c-47e4-8f6b-ad122832367b';
@@ -109,7 +113,10 @@ function makeClient(overrides = {}) {
 		},
 		async getPage() {
 			calls.push(['getPage']);
-			return { page: samplePage(), version: 'v-refreshed' };
+			// After a structure save the server HOLDS the minted block, so a re-read
+			// answers the realized page, the way Apex would.
+			const page = overrides.structurePage ? overrides.structurePage() : samplePage();
+			return { page, version: 'v-refreshed' };
 		}
 	};
 	if (serverVersion === undefined) serverVersion = 'baseline-v';
@@ -169,6 +176,79 @@ describe('savePage (M1 explicit save)', () => {
 		assert.ok(!client.calls.some((c) => c[0] === 'changePageStatus'));
 	});
 
+	/**
+	 * K41 / K67, the editor-facing half. `save-page-structure.ts` refuses a rename
+	 * onto a route the site generates, onto the chrome or onto the home page with
+	 * `400 reserved-slug` — the human reason goes to the audit table and only the
+	 * CODE comes back to the browser (`bff-client.js`'s `mutate` spreads the body,
+	 * then pins `ok`/`status`, so `result.error` is on the object `messageFor`
+	 * gets). Without a branch on that code the editor is told "Saving the page
+	 * layout failed. Save again to retry." — a sentence about the layout, naming
+	 * neither the slug nor the address, advising a retry that can never succeed.
+	 *
+	 * MUTATION (run): drop the `result?.error === 'reserved-slug'` branch from
+	 * `messageFor` → this test goes RED.
+	 */
+	it('a refused slug is reported as the create form reports it, not as a layout failure', async () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		reorderBlocks(draft, 0, 1);
+		const client = makeClient({
+			serverVersion: 'baseline-v',
+			results: { structure: () => ({ ok: false, status: 400, error: 'reserved-slug' }) }
+		});
+		const result = await savePage(draft, client);
+		assert.equal(result.ok, false);
+		assert.equal(result.stage, 'structure');
+		assert.equal(result.status, 400);
+		// The SAME sentence `pageCreateError` / `PageList.svelte` show for the same
+		// refusal — one rule, one wording, shared from `field-errors.js`.
+		assert.equal(result.message, RESERVED_SLUG_MESSAGE);
+		assert.doesNotMatch(result.message, /Save again to retry/u);
+	});
+
+	/**
+	 * The OTHER address refusal (codex F3). `save-page-structure.ts` answers
+	 * `400 invalid-slug` when the slug sent is blank — what an editor produces by
+	 * clearing the Slug field, which no site's input marks `required`. Until it had
+	 * its own code it was the schema's `400 invalid body`, and this mapper could
+	 * only report it as "Saving the page layout failed. Save again to retry.": the
+	 * layout named for a failure of the address, and a retry that cannot succeed.
+	 *
+	 * It is NOT `RESERVED_SLUG_MESSAGE`: "choose a different one" is no instruction
+	 * for a field with nothing in it.
+	 *
+	 * MUTATION (run): drop the `result?.error === 'invalid-slug'` branch from
+	 * `messageFor` → this test goes RED with the retry sentence.
+	 */
+	it('a cleared slug is named as a missing address, not as a layout failure', async () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		reorderBlocks(draft, 0, 1);
+		const client = makeClient({
+			serverVersion: 'baseline-v',
+			results: { structure: () => ({ ok: false, status: 400, error: 'invalid-slug' }) }
+		});
+		const result = await savePage(draft, client);
+		assert.equal(result.ok, false);
+		assert.equal(result.stage, 'structure');
+		assert.equal(result.status, 400);
+		assert.equal(result.message, BLANK_SLUG_MESSAGE);
+		assert.notEqual(result.message, RESERVED_SLUG_MESSAGE);
+		assert.doesNotMatch(result.message, /Save again to retry/u);
+	});
+
+	it('any OTHER 400 on the structure save still reads as a layout failure', async () => {
+		// The branch is on the code, not on the status: `invalid body`, `foreign id`
+		// and the rest are 400s the editor cannot fix by choosing a new address.
+		const draft = createDraft(samplePage(), 'baseline-v');
+		reorderBlocks(draft, 0, 1);
+		const client = makeClient({
+			serverVersion: 'baseline-v',
+			results: { structure: () => ({ ok: false, status: 400, error: 'invalid body' }) }
+		});
+		const result = await savePage(draft, client);
+		assert.match(result.message, /Saving the page layout failed/u);
+	});
+
 	it('the composite version guard detects a stale save and dispatches NOTHING', async () => {
 		const draft = createDraft(samplePage(), 'baseline-v');
 		setField(draft, 'block-heading', 'title', 'X');
@@ -208,7 +288,173 @@ describe('savePage (M1 explicit save)', () => {
 	});
 });
 
+describe('a duplicated section — the fields the editor seeded on a temp entity', () => {
+	/** The server page after the structure save: the new block minted at position 2. */
+	function mintedPage() {
+		const page = samplePage();
+		page.blocks.push({
+			id: 'block-new',
+			label: 'Copy of heading',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::TemplateInstance',
+			blockable: {
+				id: 'inst-new',
+				page_block_template_id: 'tpl-heading',
+				page_block_template: { id: 'tpl-heading', slug: 'glc-page-heading' },
+				// Rails permits no `fields_data` under `entity_attributes`: minted EMPTY.
+				entity: { id: 'entity-new', entity_type_id: ET_HEADING, fields_data: {} },
+				child_template_instances: []
+			}
+		});
+		return page;
+	}
+	const copied = { title: 'The Gospel', breadcrumb_label: 'Home' };
+
+	it('saves the structure, then PATCHes the copied fields ONCE against the minted entity id', async () => {
+		const client = makeClient({ structurePage: mintedPage });
+		const draft = createDraft(samplePage(), 'baseline-v');
+		addTemplateBlock(draft, {
+			templateId: 'tpl-heading',
+			templateSlug: 'glc-page-heading',
+			label: 'Copy of heading',
+			entityTypeId: ET_HEADING,
+			fieldsData: { ...copied }
+		});
+		const result = await savePage(draft, client);
+		assert.equal(result.ok, true, JSON.stringify(result));
+		assert.deepEqual(
+			client.calls.map((c) => c[0]),
+			['readVersion', 'savePageStructure', 'patchEntityFields', 'getPage'],
+			'structure first, then the seeded fields, then a re-read for an honest baseline'
+		);
+		const patches = client.calls.filter((c) => c[0] === 'patchEntityFields');
+		assert.equal(patches.length, 1);
+		assert.equal(patches[0][1], 'entity-new', 'the id Apex minted, never the temp id');
+		assert.deepEqual(patches[0][2], copied);
+		assert.equal(draft.baselineVersion, 'v-refreshed');
+		assert.equal(isDirty(draft), false);
+	});
+
+	it('a new block with no fields makes no extra PATCH', async () => {
+		const client = makeClient({ structurePage: mintedPage });
+		const draft = createDraft(samplePage(), 'baseline-v');
+		addTemplateBlock(draft, {
+			templateId: 'tpl-heading',
+			templateSlug: 'glc-page-heading',
+			label: 'Blank',
+			entityTypeId: ET_HEADING,
+			fieldsData: {}
+		});
+		assert.equal((await savePage(draft, client)).ok, true);
+		assert.deepEqual(
+			client.calls.map((c) => c[0]),
+			['readVersion', 'savePageStructure'],
+			"nothing to copy: no PATCH, and the structure save's page is baseline enough"
+		);
+	});
+
+	it('a refused copy stops there — the section exists, its fields do not, and no publish goes out', async () => {
+		const client = makeClient({
+			structurePage: mintedPage,
+			results: { fields: () => ({ ok: false, status: 422 }) }
+		});
+		const draft = createDraft(samplePage(), 'baseline-v');
+		addTemplateBlock(draft, {
+			templateId: 'tpl-heading',
+			templateSlug: 'glc-page-heading',
+			label: 'Copy',
+			entityTypeId: ET_HEADING,
+			fieldsData: { ...copied }
+		});
+		const result = await savePage(draft, client, { statusEvent: 'publish' });
+		assert.equal(result.ok, false);
+		assert.equal(result.stage, 'new-block-fields');
+		assert.equal(result.status, 422);
+		assert.match(result.message, /The new section was added, but its fields could not be saved/u);
+		assert.ok(!client.calls.some((c) => c[0] === 'changePageStatus'), 'no publish after a failure');
+	});
+});
+
 describe('page-draft local model', () => {
+	it('adds a medium spacer locally and serializes it without server ids', () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		const block = addSpacerBlock(draft);
+		const blocks = getBlocks(draft);
+
+		assert.equal(block.id.startsWith('temp-'), true);
+		assert.equal(block.label, null);
+		assert.equal(block.blockable_type, 'Cms::PageBlock::Spacer');
+		assert.equal(block.blockable.kind, 'medium');
+		assert.equal(isTempId(block.blockable.id), true, 'the blockable carries a TEMP id');
+		assert.equal(block.position, blocks.indexOf(block));
+		assert.equal(isDirty(draft), true);
+
+		const attr = structurePayload(draft).blocks_attributes[block.position];
+		assert.equal(Object.hasOwn(attr, 'id'), false);
+		assert.equal(attr.blockable_type, 'Cms::PageBlock::Spacer');
+		assert.deepEqual(attr.blockable_attributes, { kind: 'medium' });
+		assert.equal(attr._destroy, false);
+	});
+
+	it('sets and serializes a hydrated spacer kind with its existing ids', () => {
+		const page = samplePage();
+		page.blocks.push({
+			id: 'b1',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::Spacer',
+			blockable: { id: 's1', kind: 'medium', created_at: '2026-09-19T00:00:00.000Z' }
+		});
+		const draft = createDraft(page, 'baseline-v');
+
+		assert.equal(setSpacerKind(draft, 'b1', 'large'), true);
+		assert.equal(isDirty(draft), true);
+		const attr = structurePayload(draft).blocks_attributes.find((block) => block.id === 'b1');
+		assert.equal(attr.id, 'b1');
+		assert.equal(attr.blockable_attributes.id, 's1');
+		assert.equal(attr.blockable_attributes.kind, 'large');
+	});
+
+	it('refuses invalid spacer kinds and missing blockable records without dirtying the draft', () => {
+		const page = samplePage();
+		page.blocks.push(
+			{
+				id: 'spacer',
+				position: 2,
+				blockable_type: 'Cms::PageBlock::Spacer',
+				blockable: { id: 'spacer-record', kind: 'medium' }
+			},
+			{
+				id: 'empty-spacer',
+				position: 3,
+				blockable_type: 'Cms::PageBlock::Spacer',
+				blockable: null
+			}
+		);
+		const draft = createDraft(page, 'baseline-v');
+
+		for (const kind of ['huge', '', null]) {
+			assert.equal(setSpacerKind(draft, 'spacer', kind), false);
+		}
+		assert.equal(setSpacerKind(draft, 'block-heading', 'large'), false);
+		assert.equal(setSpacerKind(draft, 'unknown', 'large'), false);
+		assert.equal(setSpacerKind(draft, 'empty-spacer', 'large'), false);
+		assert.equal(setSpacerKind(draft, 'spacer', 'medium'), true);
+		assert.equal(isDirty(draft), false);
+		assert.equal(getBlocks(draft).find((block) => block.id === 'empty-spacer').blockable, null);
+	});
+
+	it('saves a new spacer through the structure route without patching entity fields', async () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		addSpacerBlock(draft);
+		const client = makeClient({ serverVersion: 'baseline-v' });
+
+		const result = await savePage(draft, client);
+
+		assert.equal(result.ok, true);
+		assert.equal(client.calls.filter((call) => call[0] === 'savePageStructure').length, 1);
+		assert.equal(client.calls.filter((call) => call[0] === 'patchEntityFields').length, 0);
+	});
+
 	it('reorder mutates the draft only and NEVER calls the client', async () => {
 		const draft = createDraft(samplePage(), 'baseline-v');
 		const before = getBlocks(draft).map((b) => b.id);

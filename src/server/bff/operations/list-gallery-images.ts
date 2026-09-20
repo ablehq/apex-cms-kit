@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { cleanString, unwrapArchetypeCollection } from '../archetype-record';
+import { cleanString, isRecord, unwrapArchetypeCollection } from '../archetype-record';
 import type { ApexAdminClient } from '../apex-admin-client';
 import type { BffContext } from '../context';
 
@@ -36,37 +36,13 @@ import type { BffContext } from '../context';
  *
  * `medium` and `thumbnail` are `has_one … as: :record` and are simply ABSENT until
  * something is attached — they are not null keys, they are missing keys. Nothing
- * here guesses at their shape: no bytes can be uploaded against this Apex (below),
- * so no shape has been observed, and inventing one would be a thumbnail that
- * silently never renders. See `IMAGE_UPLOAD_ENABLED`.
+ * here guesses at their shape: no bytes have been uploaded against this Apex, so no
+ * shape has been observed, and inventing one would be a thumbnail that silently
+ * never renders.
  */
 export const imageIdSchema = z
 	.string()
 	.regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/iu);
-
-/**
- * ⚠ BRING-UP GATE — byte upload is NOT proven and is therefore OFF (spec §2.7).
- *
- * `POST /api/platform/v1/media/signed_upload_url` answers 200 with
- * `{url, headers, signed_id}` (probes G5/G6) — but the `url` it returns points at
- * `http://localhost:3000` while this Apex serves on `:3001`, and a `PUT` to it hung
- * until it was killed. The finalize leg (`POST /media` with the signed id) has
- * therefore never been executed at all: it is marked NOT PROVEN in the probe ledger.
- *
- * The screen shows the Upload button DISABLED and says why, rather than offering a
- * control that would create an empty gallery item and then fail — an editor would be
- * left with a caption attached to no image and no way to tell that from a slow
- * upload. Everything else on the screen (browse, caption, alt, delete) is proven
- * against real local Apex and works.
- *
- * At bring-up: flip this to `true`, confirm the `medium`/`thumbnail` read shape, and
- * surface a thumbnail URL from it. Nothing else on this screen changes.
- */
-export const IMAGE_UPLOAD_ENABLED = false;
-
-/** The reason the upload control is off, in the words the editor is shown. */
-export const IMAGE_UPLOAD_DISABLED_REASON =
-	'Uploading is not switched on yet. The storage service this CMS uploads to is not reachable from here, so an upload would appear to start and never finish. Captions, alt text and deletion all work.';
 
 /** One row of the Images list. */
 export interface AdminGalleryImageRecord {
@@ -82,16 +58,31 @@ export interface AdminGalleryImageRecord {
 	 * which is what it did before any site could resolve a URL.
 	 */
 	url: string | null;
+	/**
+	 * The stored file's type and size, or `''`/`0` when nothing is attached.
+	 *
+	 * A thumbnail is composed for IMAGES only — a Cloudflare image transform is
+	 * meaningless for a PDF or an MP4 — so without these two a Files or Videos row
+	 * could show no evidence whatsoever that an upload had landed, which is exactly
+	 * how a screen ends up printing "No file attached" under a file that is attached.
+	 * They are what Apex actually returns: `medium.file` carries `key`,
+	 * `content_type` and `byte_size` and NO filename, so the screen names the type
+	 * and the size, and does not invent a name it was never given.
+	 */
+	contentType: string;
+	byteSize: number;
 }
 
 /** Normalize one `Cms::GalleryItem`. Rows without an id are dropped, not rendered blank. */
 export function summarizeGalleryImage(
 	row: Record<string, unknown>,
-	assetsPrefix = ''
+	assetsPrefix = '',
+	gallery: string = 'images'
 ): AdminGalleryImageRecord {
-	const medium = isPlainRecord(row.medium) ? row.medium : null;
-	const file = medium && isPlainRecord(medium.file) ? medium.file : null;
+	const medium = isRecord(row.medium) ? row.medium : null;
+	const file = medium && isRecord(medium.file) ? medium.file : null;
 	const key = file ? cleanString(file.key) : '';
+	const byteSize = file && typeof file.byte_size === 'number' ? file.byte_size : 0;
 	return {
 		id: cleanString(row.id),
 		galleryId: cleanString(row.gallery_id),
@@ -101,29 +92,51 @@ export function summarizeGalleryImage(
 		createdAt: cleanString(row.created_at),
 		// The same transform the public pages use, so the picker shows what the site
 		// will show.
-		url: assetsPrefix && key ? `${assetsPrefix}/cdn-cgi/image/f=auto,w=auto/${key}` : null
+		// A Cloudflare IMAGE transform — meaningless for a PDF or an MP4, so only images
+		// get a thumbnail URL. The other galleries carry the key and no URL.
+		url:
+			assetsPrefix && key && gallery === 'images'
+				? `${assetsPrefix}/cdn-cgi/image/f=auto,w=auto/${key}`
+				: null,
+		// Carried for EVERY gallery, unlike `url`: this is the only evidence a Files or
+		// Videos row has that the bytes are really there.
+		contentType: file ? cleanString(file.content_type) : '',
+		byteSize
 	};
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
 /** The account's `images` gallery id, resolved by name from `cms_config`. */
-export async function readImagesGalleryId(apex: ApexAdminClient): Promise<string | null> {
+/** The galleries `cms_config` names, and the only ones a screen may address. */
+export const GALLERY_NAMES = Object.freeze(['images', 'videos', 'files'] as const);
+
+/**
+ * Resolve ONE gallery's id by NAME from `cms_config`, on every request (the ids are
+ * account-scoped — risk R14). `gallery` defaults to `images` so every shipped caller
+ * is unchanged; an unknown name resolves to null, never to the images gallery.
+ */
+export async function readGalleryId(
+	apex: ApexAdminClient,
+	gallery: string = 'images'
+): Promise<string | null> {
+	if (!(GALLERY_NAMES as readonly string[]).includes(gallery)) return null;
 	const config = await apex.readCmsConfig();
 	if (!config.ok) return null;
 	const body = config.body as { data?: unknown } | null;
 	const data = (body?.data ?? body) as { asset_library?: unknown } | null;
 	const entries = Array.isArray(data?.asset_library) ? data.asset_library : [];
 	for (const entry of entries) {
-		const gallery = (entry as { gallery?: { id?: unknown; name?: unknown } }).gallery;
-		if (cleanString(gallery?.name) === 'images') {
-			const id = cleanString(gallery?.id);
+		const entryGallery = (entry as { gallery?: { id?: unknown; name?: unknown } }).gallery;
+		if (cleanString(entryGallery?.name) === gallery) {
+			const id = cleanString(entryGallery?.id);
 			if (imageIdSchema.safeParse(id).success) return id;
 		}
 	}
 	return null;
+}
+
+/** The images gallery's id — the original name, kept for its positional callers. */
+export function readImagesGalleryId(apex: ApexAdminClient): Promise<string | null> {
+	return readGalleryId(apex, 'images');
 }
 
 /**
@@ -135,16 +148,17 @@ export async function readImagesGalleryId(apex: ApexAdminClient): Promise<string
  */
 export async function loadImagesGallery(
 	apex: ApexAdminClient,
-	assetsPrefix = ''
+	assetsPrefix = '',
+	gallery: string = 'images'
 ): Promise<{ galleryId: string; images: AdminGalleryImageRecord[] } | null> {
-	const galleryId = await readImagesGalleryId(apex);
+	const galleryId = await readGalleryId(apex, gallery);
 	if (!galleryId) return null;
 
 	const listed = await apex.listGalleryItems(galleryId);
 	if (!listed.ok) return null;
 
 	const images = unwrapArchetypeCollection(listed.body)
-		.map((row) => summarizeGalleryImage(row, assetsPrefix))
+		.map((row) => summarizeGalleryImage(row, assetsPrefix, gallery))
 		.filter((image) => image.id.length > 0)
 		// Newest first, like every other collection in this admin. `position` is what
 		// Apex sorts a gallery by for RENDERING; the library screen is a filing
@@ -154,32 +168,89 @@ export async function loadImagesGallery(
 	return { galleryId, images };
 }
 
-/** The item with this id, only if it is in the IMAGES gallery. `null` otherwise. */
+/**
+ * The item with this id, only if it is in the REQUESTED gallery (`images` by default).
+ * Apex addresses items by id alone, so this membership check is the only thing that
+ * stops the files screen editing an image, or vice versa.
+ *
+ * TWO checks, not one. The list is read with `q[gallery_id_eq]`, but a filter is
+ * a request, not a proof: a code review proved by mutation (2026-09-05) that
+ * against an Apex which ignored the filter, an item from another gallery came
+ * back in the list, matched by id, and was written upstream through the wrong
+ * route. So the row's OWN `gallery_id` — which `summarizeGalleryImage` already
+ * carries as `galleryId` — must also equal the gallery id resolved by name. A row
+ * Apex returns from the wrong gallery is refused whatever the filter did.
+ */
 export async function findImage(
 	apex: ApexAdminClient,
 	imageId: string,
-	assetsPrefix = ''
+	assetsPrefix = '',
+	gallery: string = 'images'
 ): Promise<AdminGalleryImageRecord | null> {
-	const gallery = await loadImagesGallery(apex, assetsPrefix);
-	if (!gallery) return null;
-	return gallery.images.find((image) => image.id === imageId) ?? null;
+	const loaded = await loadImagesGallery(apex, assetsPrefix, gallery);
+	if (!loaded) return null;
+	return (
+		loaded.images.find((image) => image.id === imageId && image.galleryId === loaded.galleryId) ??
+		null
+	);
 }
 
-export async function handleListImages(request: Request, ctx: BffContext): Promise<Response> {
+/**
+ * Every member id of one gallery, resolved ONCE — the set a caller checks MANY
+ * ids against.
+ *
+ * `findImage` resolves the gallery per invocation, which is right for the image
+ * routes (one id, one request) and wrong for a post body: two hundred blocks
+ * would be two hundred `cms_config` reads and two hundred paginated walks of the
+ * gallery. This is the same rule with the read hoisted out — additive, so
+ * `findImage`, `readGalleryId` and every caller of theirs are untouched.
+ *
+ * THE SAME TWO CHECKS. The list is read with `q[gallery_id_eq]`, but a filter is a
+ * request and not a proof, so each row's OWN `gallery_id` must also equal the
+ * gallery id resolved by name; a row Apex returns from the wrong gallery is not a
+ * member whatever the filter did.
+ *
+ * `null` means the gallery could not be READ (`cms_config` or the item list
+ * failed) — an upstream fault, and distinct from an empty gallery (an empty set).
+ * A caller must not report the first as "unknown image": that would tell an editor
+ * their picture does not exist because Apex hiccuped.
+ */
+export async function loadGalleryMemberIds(
+	apex: ApexAdminClient,
+	gallery: string = 'images'
+): Promise<Set<string> | null> {
+	// No assets prefix: membership is about ids, and composing thumbnail URLs for a
+	// check nobody renders is work with no reader.
+	const loaded = await loadImagesGallery(apex, '', gallery);
+	if (!loaded) return null;
+	const members = new Set<string>();
+	for (const image of loaded.images) {
+		if (image.galleryId === loaded.galleryId) members.add(image.id);
+	}
+	return members;
+}
+
+export async function handleListImages(
+	request: Request,
+	ctx: BffContext,
+	options: { gallery?: string } = {}
+): Promise<Response> {
+	const gallery = options.gallery ?? 'images';
 	const guard = await guardRequest(request, ctx, { mutation: false });
 	if (!guard.ok) return guard.response;
+	if (!(GALLERY_NAMES as readonly string[]).includes(gallery))
+		return bffError(404, 'no such gallery');
 
 	// The site's CDN prefix, when it has one: with it the picker browses thumbnails,
 	// without it the ids, which is what it did before any site could resolve a URL.
-	const gallery = await loadImagesGallery(guard.apex, ctx.assetsPrefix ?? '');
-	if (!gallery) return bffError(502, 'upstream error');
-
-	// The gate travels WITH the data, so the button's state is a server fact rather
-	// than a guess the browser makes about an environment it cannot see.
+	const loaded = await loadImagesGallery(guard.apex, ctx.assetsPrefix ?? '', gallery);
+	if (!loaded) return bffError(502, 'upstream error');
+	// `images` stays as the key the shipped browser client reads; `items` is the honest
+	// name for a files or videos listing and carries the same rows.
 	return noStoreJson({
-		images: gallery.images,
-		galleryId: gallery.galleryId,
-		uploadEnabled: IMAGE_UPLOAD_ENABLED,
-		uploadDisabledReason: IMAGE_UPLOAD_ENABLED ? '' : IMAGE_UPLOAD_DISABLED_REASON
+		gallery,
+		galleryId: loaded.galleryId,
+		images: loaded.images,
+		items: loaded.images
 	});
 }

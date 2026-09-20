@@ -3,13 +3,15 @@
  * RIGHT NOW rather than from the committed snapshot the public routes are built
  * from.
  *
- * Why this exists. `src/routes/[...slug]/+page.server.js` is `prerender = true`
- * and reads `cms/data/pages.json` — the committed snapshot (plan §2, the hermetic
- * build). That is deliberate and stays. The consequence is that the admin's
- * "Preview" button, which pointed at the page's PUBLIC address, showed the last
- * published snapshot and never the editor's work — a control named Preview that
- * previews nothing you just did, with the caveat in a tooltip. This is the path
- * that makes the name true.
+ * Why this exists. The public catch-all route reads the PUBLISHED snapshot out of
+ * KV at request time. The consequence is that the admin's "Preview" button, which
+ * pointed at the page's PUBLIC address, showed the last published state and never
+ * the editor's work — a control named Preview that previews nothing you just did.
+ * This is the path that makes the name true.
+ *
+ * (This paragraph used to describe `prerender = true` reading `cms/data/pages.json`.
+ * Neither has been true since the move to runtime KV content; the route does not
+ * prerender and that file does not exist.)
  *
  * ── Reuse is the design, not a convenience ──────────────────────────────────
  * The projection is `projectCmsPage` / `projectBlocks` / `projectFields` from
@@ -45,6 +47,7 @@
  * result type — is the same pattern.
  */
 
+import { unwrapArchetypeRecord } from '../archetype-record';
 import { stringifyCanonical } from '../../../cms/canonical-json.js';
 import { buildMediaIndex } from '../../../cms/media.js';
 import { isCmsPageRoutable, projectCmsPage, projectedPageBySlug } from '../../../cms/page-data.js';
@@ -52,7 +55,7 @@ import type { ProjectedCmsPage } from '../../../cms/page-data.js';
 
 import { guardRequest } from '../guard';
 import { ContentUnavailableError, readContent } from '../../content/read';
-import { pageIdSchema, unwrapPage } from './get-page';
+import { pageIdSchema } from './get-page';
 import type { BffContext } from '../context';
 
 /**
@@ -125,6 +128,14 @@ export async function loadPagePreview(
 		partitionRenderableBlocks: PartitionRenderableBlocks;
 		/** Derive the request-time data a derived section needs (GLC: the sermon strip). */
 		messages?: (collections: Record<string, unknown[]>, blocks: unknown[]) => unknown;
+		/**
+		 * The `<title>` fallback for a page with no title of its own — and it MUST be
+		 * the same value the site's publish projection uses. The two projections are
+		 * compared byte-for-byte below to decide `identical` vs `differs`, so a site
+		 * that passes `siteTitle` at publish and not here reports every untitled page
+		 * as `differs` forever, no matter how often it republishes.
+		 */
+		siteTitle?: string;
 	}
 ): Promise<PagePreviewResult> {
 	const { partitionRenderableBlocks } = options;
@@ -141,7 +152,7 @@ export async function loadPagePreview(
 	if (apexResponse.status === 404) return { ok: false, status: 404, reason: 'no such page' };
 	if (!apexResponse.ok) return { ok: false, status: 502, reason: 'upstream error' };
 
-	const raw = unwrapPage(apexResponse.body);
+	const raw = unwrapArchetypeRecord(apexResponse.body);
 	if (!raw) return { ok: false, status: 502, reason: 'unexpected upstream shape' };
 
 	let site: Awaited<ReturnType<typeof siteSnapshot>>;
@@ -153,7 +164,7 @@ export async function loadPagePreview(
 	}
 
 	// ── The site's own projection, on live data. No second implementation. ──
-	const projected = projectCmsPage(raw, { media: site.mediaIndex });
+	const projected = projectCmsPage(raw, { media: site.mediaIndex, siteTitle: options.siteTitle });
 	const { renderable, unknownTemplates } = previewBlocks(projected, partitionRenderableBlocks);
 	const messages = options.messages ? options.messages(site.collections, renderable) : [];
 

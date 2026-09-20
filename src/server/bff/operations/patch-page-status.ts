@@ -1,9 +1,9 @@
 import { z } from 'zod';
 import { appendAuditEntry } from '../audit';
-import { REVIEW_ONLY_FIELDS } from '../authorization';
+
 import { bffError, noStoreJson } from '../boundary';
 import { guardRequest } from '../guard';
-import { rejectMutation } from '../reject';
+import { rejectGuardFailure, rejectMutation } from '../reject';
 import type { BffContext } from '../context';
 
 /**
@@ -38,13 +38,22 @@ export async function handlePatchPageStatus(
 	const meta = {
 		action: 'pages.status_event',
 		method: 'PATCH',
-		path: `/api/admin/pages/${params.pageId}/status`,
-		pageId: params.pageId,
+		// The route TEMPLATE, not the request's own path. `reject.ts` states the rule
+		// and `postRouteMeta` already follows it: a route parameter is
+		// attacker-controlled until validated, and this meta is built BEFORE the
+		// validation, so interpolating it would write an arbitrary caller string into
+		// the audit table's `path` on every refused request. The validated values go
+		// in `detail`.
+		path: '/api/admin/pages/[pageId]/status',
+		// NO `pageId` HERE. `auditRejection` writes it to its own indexed column, and
+		// this meta is built before `pageIdSchema` runs — so an unvalidated route
+		// parameter reached that column on every guard failure. It is added below, once
+		// there is a validated id to add.
 		requestId: request.headers.get('cf-ray')
 	};
 
 	const guard = await guardRequest(request, ctx, { mutation: true });
-	if (!guard.ok) return rejectMutation(ctx, meta, guard.status, guard.reason, guard.reason);
+	if (!guard.ok) return rejectGuardFailure(request, ctx, meta, guard);
 
 	const idResult = pageIdSchema.safeParse(params.pageId);
 	if (!idResult.success) {
@@ -56,43 +65,27 @@ export async function handlePatchPageStatus(
 			'invalid page id'
 		);
 	}
+	// From here the id HAS been validated, so it may go in the column it belongs in.
+	const validMeta = { ...meta, actorEmail: guard.actor.email, pageId: idResult.data };
 
 	let bodyJson: unknown;
 	try {
 		bodyJson = await request.json();
 	} catch {
-		return rejectMutation(
-			ctx,
-			{ ...meta, actorEmail: guard.actor.email },
-			400,
-			'invalid json',
-			'invalid json'
-		);
+		return rejectMutation(ctx, validMeta, 400, 'invalid json', 'invalid json');
 	}
 
 	if (
 		typeof bodyJson === 'object' &&
 		bodyJson !== null &&
-		REVIEW_ONLY_FIELDS.some((field) => field in bodyJson)
+		ctx.reviewOnlyFields.some((field) => field in bodyJson)
 	) {
-		return rejectMutation(
-			ctx,
-			{ ...meta, actorEmail: guard.actor.email },
-			400,
-			'field not allowed',
-			'review-only field'
-		);
+		return rejectMutation(ctx, validMeta, 400, 'field not allowed', 'review-only field');
 	}
 
 	const bodyResult = statusBodySchema.safeParse(bodyJson);
 	if (!bodyResult.success) {
-		return rejectMutation(
-			ctx,
-			{ ...meta, actorEmail: guard.actor.email },
-			400,
-			'invalid body',
-			'invalid body'
-		);
+		return rejectMutation(ctx, validMeta, 400, 'invalid body', 'invalid body');
 	}
 
 	const apexResponse = await guard.apex.changePageStatus(
@@ -109,7 +102,7 @@ export async function handlePatchPageStatus(
 			actorSub: guard.actor.sub,
 			action: 'pages.status_event',
 			method: 'PATCH',
-			path: `/api/admin/pages/${idResult.data}/status`,
+			path: '/api/admin/pages/[pageId]/status',
 			accountId: ctx.accountId ?? null,
 			pageId: idResult.data,
 			requestId: request.headers.get('cf-ray'),

@@ -24,7 +24,7 @@ CREATE TABLE IF NOT EXISTS bff_audit_log (
   account_id  TEXT,               -- the fixed Apex account the operation targets
   page_id     TEXT,
   request_id  TEXT,               -- Cf-Ray / correlation id, for cross-referencing
-  outcome     TEXT NOT NULL,      -- 'accepted' | 'rejected' | 'apex_error'
+  outcome     TEXT NOT NULL,      -- 'accepted' | 'rejected' | 'apex_error' | 'upstream_shape_error'
   detail      TEXT                -- small JSON string; never a secret or a token
 );
 

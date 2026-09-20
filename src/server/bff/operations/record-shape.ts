@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { ContentContract, Referrers } from '../content-contract';
+import type { ContentContract, SchemaItem } from '../content-contract';
 import {
 	cleanString,
 	readPrimitiveValue,
@@ -27,6 +27,20 @@ export const PAGE_SIZE = 100;
 export interface AdminRecord {
 	id: string;
 	updatedAt: string;
+	/**
+	 * The archetype's own ordering COLUMN — not a declared field, which is why it
+	 * sits beside `fields` rather than in it.
+	 *
+	 * `null` when the record carries none, which is a legal upstream state and is
+	 * what a record created without one holds. It is NOT the destructive `null` the
+	 * primitive rule is about: `position` is a column on the archetype, not an
+	 * `archetype_item`, so clearing it strands nothing.
+	 *
+	 * The kit dropped it until P3. A site that sorts its public lists by `position`
+	 * — Poovayya does, in five places — had no way to read or write the ordering the
+	 * page is drawn in, and ordering is not a schema primitive it could add.
+	 */
+	position: number | null;
 	/**
 	 * The primitive field values, by field name, UNNARROWED.
 	 *
@@ -60,28 +74,153 @@ export function summarizeRecord(
 	for (const item of contract.referenceItems(slug)) {
 		references[item.name] = readReferences(record, item.name);
 	}
-	return { id: cleanString(record.id), updatedAt: readUpdatedAt(record), fields, references };
+	return {
+		id: cleanString(record.id),
+		updatedAt: readUpdatedAt(record),
+		position: readPosition(record),
+		fields,
+		references
+	};
 }
 
 /**
- * The body schema for a create or an update on one schema slug.
+ * The archetype's `position` column, or null.
+ *
+ * Anything that is not a finite number reads as "unset" rather than as `0`.
+ * Coercing here would be worse than dropping it: `0` is a real ordering value and a
+ * record that never had one would jump to the front of every list.
+ */
+export function readPosition(record: Record<string, unknown>): number | null {
+	const value = record.position;
+	return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/**
+ * The three validator kinds whose value is a LIST, named as the backend names them.
+ *
+ * The spelling is EXACT, and `array_ref` keeps its slash. The permit upstream is
+ * `kind == "text_array" || kind == "number_array" || kind.match?(%r{^array_ref/})`
+ * (`archetype_models_controller.rb#array_validator_kind?`), and `validator_kind` is
+ * free-form text — so `startsWith('array_ref')`, which is what the deleted
+ * child-list module used, also accepts `array_ref` bare, `array_reference` and
+ * `array_refx/foo`. Those are SCALAR fields as far as the permit is concerned: an
+ * array sent to one is reduced to `[]` and, when the kind is not a validator the
+ * backend recognises, stored — 200, no error, the value gone. A predicate looser
+ * than the permit is therefore a data-loss path, not a convenience.
+ */
+export type ArrayFieldKind = 'text_array' | 'number_array' | 'array_ref';
+
+export function arrayFieldKind(kind: string | null | undefined): ArrayFieldKind | null {
+	if (typeof kind !== 'string') return null;
+	if (kind === 'text_array') return 'text_array';
+	if (kind === 'number_array') return 'number_array';
+	return /^array_ref\//u.test(kind) ? 'array_ref' : null;
+}
+
+/**
+ * MAY A FLAT PATCH CARRY AN ARRAY FOR THIS FIELD? — the whole of the kind-aware
+ * refusal, in one place, and it FAILS CLOSED.
+ *
+ * `ellipsis-backend` PR #1888 (`fix/archetype-model-array-fields`) widened the
+ * `archetype_models` permit, but it widened it NARROWLY, and the narrowness is the
+ * point. `array_payload_schema_item?` admits a schema item only when it is a
+ * Primitive holding exactly ONE field def whose kind is an array kind. Everything
+ * else still reduces the array to `[]` on the way through strong parameters, and
+ * what happens next is not a refusal:
+ *
+ *   - a SCALAR field with a recognised validator generally answers 422, but one
+ *     whose `validator_kind` is null or unrecognised STORES the `[]` and answers
+ *     200 (measured on local Apex at `dfac456e`: `practice_area.tagline`,
+ *     `validator_kind: null`, re-read as `[]`);
+ *   - a MULTI-FIELD Primitive gets the `[]` assigned to whichever field is FIRST,
+ *     because `ArchetypeModelService#primitive_fields_data` routes a non-Hash entry
+ *     to `primitive_field_names(...).first`;
+ *   - an entity-type item is excluded outright.
+ *
+ * So this is what stands between an editor and a silent empty write, and it answers
+ * null — array refused — for every shape it is not certain about: a field no
+ * Primitive item holds, a field two items hold, an item holding more than one
+ * field, an entity-type item, a near-miss kind. Being unsure is a refusal.
+ */
+export function writableArrayKind(
+	contract: ContentContract,
+	slug: string,
+	fieldName: string
+): ArrayFieldKind | null {
+	const items = contract.schema(slug)?.items ?? [];
+	const holders = items.filter(
+		(item): item is Extract<SchemaItem, { kind: 'primitive' }> =>
+			item.kind === 'primitive' && item.field_defs.some((def) => def.field_name === fieldName)
+	);
+	// Not one item: either nothing declares the field (so the contract cannot say
+	// what it is) or two items do (so which one the backend would write to is a
+	// guess). Both refuse.
+	if (holders.length !== 1) return null;
+	const defs = holders[0].field_defs;
+	if (defs.length !== 1) return null;
+	return arrayFieldKind(defs[0].validator_kind);
+}
+
+/**
+ * The `fields` shape for one schema — SHARED by the record body and the post body,
+ * because they are the same question about the same controller.
  *
  * Built from the CONTRACT, so an unknown field name is a 400 here rather than a
  * silently ignored key upstream, and so adding a field to the schema is one
  * regenerated JSON file rather than four edited zod objects.
  *
- * `fields` values are `z.unknown()` because rich text is a legitimate object. What
- * they may NOT be is `null` — the destructive case — and that is enforced
- * separately by `containsNullPrimitive`, which can tell a null on a primitive from
- * a null on a reference. Doing it in zod would need the same distinction and would
- * report it as a shape failure rather than as what it is.
+ * Values are `z.unknown()` because rich text is a legitimate object. What they may
+ * NOT be is `null` — the destructive case — and that is enforced separately by
+ * `containsNullPrimitive`, which can tell a null on a primitive from a null on a
+ * reference. Doing it in zod would need the same distinction and would report it as
+ * a shape failure rather than as what it is.
+ *
+ * ARRAYS ARE DECIDED BY `writableArrayKind`, never by `z.unknown()`:
+ *
+ *   - a field the backend will store a list for takes an array and only an array,
+ *     checked down to its entries;
+ *   - EVERY OTHER field REFUSES an array, and that refusal is load-bearing rather
+ *     than tidy — see `writableArrayKind` for what the flat surface does with an
+ *     array it did not permit.
+ */
+export function primitiveFieldsShape(
+	contract: ContentContract,
+	slug: string
+): Record<string, z.ZodTypeAny> {
+	const fieldsShape: Record<string, z.ZodTypeAny> = {};
+	for (const def of contract.primitiveFieldDefs(slug)) {
+		switch (writableArrayKind(contract, slug, def.field_name)) {
+			case 'array_ref':
+				// The entries are content-library ENTITY ids. A malformed one comes back
+				// from Apex as a 422 naming the field, but refusing it here names the field
+				// too and costs no round trip.
+				fieldsShape[def.field_name] = z.array(z.string().uuid()).max(200).optional();
+				break;
+			case 'text_array':
+				fieldsShape[def.field_name] = z.array(z.string()).max(200).optional();
+				break;
+			case 'number_array':
+				fieldsShape[def.field_name] = z.array(z.number()).max(200).optional();
+				break;
+			default:
+				fieldsShape[def.field_name] = z
+					.unknown()
+					.refine((value) => !Array.isArray(value), 'this field does not hold a list')
+					.optional();
+		}
+	}
+	return fieldsShape;
+}
+
+/**
+ * The body schema for a create or an update on one schema slug.
+ *
+ * `fields` is `primitiveFieldsShape` above; everything here is what a RECORD adds
+ * to it — the reference relations and the ordering column.
  */
 export function recordBodySchema(contract: ContentContract, slug: string) {
-	const fieldNames = contract.primitiveFieldDefs(slug).map((def) => def.field_name);
 	const references = contract.referenceItems(slug);
-
-	const fieldsShape: Record<string, z.ZodTypeAny> = {};
-	for (const name of fieldNames) fieldsShape[name] = z.unknown().optional();
+	const fieldsShape = primitiveFieldsShape(contract, slug);
 
 	const referencesShape: Record<string, z.ZodTypeAny> = {};
 	for (const item of references) {
@@ -98,7 +237,18 @@ export function recordBodySchema(contract: ContentContract, slug: string) {
 	return z
 		.object({
 			fields: z.object(fieldsShape).strict().optional(),
-			references: z.object(referencesShape).strict().optional()
+			references: z.object(referencesShape).strict().optional(),
+			/**
+			 * The archetype's ordering column, at the ROOT of the payload — which is
+			 * where Apex permits it (`archetype_models_controller.rb:181`, `:position`
+			 * alongside the field names) and why it is not inside `fields`, whose names
+			 * are checked against the contract.
+			 *
+			 * `null` is ALLOWED here and only here. On a primitive it destroys the
+			 * `archetype_item` row and strands the old value where the public site
+			 * reads it; on this column it just clears the ordering.
+			 */
+			position: z.number().int().nullable().optional()
 		})
 		.strict();
 }
@@ -157,7 +307,15 @@ export function hasManyDiff(
  * the delete confirmation has to, and it has to name the types truthfully.
  */
 /**
- * How many content-library records reference this one, fresh.
+ * How many records reference this one, fresh — content-library records AND posts.
+ *
+ * A referrer whose schema is a POST (`target_model: 'Cms::Post'`) is read through
+ * `listPostArchetypes`, the archetypes surface that carries the items; a
+ * content-library referrer through `listContentLibrary`. A site whose contract
+ * names a post referrer as countable but whose client has not enabled that slug
+ * gets a thrown refusal from the client — caught here and reported as
+ * `{ok:false}`, so the delete answers 502 rather than 500 and, above all, never
+ * proceeds on a count it could not take.
  *
  * It fails CLOSED: any leg that will not read returns `{ok:false}` and the caller
  * answers 502 rather than a count that is missing entries — because a missing entry
@@ -172,15 +330,20 @@ export async function countReferencesTo(
 	const { countable } = contract.referrersTo(targetSlug);
 	let count = 0;
 	for (const referrer of countable) {
+		const isPost = contract.schema(referrer.slug)?.target_model === 'Cms::Post';
 		// EVERY page. A referrer on page two counted as zero is the one answer that
 		// must never be a guess: it reads as "nothing uses this" and talks an editor
 		// into a delete that silently strips the reference.
 		let page = 1;
 		for (;;) {
-			const listed = await apex.listContentLibrary(referrer.slug, {
-				per_page: PAGE_SIZE,
-				page
-			});
+			let listed;
+			try {
+				listed = isPost
+					? await apex.listPostArchetypes(referrer.slug, { per_page: PAGE_SIZE, page })
+					: await apex.listContentLibrary(referrer.slug, { per_page: PAGE_SIZE, page });
+			} catch {
+				return { ok: false };
+			}
 			if (!listed.ok) return { ok: false };
 			for (const record of unwrapArchetypeCollection(listed.body)) {
 				const references = readReferences(record, referrer.itemName);
