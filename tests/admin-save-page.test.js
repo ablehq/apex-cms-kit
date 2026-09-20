@@ -18,6 +18,7 @@ import {
 	structurePayload,
 	getBlocks
 } from '../src/admin/page-draft.js';
+import { isTempId } from '../src/admin/block-serialize.js';
 import { savePage, STALE_MESSAGE } from '../src/admin/save-page.js';
 import { BLANK_SLUG_MESSAGE, RESERVED_SLUG_MESSAGE } from '../src/admin/field-errors.js';
 
@@ -383,7 +384,8 @@ describe('page-draft local model', () => {
 		assert.equal(block.id.startsWith('temp-'), true);
 		assert.equal(block.label, null);
 		assert.equal(block.blockable_type, 'Cms::PageBlock::Spacer');
-		assert.deepEqual(block.blockable, { kind: 'medium' });
+		assert.equal(block.blockable.kind, 'medium');
+		assert.equal(isTempId(block.blockable.id), true, 'the blockable carries a TEMP id');
 		assert.equal(block.position, blocks.indexOf(block));
 		assert.equal(isDirty(draft), true);
 

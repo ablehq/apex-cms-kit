@@ -248,7 +248,10 @@ export function addSpacerBlock(draft) {
 		label: null,
 		position: draft.page.blocks.length,
 		blockable_type: SPACER_BLOCKABLE,
-		blockable: { kind: 'medium' }
+		// A TEMP id, like the template path's instance and entity: `AdminBlockable.id` is
+		// required, so an id-less blockable would be a type that lies to every consumer.
+		// `serializePageBlockForSave` strips temp ids, so Apex still mints the real one.
+		blockable: { id: nextTempId('spacer'), kind: 'medium' }
 	};
 	draft.page.blocks.push(block);
 	applyPositions(draft);
