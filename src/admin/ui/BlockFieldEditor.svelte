@@ -22,7 +22,11 @@
 	/** @type {Record<string, unknown>} */
 	export let fieldsData = {};
 	export let editable = true;
-	/** Every control read-only while a save is in flight. */
+	/**
+	 * Locks every field while a save is in flight. The wrapper uses `inert` so it
+	 * covers the rich-text editor as well as native controls; parent
+	 * `if (saving) return;` guards remain defence in depth.
+	 */
 	export let disabled = false;
 	/**
 	 * Resolve a gallery-item id to a thumbnail URL, when the site can. Returning
@@ -203,7 +207,7 @@
 {:else if fieldDefs.length === 0}
 	<p class="notice">This section has no editable fields.</p>
 {:else}
-	<div class="fields">
+	<div class="fields" inert={disabled}>
 		{#each fieldDefs as def (def.field_name)}
 			<div class="f">
 				{#if def.validator_kind === 'boolean'}
@@ -321,3 +325,14 @@
 		{/each}
 	</div>
 {/if}
+
+<style>
+	.fields[inert] {
+		opacity: 0.45;
+		cursor: default;
+	}
+
+	.fields[inert] :global(*) {
+		cursor: default;
+	}
+</style>
