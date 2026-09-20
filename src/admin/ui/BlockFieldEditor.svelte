@@ -15,6 +15,7 @@
 	Legacy Svelte mode.
 -->
 <script>
+	import { tick } from 'svelte';
 	import RichTextField from './RichTextField.svelte';
 
 	/** @type {import('../types').AdminFieldDef[]} */
@@ -22,7 +23,11 @@
 	/** @type {Record<string, unknown>} */
 	export let fieldsData = {};
 	export let editable = true;
-	/** Every control read-only while a save is in flight. */
+	/**
+	 * Locks every field while a save is in flight. The wrapper uses `inert` so it
+	 * covers the rich-text editor as well as native controls; parent
+	 * `if (saving) return;` guards remain defence in depth.
+	 */
 	export let disabled = false;
 	/**
 	 * Resolve a gallery-item id to a thumbnail URL, when the site can. Returning
@@ -129,6 +134,37 @@
 	/** @type {((name: string) => void) | null} */
 	export let onPickMedia = null;
 
+	/** @type {HTMLDivElement | null} */
+	let fieldsElement = null;
+	/** @type {HTMLElement | null} */
+	let focusedBeforeDisable = null;
+	let wasDisabled = disabled;
+
+	function rememberFocusedElement() {
+		focusedBeforeDisable = null;
+		if (typeof document === 'undefined' || !fieldsElement) return;
+		const active = document.activeElement;
+		if (active instanceof HTMLElement && fieldsElement.contains(active)) {
+			focusedBeforeDisable = active;
+		}
+	}
+
+	async function restoreFocusedElement() {
+		const target = focusedBeforeDisable;
+		await tick();
+		if (typeof document !== 'undefined' && !disabled && target && document.contains(target)) {
+			const active = document.activeElement;
+			if (active === document.body || fieldsElement?.contains(active)) target.focus();
+		}
+		if (focusedBeforeDisable === target) focusedBeforeDisable = null;
+	}
+
+	$: if (disabled !== wasDisabled) {
+		if (disabled) rememberFocusedElement();
+		else restoreFocusedElement();
+		wasDisabled = disabled;
+	}
+
 	// Which plain-text fields are machine-facing, and so set in the mono face. The
 	// prototype's rule, applied by name because that is what the contract gives us.
 	const MACHINE = /(^|_)(anchor_id|href|url|key|slug|id|refs|count)$/u;
@@ -203,7 +239,7 @@
 {:else if fieldDefs.length === 0}
 	<p class="notice">This section has no editable fields.</p>
 {:else}
-	<div class="fields">
+	<div class="fields" inert={disabled} bind:this={fieldsElement}>
 		{#each fieldDefs as def (def.field_name)}
 			<div class="f">
 				{#if def.validator_kind === 'boolean'}
@@ -321,3 +357,14 @@
 		{/each}
 	</div>
 {/if}
+
+<style>
+	.fields[inert] {
+		opacity: 0.45;
+		cursor: default;
+	}
+
+	.fields[inert] :global(*) {
+		cursor: default;
+	}
+</style>

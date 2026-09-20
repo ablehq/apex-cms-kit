@@ -74,6 +74,7 @@ export interface AdminChildTemplateInstance {
 /** What a page block points at. Only the template-instance case is authored here. */
 export interface AdminBlockable {
 	id: string;
+	kind?: string | null;
 	page_block_template_id?: string;
 	page_block_template?: AdminPageBlockTemplate | null;
 	entity?: AdminEntity | null;

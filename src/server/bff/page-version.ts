@@ -75,18 +75,33 @@ function projectBlockable(blockable: BlockableLike | null | undefined): unknown 
 /** Reduce a hydrated Apex page to the version-sensitive projection described above. */
 export function projectPageForVersion(page: PageLike): unknown {
 	const blocks = Array.isArray(page?.blocks) ? page.blocks : [];
-	return {
-		id: page?.id ?? null,
-		status: page?.status ?? null,
-		updated_at: page?.updated_at ?? null,
-		blocks: blocks.map((block) => ({
+	const projectedBlocks = blocks
+		.map((block) => ({
 			id: block?.id ?? null,
 			position: block?.position ?? null,
 			label: block?.label ?? null,
 			blockable_type: block?.blockable_type ?? null,
-			updated_at: block?.updated_at ?? null,
 			blockable: projectBlockable(block?.blockable)
 		}))
+		.sort((a, b) => {
+			const aId = String(a.id ?? '');
+			const bId = String(b.id ?? '');
+			return aId < bId ? -1 : aId > bId ? 1 : 0;
+		});
+	// Two things a structure save's PATCH response gets "wrong" against a fresh GET, with
+	// nothing changed, and both are left out so the save can re-baseline from it:
+	// - ORDER. Cms::Page's has_many :blocks has no order, so Apex lists blocks in heap order.
+	//   Position stays in each projection, so a real reorder still changes the version.
+	// - THE BLOCK'S updated_at. Cms::PageBlockable declares has_one :block, touch: true, so a
+	//   blockable update (a spacer resize) bumps the block row through a different instance
+	//   and the response keeps the old value. It adds no detection: every other block column
+	//   (label, position, blockable_type, blockable_id) is projected, and the same touch
+	//   moves the blockable's own updated_at, which is.
+	return {
+		id: page?.id ?? null,
+		status: page?.status ?? null,
+		updated_at: page?.updated_at ?? null,
+		blocks: projectedBlocks
 	};
 }
 
@@ -102,8 +117,8 @@ function toHex(buffer: ArrayBuffer): string {
 /**
  * Compute the composite version token: a hex SHA-256 over the canonical JSON of the
  * projection (object keys sorted so key-order jitter from Apex never changes the
- * hash; array order preserved so a reorder DOES). Web-standard `crypto.subtle`, so
- * the identical token is produced in workerd and Node.
+ * hash; each block's projected position makes a reorder change it). Web-standard
+ * `crypto.subtle`, so the identical token is produced in workerd and Node.
  */
 export async function computePageVersion(page: PageLike): Promise<string> {
 	const canonical = JSON.stringify(canonicalize(projectPageForVersion(page)));
