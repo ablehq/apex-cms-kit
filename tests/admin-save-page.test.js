@@ -15,6 +15,12 @@ import {
 	setSpacerKind,
 	addCollectionBlock,
 	addListChild,
+	addBundleEntity,
+	removeBundleEntity,
+	moveBundleEntity,
+	setBundleEntityField,
+	newBundleEntities,
+	isBundleBlock,
 	removeListChild,
 	moveListChild,
 	setListChildField,
@@ -880,6 +886,118 @@ describe('child rows inside a section (array_ref fields)', () => {
 		assert.equal(removeListChild(draft, fresh.id, 'f', 'x'), false);
 		assert.equal(moveListChild(draft, fresh.id, 'f', 0, 1), false);
 		assert.equal(setListChildField(draft, fresh.id, 'f', 'x', 'y', 'z'), false);
+	});
+});
+
+describe("a bundle's own children", () => {
+	function pageWithBundle() {
+		const page = samplePage();
+		page.blocks.push({
+			id: 'bundle-block',
+			position: 2,
+			label: null,
+			blockable_type: 'Cms::PageBlock::EntityBundle',
+			blockable: {
+				id: 'bundle-1',
+				entity_type_ids: ['card-type'],
+				entities: [
+					{ id: 'card-a', position: 0, entity_type_id: 'card-type', fields_data: { heading: 'A' } },
+					{ id: 'card-b', position: 0, entity_type_id: 'card-type', fields_data: { heading: 'B' } }
+				]
+			}
+		});
+		return page;
+	}
+
+	it('a REORDER renumbers every sibling and marks each one dirty', () => {
+		// Every live child is position 0 and there is nothing below zero, so moving the
+		// last row to the front cannot be written as one row. And a renumbered row that
+		// is not marked dirty is never emitted, so the drag is silently dropped.
+		const draft = createDraft(pageWithBundle(), 'v');
+		assert.equal(moveBundleEntity(draft, 'bundle-block', 1, 0), true);
+		const rows = draft.page.blocks[2].blockable.entities;
+		assert.deepEqual(
+			rows.map((r) => [r.id, r.position]),
+			[
+				['card-b', 0],
+				['card-a', 1]
+			]
+		);
+		// card-b keeps position 0 — canonicalising [0,0] gives [0,1], so asserting that
+		// every VALUE changed would fail on a correct implementation.
+		const patched = dirtyEntityPatches(draft).map((p) => p.entityId);
+		assert.deepEqual(patched.sort(), ['card-a'], 'only the row whose value changed is patched');
+	});
+
+	it('carries position on the patch, never alone', () => {
+		// The entities route assigns fields and position in one call, and a bare
+		// {position} body is a 500 because fields_data is mandatory.
+		const draft = createDraft(pageWithBundle(), 'v');
+		moveBundleEntity(draft, 'bundle-block', 1, 0);
+		const patch = dirtyEntityPatches(draft).find((p) => p.entityId === 'card-a');
+		assert.equal(patch.position, 1);
+		assert.deepEqual(patch.fields_data, { heading: 'A' });
+	});
+
+	it('a field edit on a bundle child reaches dirtyEntityPatches', () => {
+		// It only does because collectEntities walks blockable.entities — a bundle OWNS
+		// its children, unlike an array_ref row.
+		const draft = createDraft(pageWithBundle(), 'v');
+		assert.equal(setBundleEntityField(draft, 'bundle-block', 'card-a', 'heading', 'edited'), true);
+		const patch = dirtyEntityPatches(draft).find((p) => p.entityId === 'card-a');
+		assert.equal(patch.fields_data.heading, 'edited');
+	});
+
+	it('a NEW child is created by its own leg, not by the page PATCH', () => {
+		const draft = createDraft(pageWithBundle(), 'v');
+		const added = addBundleEntity(draft, 'bundle-block', 'card', { heading: 'C' });
+		assert.ok(added.id.startsWith('temp-'));
+		assert.equal(newBundleEntities(draft).length, 1);
+		assert.equal(newBundleEntities(draft)[0].position, 2);
+		// And it is NOT in the structure payload's entities_attributes.
+		const attr = structurePayload(draft).blocks_attributes.find((b) => b.id === 'bundle-block');
+		assert.equal(attr.blockable_attributes.entities_attributes, undefined);
+		assert.equal(attr.blockable_attributes.entities, undefined, 'the read-back key must not ride');
+	});
+
+	it('only REMOVALS travel on the page PATCH, as _destroy entries', () => {
+		// entities_attributes is the only destroy path and permits no position. An entry
+		// with no id would build a NEW row, so nothing else may be sent here.
+		const draft = createDraft(pageWithBundle(), 'v');
+		assert.equal(removeBundleEntity(draft, 'bundle-block', 'card-a'), true);
+		const attr = structurePayload(draft).blocks_attributes.find((b) => b.id === 'bundle-block');
+		assert.deepEqual(attr.blockable_attributes.entities_attributes, [
+			{ id: 'card-a', _destroy: true }
+		]);
+		assert.equal(attr.blockable_attributes.deleted_entity_ids, undefined);
+		// The survivor was renumbered.
+		assert.equal(draft.page.blocks[2].blockable.entities[0].position, 0);
+	});
+
+	it('removing DIRTIES the draft — or the structure save never happens', () => {
+		const draft = createDraft(pageWithBundle(), 'v');
+		assert.equal(isDirty(draft), false);
+		removeBundleEntity(draft, 'bundle-block', 'card-a');
+		assert.equal(isDirty(draft), true, 'deleted_entity_ids alone does not dirty the draft');
+	});
+
+	it('removing a TEMP child leaves nothing to destroy', () => {
+		const draft = createDraft(pageWithBundle(), 'v');
+		const added = addBundleEntity(draft, 'bundle-block', 'card');
+		assert.equal(removeBundleEntity(draft, 'bundle-block', added.id), true);
+		const attr = structurePayload(draft).blocks_attributes.find((b) => b.id === 'bundle-block');
+		assert.equal(attr.blockable_attributes.entities_attributes, undefined);
+		assert.equal(newBundleEntities(draft).length, 0);
+	});
+
+	it('refuses every operation on a block that is not a bundle', () => {
+		const draft = createDraft(pageWithBundle(), 'v');
+		const other = draft.page.blocks[0].id;
+		assert.equal(isBundleBlock(draft.page.blocks[0]), false);
+		assert.equal(addBundleEntity(draft, other, 'card'), null);
+		assert.equal(removeBundleEntity(draft, other, 'x'), false);
+		assert.equal(moveBundleEntity(draft, other, 0, 1), false);
+		assert.equal(setBundleEntityField(draft, other, 'x', 'y', 'z'), false);
 	});
 });
 

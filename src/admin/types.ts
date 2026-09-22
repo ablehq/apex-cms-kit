@@ -439,7 +439,20 @@ export interface BffClient {
 	 */
 	createEntity(
 		entityType: string,
-		fieldsData: Record<string, unknown>
+		fieldsData: Record<string, unknown>,
+		/**
+		 * Owner-scoped creation, for a block that OWNS its children.
+		 *
+		 * `page_id` is read by the BFF and never forwarded: it is what lets the guard
+		 * prove `owner_id` is a bundle on the page the caller named. Without it the
+		 * rule "the owner must be a block on this page" has nothing to check against.
+		 */
+		owner?: {
+			owner_type: string;
+			owner_id: string;
+			position?: number;
+			page_id?: string;
+		}
 	): Promise<BffMutationResult & { entity?: { id?: string } }>;
 	/**
 	 * `400 reserved-slug` is a refusal here too, on a RENAME, and `400 invalid-slug`

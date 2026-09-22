@@ -3,6 +3,8 @@
 // behavior is covered by tests/admin-save-page.test.js + tests/bff-realapex.test.js.
 import {
 	adoptListChildId,
+	BUNDLE_BLOCKABLE,
+	newBundleEntities,
 	dirtyEntityPatches,
 	editedListChildren,
 	newListChildren,
@@ -149,6 +151,49 @@ export async function savePage(draft, client, options = {}) {
 			};
 		}
 		adoptListChildId(draft, row.blockId, row.fieldName, row.id, realId);
+	}
+
+	// 2B. CREATE each new BUNDLE child. Its owner is the bundle's blockable, and the
+	// entities route carries fields, owner and position in ONE call — the page-PATCH
+	// alternative mints an empty row and then needs a second write for its fields.
+	//
+	// `entities_attributes` on the page PATCH cannot express any of this: it permits
+	// no `:position`, and it is used below for removals only.
+	for (const child of newBundleEntities(draft)) {
+		const block = draft.page.blocks.find((candidate) => candidate.id === child.blockId);
+		const ownerId = block?.blockable?.id;
+		if (!ownerId || isTempId(`${ownerId}`)) {
+			return {
+				ok: false,
+				stage: 'children',
+				message: 'Save the page once before adding cards to a new section.'
+			};
+		}
+		const res = await client.createEntity(child.childType, child.fields_data, {
+			owner_type: BUNDLE_BLOCKABLE,
+			owner_id: ownerId,
+			position: child.position,
+			page_id: pageId
+		});
+		if (!res.ok) {
+			return {
+				ok: false,
+				stage: 'children',
+				status: res.status,
+				message: messageFor('children', res)
+			};
+		}
+		const realId = res.entity?.id ?? res.data?.id ?? res.id;
+		if (!realId) {
+			return {
+				ok: false,
+				stage: 'children',
+				message: 'A card was created but Apex did not return its id. Save again to retry.'
+			};
+		}
+		// Adopt in place, so a retry after a later failure does not create it twice.
+		const row = (block.blockable.entities ?? []).find((item) => item.id === child.id);
+		if (row) row.id = realId;
 	}
 
 	// 3N. PATCH each EDITED existing child row. These entities are free-standing —

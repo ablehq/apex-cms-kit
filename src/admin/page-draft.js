@@ -394,6 +394,164 @@ export function listChildRows(draft, blockId, fieldName) {
 }
 
 /**
+ * ── A BUNDLE'S OWN CHILDREN (`Cms::PageBlock::EntityBundle`) ────────────────
+ *
+ * Different from an `array_ref` list in every way that matters: the bundle OWNS
+ * these rows (`has_many :entities, as: :owner, dependent: :destroy`), their order
+ * lives on the row as `position` rather than in an array, and destroying the block
+ * destroys them.
+ *
+ * `Cms::PageBlock::EntityGroup` has the identical mechanism. Nothing on these sites
+ * uses one, and `isBundleBlock` deliberately does not claim it — but the operations
+ * take the block, not a hard-coded type, so adopting it later is a predicate change.
+ */
+export const BUNDLE_BLOCKABLE = 'Cms::PageBlock::EntityBundle';
+
+/** @param {AdminPageBlock | null | undefined} block */
+export function isBundleBlock(block) {
+	return block?.blockable_type === BUNDLE_BLOCKABLE;
+}
+
+/** The bundle's children as stored, or `[]`. */
+function ownedChildren(block) {
+	const rows = block?.blockable?.entities;
+	return Array.isArray(rows) ? rows : [];
+}
+
+/**
+ * Give every sibling a contiguous `position`, and mark each one dirty.
+ *
+ * Renumbering the WHOLE set is not tidiness. Every live child is `position: 0` and
+ * there is no value below zero, so moving the last row to the front cannot be
+ * expressed by writing that one row. And each renumbered row must be marked dirty or
+ * `dirtyEntityPatches` emits none of them and the drag is silently dropped.
+ */
+function renumber(draft, block) {
+	ownedChildren(block).forEach((child, index) => {
+		if (!child?.id) return;
+		if (child.position !== index) {
+			child.position = index;
+			draft.dirtyEntityIds.add(child.id);
+		}
+	});
+}
+
+/**
+ * Add a child to a bundle. It is created by its own leg, so it carries a temp id
+ * until then — but unlike an `array_ref` row there is no parent array to keep it out
+ * of, so it lives in the block where the editor can see it.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} childType the entity type SLUG
+ * @param {Record<string, unknown>} [fieldsData]
+ * @returns {{ id: string } | null}
+ */
+export function addBundleEntity(draft, blockId, childType, fieldsData = {}) {
+	const block = findBlock(draft, blockId);
+	if (!isBundleBlock(block) || !block.blockable) return null;
+	if (typeof childType !== 'string' || !childType) return null;
+	if (!Array.isArray(block.blockable.entities)) block.blockable.entities = [];
+	const child = {
+		id: nextTempId('bundle-child'),
+		childType,
+		position: block.blockable.entities.length,
+		fields_data: fieldsData && typeof fieldsData === 'object' ? { ...fieldsData } : {}
+	};
+	block.blockable.entities.push(child);
+	draft.structureDirty = true;
+	return child;
+}
+
+/**
+ * Remove a child. A stored row is destroyed with the page save; a temp one just goes.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} childId
+ * @returns {boolean}
+ */
+export function removeBundleEntity(draft, blockId, childId) {
+	const block = findBlock(draft, blockId);
+	if (!isBundleBlock(block) || !block.blockable) return false;
+	const rows = ownedChildren(block);
+	const at = rows.findIndex((row) => row?.id === childId);
+	if (at === -1) return false;
+	const [removed] = rows.splice(at, 1);
+	if (!isTempId(`${removed.id}`)) {
+		if (!Array.isArray(block.blockable.deleted_entity_ids)) {
+			block.blockable.deleted_entity_ids = [];
+		}
+		block.blockable.deleted_entity_ids.push(removed.id);
+	}
+	draft.dirtyEntityIds.delete(removed.id);
+	// Explicitly: pushing onto `deleted_entity_ids` does not dirty the draft by
+	// itself, and without this `savePage` skips the structure PATCH and the removal
+	// is silently dropped.
+	draft.structureDirty = true;
+	renumber(draft, block);
+	return true;
+}
+
+/**
+ * Move a child within its bundle. Renumbers every sibling — see `renumber`.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {number} from
+ * @param {number} to
+ * @returns {boolean}
+ */
+export function moveBundleEntity(draft, blockId, from, to) {
+	const block = findBlock(draft, blockId);
+	if (!isBundleBlock(block) || !block.blockable) return false;
+	const rows = ownedChildren(block);
+	if (!Number.isInteger(from) || !Number.isInteger(to)) return false;
+	if (from < 0 || to < 0 || from >= rows.length || to >= rows.length) return false;
+	if (from === to) return true;
+	const [moved] = rows.splice(from, 1);
+	rows.splice(to, 0, moved);
+	renumber(draft, block);
+	return true;
+}
+
+/**
+ * Set a field on one of a bundle's children.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} childId
+ * @param {string} fieldName
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function setBundleEntityField(draft, blockId, childId, fieldName, value) {
+	const block = findBlock(draft, blockId);
+	if (!isBundleBlock(block) || !block.blockable) return false;
+	if (typeof fieldName !== 'string' || !fieldName) return false;
+	const child = ownedChildren(block).find((row) => row?.id === childId);
+	if (!child) return false;
+	if (!child.fields_data || typeof child.fields_data !== 'object') child.fields_data = {};
+	child.fields_data[fieldName] = value;
+	// A temp child is created by its own leg and carries its fields there; only a
+	// stored one goes through the dirty-entity patch.
+	if (!isTempId(`${child.id}`)) draft.dirtyEntityIds.add(child.id);
+	return true;
+}
+
+/** The children a save must CREATE, with the block that owns them. */
+export function newBundleEntities(draft) {
+	const out = [];
+	for (const block of draft.page.blocks) {
+		if (!isBundleBlock(block)) continue;
+		for (const child of ownedChildren(block)) {
+			if (isTempId(`${child.id}`)) out.push({ blockId: block.id, ...child });
+		}
+	}
+	return out;
+}
+
+/**
  * Reorder blocks by moving one index to another. LOCAL ONLY — this rewrites
  * `position` on the in-memory draft and marks structure dirty; it NEVER calls the
  * BFF. Persistence happens only when `savePage()` runs (plan M1: "reordering is
@@ -811,6 +969,13 @@ function collectEntities(draft) {
 				if (child.entity?.id) entities.set(child.entity.id, child.entity);
 			}
 		}
+		// A bundle OWNS its children, so a field edit on one rides the dirty-entity leg.
+		// List children are deliberately NOT here: those are free-standing, written by
+		// their own leg, and collecting them would write each row twice.
+		const owned = block.blockable?.entities;
+		if (Array.isArray(owned)) {
+			for (const child of owned) if (child?.id) entities.set(child.id, child);
+		}
 	}
 	return entities;
 }
@@ -833,11 +998,17 @@ export function dirtyEntityPatches(draft) {
 	for (const entityId of draft.dirtyEntityIds) {
 		const entity = entities.get(entityId);
 		if (!entity || isTempId(`${entity.id}`)) continue;
-		patches.push({
+		const patch = {
 			entityTypeId: entity.entity_type_id,
 			entityId: entity.id,
 			fields_data: clone(entity.fields_data || {})
-		});
+		};
+		// A bundle child's row order lives on the row. `position` can never travel
+		// without `fields_data` — the entities route assigns both in one call and a
+		// bare `{position}` body is a 500 — so it rides this patch rather than a leg
+		// of its own.
+		if (Number.isInteger(entity.position)) patch.position = entity.position;
+		patches.push(patch);
 	}
 	return patches;
 }
