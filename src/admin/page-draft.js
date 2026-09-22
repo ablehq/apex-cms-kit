@@ -343,6 +343,25 @@ function resolveTarget(sources, refName) {
 }
 
 /**
+ * A stored `ref_name`, in the spelling this comparison works in.
+ *
+ * Apex stores whatever was written: `team member`, `team_member`, `Focus-Area`. Both
+ * sites already normalise the same way before dispatching, so the kit has to as well
+ * — matching the raw string here made `setCollectionItemCount` return false for an
+ * underscored band whose panel the site had already decided to show, which reads as a
+ * "How many" box that silently does nothing.
+ *
+ * @param {unknown} value
+ */
+function normalizeRef(value) {
+	return String(value ?? '')
+		.toLowerCase()
+		.trim()
+		.replace(/[_-]+/gu, ' ')
+		.replace(/\s+/gu, ' ');
+}
+
+/**
  * The source a STORED `ref_name` belongs to — canonical spelling or alias.
  *
  * This is the comparison half, and it has to accept aliases where `resolveTarget`
@@ -357,13 +376,16 @@ function resolveTarget(sources, refName) {
  * @returns {CollectionSource | null}
  */
 function resolveStored(sources, refName) {
-	if (!Array.isArray(sources) || typeof refName !== 'string' || !refName) return null;
+	if (!Array.isArray(sources)) return null;
+	const wanted = normalizeRef(refName);
+	if (!wanted) return null;
 	return (
 		sources
 			.filter(
 				(source) =>
-					source?.refName === refName ||
-					(Array.isArray(source?.aliases) && source.aliases.includes(refName))
+					normalizeRef(source?.refName) === wanted ||
+					(Array.isArray(source?.aliases) &&
+						source.aliases.some((alias) => normalizeRef(alias) === wanted))
 			)
 			.find(isUsableSource) ?? null
 	);

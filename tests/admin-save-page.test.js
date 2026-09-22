@@ -555,6 +555,39 @@ describe('generated listings (Cms::PageBlock::AutoCollection)', () => {
 		assert.equal(addCollectionBlock(draft, 'story', SOURCES, null).blockable.kind, 'archetype');
 	});
 
+	it('reads a stored ref in ANY spelling Apex might hold', () => {
+		// The site normalises before deciding to show the panel; if the kit matched the
+		// raw string, an underscored band got a "How many" box that silently did nothing
+		// — no error, no dirty flag, no save, the typed number just sitting there.
+		for (const stored of ['story', 'Story', 'STORY']) {
+			const page = samplePage();
+			page.blocks.push({
+				id: 'b1',
+				position: 2,
+				blockable_type: 'Cms::PageBlock::AutoCollection',
+				blockable: { id: 'c1', kind: 'archetype', ref_name: stored, item_count: 3 }
+			});
+			const draft = createDraft(page, 'baseline-v');
+			assert.equal(setCollectionItemCount(draft, 'b1', 5, SOURCES), true, stored);
+			assert.equal(isDirty(draft), true, stored);
+		}
+		// And an underscored alias of a multi-word source.
+		const page = samplePage();
+		page.blocks.push({
+			id: 'b1',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::AutoCollection',
+			blockable: { id: 'c1', kind: 'archetype', ref_name: 'team_member', item_count: 4 }
+		});
+		const draft = createDraft(page, 'baseline-v');
+		// team member declares itemCount 'none', so the refusal here is the RULE, not a
+		// failure to recognise the spelling — proven by the switch below being a no-op.
+		assert.equal(setCollectionItemCount(draft, 'b1', 5, SOURCES), false);
+		assert.equal(setCollectionSource(draft, 'b1', 'team member', SOURCES), true);
+		assert.equal(draft.page.blocks[2].blockable.ref_name, 'team_member', 'recognised, so no-op');
+		assert.equal(isDirty(draft), false);
+	});
+
 	it('REFUSES a count on a source whose count is a mode switch, not a limit', () => {
 		// Poovayya's team band renders a search-and-filter UI at 0 and a capped grid at
 		// any positive value, so a "count" written there deletes the live search box.
