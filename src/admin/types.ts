@@ -432,6 +432,16 @@ export interface BffClient {
 		fieldsData: Record<string, unknown>
 	): Promise<BffMutationResult>;
 	/**
+	 * Mint one content-library entity and return its id — a child row of an
+	 * `array_ref` field, created BEFORE the section that will name it (§7.1).
+	 * `entityType` is the type's SLUG; the route takes an id or a slug and the
+	 * BFF's allow-list holds slugs.
+	 */
+	createEntity(
+		entityType: string,
+		fieldsData: Record<string, unknown>
+	): Promise<BffMutationResult & { entity?: { id?: string } }>;
+	/**
 	 * `400 reserved-slug` is a refusal here too, on a RENAME, and `400 invalid-slug`
 	 * is the blank-slug one — `save-page.js` names both.
 	 */

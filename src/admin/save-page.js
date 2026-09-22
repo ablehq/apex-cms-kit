@@ -1,7 +1,14 @@
 // @ts-nocheck — legacy-mode admin browser module (plan §8, 3a compile-mode (a)).
 // Deliberately untyped JS to sit beside the legacy-compiled admin components; its
 // behavior is covered by tests/admin-save-page.test.js + tests/bff-realapex.test.js.
-import { dirtyEntityPatches, structurePayload, reconcile } from './page-draft.js';
+import {
+	adoptListChildId,
+	dirtyEntityPatches,
+	editedListChildren,
+	newListChildren,
+	structurePayload,
+	reconcile
+} from './page-draft.js';
 import { isTempId } from './block-serialize.js';
 import { BLANK_SLUG_MESSAGE, RESERVED_SLUG_MESSAGE } from './field-errors.js';
 
@@ -32,6 +39,14 @@ function messageFor(stage, result) {
 		return status === 422
 			? 'A section field was rejected (check required values). Your other changes were not saved yet — fix it and Save again.'
 			: 'Saving a section field failed. Nothing after it was saved — Save again to retry.';
+	}
+	if (stage === 'children') {
+		// The rows are free-standing entities created before the section that names
+		// them, so a failure here means NOTHING about the page changed — which is the
+		// opposite of the 'fields' case and has to be said differently.
+		return status === 422
+			? 'A row in a list was rejected (check its required values). Nothing on the page was saved yet — fix it and Save again.'
+			: 'Saving a row in a list failed. Nothing on the page was saved — Save again to retry.';
 	}
 	if (stage === 'new-block-fields') {
 		return 'The new section was added, but its fields could not be saved. Open it, check its values and Save again.';
@@ -105,6 +120,50 @@ export async function savePage(draft, client, options = {}) {
 	}
 	if (current?.version !== draft.baselineVersion) {
 		return { ok: false, stale: true, stage: 'version', message: STALE_MESSAGE };
+	}
+
+	// 2N. CREATE each new child row of an `array_ref` field, BEFORE the parent that
+	// will name it. An `array_ref` element must be the id of an entity that already
+	// exists — Apex resolves every element on write and 422s on one it cannot find,
+	// naming a field the editor never typed into.
+	//
+	// Each id is adopted into the parent's array IN THE DRAFT as it lands, so a retry
+	// after a later failure does not create the same row twice. That is
+	// `save-record.js`'s rule, unchanged.
+	for (const row of newListChildren(draft)) {
+		const res = await client.createEntity(row.childType, row.fields_data);
+		if (!res.ok) {
+			return {
+				ok: false,
+				stage: 'children',
+				status: res.status,
+				message: messageFor('children', res)
+			};
+		}
+		const realId = res.entity?.id ?? res.data?.id ?? res.id;
+		if (!realId) {
+			return {
+				ok: false,
+				stage: 'children',
+				message: 'A row was created but Apex did not return its id. Save again to retry.'
+			};
+		}
+		adoptListChildId(draft, row.blockId, row.fieldName, row.id, realId);
+	}
+
+	// 3N. PATCH each EDITED existing child row. These entities are free-standing —
+	// `collectEntities` walks blocks and never reaches them — so they are their own
+	// leg rather than part of the dirty-entity set below.
+	for (const edit of editedListChildren(draft)) {
+		const res = await client.patchEntityFields(edit.childType, edit.childId, edit.fields_data);
+		if (!res.ok) {
+			return {
+				ok: false,
+				stage: 'children',
+				status: res.status,
+				message: messageFor('children', res)
+			};
+		}
 	}
 
 	// 2. Dirty entity field PATCHes, in order. Stop on the first failure so the

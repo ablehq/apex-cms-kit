@@ -286,9 +286,19 @@ export function moveListChild(draft, blockId, fieldName, from, to) {
  * @param {string} childId
  * @param {string} childField
  * @param {unknown} value
+ * @param {string} [childType] required for a STORED row — the PATCH route is
+ *   `entity_types/:ref/entities/:id`, so the type travels with the edit
  * @returns {boolean}
  */
-export function setListChildField(draft, blockId, fieldName, childId, childField, value) {
+export function setListChildField(
+	draft,
+	blockId,
+	fieldName,
+	childId,
+	childField,
+	value,
+	childType
+) {
 	const block = findBlock(draft, blockId);
 	if (!canEditFields(block)) return false;
 	if (typeof childField !== 'string' || !childField) return false;
@@ -299,9 +309,12 @@ export function setListChildField(draft, blockId, fieldName, childId, childField
 	}
 	if (!storedIds(block, fieldName).includes(childId)) return false;
 	if (isTempId(`${childId}`)) return false;
+	if (typeof childType !== 'string' || !childType) return false;
 	if (!draft.listChildEdits) draft.listChildEdits = {};
-	if (!draft.listChildEdits[childId]) draft.listChildEdits[childId] = {};
-	draft.listChildEdits[childId][childField] = value;
+	if (!draft.listChildEdits[childId]) {
+		draft.listChildEdits[childId] = { childType, fields_data: {} };
+	}
+	draft.listChildEdits[childId].fields_data[childField] = value;
 	return true;
 }
 
@@ -348,9 +361,10 @@ export function newListChildren(draft) {
  * @param {AdminPageDraft} draft
  */
 export function editedListChildren(draft) {
-	return Object.entries(draft.listChildEdits ?? {}).map(([childId, fields_data]) => ({
+	return Object.entries(draft.listChildEdits ?? {}).map(([childId, edit]) => ({
 		childId,
-		fields_data
+		childType: edit.childType,
+		fields_data: edit.fields_data
 	}));
 }
 
@@ -368,7 +382,7 @@ export function listChildRows(draft, blockId, fieldName) {
 	const stored = storedIds(block, fieldName).map((id) => ({
 		id,
 		pending: false,
-		fields_data: edits[id] ? { ...edits[id] } : {}
+		fields_data: edits[id] ? { ...edits[id].fields_data } : {}
 	}));
 	const pending = pendingRows(draft, block.id, fieldName).map((row) => ({
 		id: row.id,

@@ -814,16 +814,31 @@ describe('child rows inside a section (array_ref fields)', () => {
 		const draft = createDraft(pageWithList(), 'v');
 		const blockId = getBlocks(draft)[0].id;
 		assert.equal(
-			setListChildField(draft, blockId, 'why_choose_points', 'row-1', 'text', 'edited'),
+			setListChildField(
+				draft,
+				blockId,
+				'why_choose_points',
+				'row-1',
+				'text',
+				'edited',
+				'strength-item'
+			),
 			true
 		);
 		assert.deepEqual(editedListChildren(draft), [
-			{ childId: 'row-1', fields_data: { text: 'edited' } }
+			{ childId: 'row-1', childType: 'strength-item', fields_data: { text: 'edited' } }
 		]);
 		assert.equal(
-			setListChildField(draft, blockId, 'why_choose_points', 'not-a-row', 'text', 'x'),
+			setListChildField(draft, blockId, 'why_choose_points', 'not-a-row', 'text', 'x', 's'),
 			false,
 			'a row that is not in the array is refused'
+		);
+		// The PATCH route is `entity_types/:ref/entities/:id`, so an edit with no type
+		// could not be dispatched — refuse it here rather than at the request.
+		assert.equal(
+			setListChildField(draft, blockId, 'why_choose_points', 'row-2', 'text', 'x'),
+			false,
+			'a stored edit without its child type is refused'
 		);
 	});
 
@@ -845,7 +860,7 @@ describe('child rows inside a section (array_ref fields)', () => {
 		const draft = createDraft(pageWithList(), 'v');
 		const blockId = getBlocks(draft)[0].id;
 		addListChild(draft, blockId, 'why_choose_points', 'strength-item');
-		setListChildField(draft, blockId, 'why_choose_points', 'row-1', 'text', 'edited');
+		setListChildField(draft, blockId, 'why_choose_points', 'row-1', 'text', 'e', 'strength-item');
 		assert.equal(newListChildren(draft).length, 1);
 		assert.equal(editedListChildren(draft).length, 1);
 
