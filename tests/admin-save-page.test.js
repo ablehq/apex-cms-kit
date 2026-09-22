@@ -350,22 +350,53 @@ describe("savePage's child legs — the seam the unit tests used to miss", () =>
 		);
 	});
 
-	it('a failure that wrote NOTHING keeps its baseline, so a real conflict is still caught', async () => {
-		// The refresh is deliberately conditional. If the very first write is refused,
-		// nothing moved, and quietly adopting whatever the server says now would mask a
-		// genuine concurrent edit.
+	it('a REFUSED first write keeps its baseline, so a real conflict is still caught', async () => {
+		// A 4xx is decided before anything is written, so the server did not move. If
+		// somebody ELSE moved it in that window, adopting their version here would let
+		// the retry sail through the stale guard and overwrite their edit. The refresh
+		// is therefore conditional on a write having actually landed.
+		// (codex's review of this branch, 2026-09-22.)
 		const draft = createDraft(pageWithList(), 'baseline-v');
 		const blockId = getBlocks(draft)[0].id;
 		addListChild(draft, blockId, 'why_choose_points', 'strength-item');
-		const client = makeClient({
-			results: { createEntity: () => ({ ok: false, status: 422 }) }
+		let client;
+		client = makeClient({
+			results: {
+				createEntity: () => {
+					// Someone else saves the page in the same window.
+					client.setServerVersion('someone-elses-version');
+					return { ok: false, status: 422 };
+				}
+			}
 		});
+		client.setServerVersion('baseline-v');
 		const saved = await savePage(draft, client);
 		assert.equal(saved.ok, false);
-		// The create was attempted, so the baseline IS refreshed — to the same value,
-		// because a 422 changed nothing. What matters is that it is never left behind
-		// the server.
-		assert.equal(draft.baselineVersion, 'baseline-v');
+		assert.equal(
+			draft.baselineVersion,
+			'baseline-v',
+			'a refusal must NOT adopt a version that moved for someone else'
+		);
+		// And the next Save is correctly refused as stale, which is the honest answer.
+		assert.equal((await savePage(draft, client)).stale, true);
+	});
+
+	it('a 5xx DOES refresh, because it may have applied and failed to report', async () => {
+		const draft = createDraft(pageWithList(), 'baseline-v');
+		const blockId = getBlocks(draft)[0].id;
+		addListChild(draft, blockId, 'why_choose_points', 'strength-item');
+		let client;
+		client = makeClient({
+			results: {
+				createEntity: () => {
+					client.setServerVersion('version-after-a-write-we-cannot-see');
+					return { ok: false, status: 500 };
+				}
+			}
+		});
+		client.setServerVersion('baseline-v');
+		await savePage(draft, client);
+		assert.equal(draft.baselineVersion, 'version-after-a-write-we-cannot-see');
 	});
 
 	it('a BUNDLE child is created with its owner, its position and its page', async () => {

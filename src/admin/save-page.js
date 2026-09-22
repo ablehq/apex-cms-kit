@@ -134,10 +134,16 @@ function seededNewBlockFields(draft) {
  * their own half-save. The advice that comes with that refusal is to reload, which
  * throws away the very changes the retry was for.
  *
- * So: when we know we wrote, re-read the version and adopt it, and the retry
- * compares against reality. `wrote` is set immediately before each mutating call, so
- * a save that failed before writing anything KEEPS its old baseline and a genuine
- * concurrent edit is still caught.
+ * So: when the server could have moved because of US, re-read the version and adopt
+ * it, and the retry compares against reality. Two things make that true — a write
+ * that definitely landed earlier in this save (`wroteOk`), or a failure that is NOT
+ * a refusal. A 4xx is decided before anything is written; a 5xx or a thrown request
+ * may have applied and then failed to report, so it counts.
+ *
+ * A save that only ever got refused therefore KEEPS its old baseline, and a genuine
+ * concurrent edit is still caught. What remains is the case one version token cannot
+ * express: our write landed and someone else's landed in the same window. That needs
+ * a per-row token, not a page one — noted on the PR rather than papered over.
  *
  * A failed re-read leaves the baseline alone. That is the safe direction: the editor
  * gets the stale notice on retry, which is wrong but recoverable, rather than a
@@ -145,12 +151,14 @@ function seededNewBlockFields(draft) {
  *
  * @param {import('./types').AdminPageDraft} draft
  * @param {import('./types').BffClient} client
- * @param {boolean} wrote
+ * @param {boolean} wroteOk true once a mutating call in this save has succeeded
  * @param {import('./types').SavePageResult} result
  * @returns {Promise<import('./types').SavePageResult>}
  */
-async function failAfterWrites(draft, client, wrote, result) {
-	if (!wrote) return result;
+async function failAfterWrites(draft, client, wroteOk, result) {
+	const status = result?.status;
+	const refusal = typeof status === 'number' && status >= 400 && status < 500;
+	if (!wroteOk && refusal) return result;
 	try {
 		const current = await client.readVersion(draft.pageId);
 		if (current?.version) draft.baselineVersion = current.version;
@@ -200,11 +208,15 @@ export async function savePage(draft, client, options = {}) {
 	 */
 	let childrenWritten = false;
 	/**
-	 * Has ANY mutating call gone out yet this save? Set immediately BEFORE each one,
-	 * not after: a call that fails with a 500 may still have applied, and the whole
-	 * point of the flag is to know whether the server could have moved.
+	 * Has a write DEFINITELY landed this save?
+	 *
+	 * Set after each successful mutating response — not before the call. Together
+	 * with the failing response's own status it decides whether the draft re-baselines
+	 * (see `failAfterWrites`): a 4xx with nothing landed yet moved nothing, and
+	 * adopting a version in that case would adopt someone ELSE's write and let the
+	 * retry sail through the stale guard over the top of it.
 	 */
-	let wrote = false;
+	let wroteOk = false;
 
 	// 2N. CREATE each new child row of an `array_ref` field, BEFORE the parent that
 	// will name it. An `array_ref` element must be the id of an entity that already
@@ -216,10 +228,9 @@ export async function savePage(draft, client, options = {}) {
 	// `save-record.js`'s rule, unchanged.
 	for (const row of newListChildren(draft)) {
 		childrenWritten = true;
-		wrote = true;
 		const res = await client.createEntity(row.childType, row.fields_data);
 		if (!res.ok) {
-			return failAfterWrites(draft, client, wrote, {
+			return failAfterWrites(draft, client, wroteOk, {
 				ok: false,
 				stage: 'children',
 				status: res.status,
@@ -231,12 +242,13 @@ export async function savePage(draft, client, options = {}) {
 		// report failure while the entity existed, so the next Save minted another.
 		const realId = res.entityId;
 		if (!realId) {
-			return failAfterWrites(draft, client, wrote, {
+			return failAfterWrites(draft, client, wroteOk, {
 				ok: false,
 				stage: 'children',
 				message: 'A row was created but Apex did not return its id. Save again to retry.'
 			});
 		}
+		wroteOk = true;
 		adoptListChildId(draft, row.blockId, row.fieldName, row.id, realId);
 	}
 
@@ -250,13 +262,12 @@ export async function savePage(draft, client, options = {}) {
 		const block = draft.page.blocks.find((candidate) => candidate.id === child.blockId);
 		const ownerId = block?.blockable?.id;
 		if (!ownerId || isTempId(`${ownerId}`)) {
-			return failAfterWrites(draft, client, wrote, {
+			return failAfterWrites(draft, client, wroteOk, {
 				ok: false,
 				stage: 'children-owned',
 				message: 'Save the page once before adding cards to a new section.'
 			});
 		}
-		wrote = true;
 		const res = await client.createEntity(child.childType, child.fields_data, {
 			owner_type: BUNDLE_BLOCKABLE,
 			owner_id: ownerId,
@@ -264,7 +275,7 @@ export async function savePage(draft, client, options = {}) {
 			page_id: pageId
 		});
 		if (!res.ok) {
-			return failAfterWrites(draft, client, wrote, {
+			return failAfterWrites(draft, client, wroteOk, {
 				ok: false,
 				stage: 'children-owned',
 				status: res.status,
@@ -276,12 +287,13 @@ export async function savePage(draft, client, options = {}) {
 		// report failure while the entity existed, so the next Save minted another.
 		const realId = res.entityId;
 		if (!realId) {
-			return failAfterWrites(draft, client, wrote, {
+			return failAfterWrites(draft, client, wroteOk, {
 				ok: false,
 				stage: 'children-owned',
 				message: 'A card was created but Apex did not return its id. Save again to retry.'
 			});
 		}
+		wroteOk = true;
 		// Adopt in place, so a retry after a later failure does not create it twice.
 		const row = (block.blockable.entities ?? []).find((item) => item.id === child.id);
 		if (row) row.id = realId;
@@ -292,22 +304,21 @@ export async function savePage(draft, client, options = {}) {
 	// leg rather than part of the dirty-entity set below.
 	for (const edit of editedListChildren(draft)) {
 		childrenWritten = true;
-		wrote = true;
 		const res = await client.patchEntityFields(edit.childType, edit.childId, edit.fields_data);
 		if (!res.ok) {
-			return failAfterWrites(draft, client, wrote, {
+			return failAfterWrites(draft, client, wroteOk, {
 				ok: false,
 				stage: 'children-edit',
 				status: res.status,
 				message: messageFor('children-edit', res)
 			});
 		}
+		wroteOk = true;
 	}
 
 	// 2. Dirty entity field PATCHes, in order. Stop on the first failure so the
 	// structure/status writes below are never dispatched after a partial failure.
 	for (const patch of dirtyEntityPatches(draft)) {
-		wrote = true;
 		const res = await client.patchEntityFields(
 			patch.entityTypeId,
 			patch.entityId,
@@ -319,13 +330,14 @@ export async function savePage(draft, client, options = {}) {
 			// otherwise, and tells the editor their other changes were not saved — when
 			// the truth is that the order is half-written and the fix is to Save again.
 			const stage = Number.isInteger(patch.position) ? 'order' : 'fields';
-			return failAfterWrites(draft, client, wrote, {
+			return failAfterWrites(draft, client, wroteOk, {
 				ok: false,
 				stage,
 				status: res.status,
 				message: messageFor(stage, res)
 			});
 		}
+		wroteOk = true;
 	}
 
 	// 3. Page structure — only if it changed. Carries block order / add / remove.
@@ -334,16 +346,16 @@ export async function savePage(draft, client, options = {}) {
 	// Captured BEFORE the structure save: after it, `reconcile` replaces the tree.
 	const seeded = draft.structureDirty ? seededNewBlockFields(draft) : [];
 	if (draft.structureDirty || draft.deletedBlockIds.length > 0) {
-		wrote = true;
 		const res = await client.savePageStructure(pageId, structurePayload(draft));
 		if (!res.ok) {
-			return failAfterWrites(draft, client, wrote, {
+			return failAfterWrites(draft, client, wroteOk, {
 				ok: false,
 				stage: 'structure',
 				status: res.status,
 				message: messageFor('structure', res)
 			});
 		}
+		wroteOk = true;
 		freshPage = res.page ?? null;
 		freshVersion = res.version ?? null;
 	}
@@ -359,7 +371,15 @@ export async function savePage(draft, client, options = {}) {
 			try {
 				minted = (await client.getPage(pageId)).page;
 			} catch {
-				return { ok: false, stage: 'new-block-fields', message: messageFor('new-block-fields') };
+				// The structure write already landed, so this exit re-baselines like every
+				// other post-write failure. Returning directly left the draft behind the
+				// server and the next Save was refused as stale — about this editor's own
+				// write, with advice to reload that discards the copied fields.
+				return failAfterWrites(draft, client, wroteOk, {
+					ok: false,
+					stage: 'new-block-fields',
+					message: messageFor('new-block-fields')
+				});
 			}
 		}
 		const byPosition = [...(Array.isArray(minted?.blocks) ? minted.blocks : [])].sort(
@@ -368,11 +388,16 @@ export async function savePage(draft, client, options = {}) {
 		for (const { position, fields_data } of seeded) {
 			const entity = byPosition[position]?.blockable?.entity;
 			if (!entity?.id || isTempId(`${entity.id}`) || !entity.entity_type_id) {
-				return { ok: false, stage: 'new-block-fields', message: messageFor('new-block-fields') };
+				// Same reason as the catch above: the section exists on the server now.
+				return failAfterWrites(draft, client, wroteOk, {
+					ok: false,
+					stage: 'new-block-fields',
+					message: messageFor('new-block-fields')
+				});
 			}
 			const res = await client.patchEntityFields(entity.entity_type_id, entity.id, fields_data);
 			if (!res.ok) {
-				return failAfterWrites(draft, client, wrote, {
+				return failAfterWrites(draft, client, wroteOk, {
 					ok: false,
 					stage: 'new-block-fields',
 					status: res.status,
@@ -389,16 +414,16 @@ export async function savePage(draft, client, options = {}) {
 	// step above returned. A status change invalidates the structure snapshot, so we
 	// force a fresh read below.
 	if (statusEvent) {
-		wrote = true;
 		const res = await client.changePageStatus(pageId, statusEvent);
 		if (!res.ok) {
-			return failAfterWrites(draft, client, wrote, {
+			return failAfterWrites(draft, client, wroteOk, {
 				ok: false,
 				stage: 'status',
 				status: res.status,
 				message: messageFor('status', res)
 			});
 		}
+		wroteOk = true;
 		freshPage = null;
 	}
 

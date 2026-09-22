@@ -181,6 +181,18 @@ export async function handleCreateEntity(
 	const parsed = createEntityBodySchema.safeParse(bodyJson);
 	if (!parsed.success) return rejectMutation(ctx, actorMeta, 400, 'invalid body', 'invalid body');
 
+	// A BUNDLE-ONLY TYPE MAY ONLY BE CREATED AS A BUNDLE CHILD.
+	//
+	// The account-wide allow-list necessarily contains every child type the site
+	// mints, and it grew to carry `card` when bundles became editable. But a card has
+	// no meaning outside the bundle that owns it: created with no owner it is an
+	// unreferenced row nothing can reach and nothing cleans up. The owner guard below
+	// decides WHICH bundle accepts a type; this is what makes reaching that guard
+	// mandatory rather than optional. (codex's review of this branch, 2026-09-22.)
+	if ((ctx.bundleOnlyEntityTypes ?? []).includes(entityType.data) && !parsed.data.owner_id) {
+		return rejectMutation(ctx, actorMeta, 422, 'field not allowed', 'that type needs an owner');
+	}
+
 	/**
 	 * THE OWNER GUARD. Apex performs none of this, so the refusals live here.
 	 *
@@ -229,7 +241,11 @@ export async function handleCreateEntity(
 		const resolved = (Array.isArray(entries) ? entries : []).find(
 			(entry) => entry?.entity_type?.slug === entityType.data
 		)?.entity_type?.id;
-		if (acceptedIds.length > 0 && (!resolved || !acceptedIds.includes(`${resolved}`))) {
+		// FAILS CLOSED ON AN EMPTY LIST. `acceptedIds.length > 0 && …` used to mean a
+		// bundle with no `entity_type_ids` accepted ANY type on the coarse allow-list —
+		// a bundle that has been told to accept nothing is not a bundle that accepts
+		// everything. (codex's review of this branch, 2026-09-22.)
+		if (!resolved || !acceptedIds.includes(`${resolved}`)) {
 			return rejectMutation(
 				ctx,
 				actorMeta,

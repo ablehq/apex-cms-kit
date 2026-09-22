@@ -14,7 +14,9 @@ import {
 	listChildRows,
 	setListChildField,
 	addListChild,
+	editedListChildren,
 	isDirty,
+	removeListChild,
 	reconcile
 } from '../src/admin/page-draft.js';
 
@@ -159,5 +161,29 @@ describe('isDirty — the Save button, and what it used to refuse to notice', ()
 		addListChild(draft, 'block-1', FIELD, 'strength-item', { title: 'New' });
 		reconcile(draft, samplePage(), 'v2', HYDRATED);
 		assert.equal(isDirty(draft), false);
+	});
+});
+
+describe('removing a row takes its queued edit with it', () => {
+	test('an edited-then-removed row makes no PATCH and leaves no orphan edit', () => {
+		// The edit was keyed by child id and survived the removal, so the save PATCHed a
+		// row the editor could no longer see — pointlessly when it succeeded, and
+		// unfixably when it 422'd, because there was no row on screen to correct.
+		// (codex's review of this branch, 2026-09-22.)
+		const draft = createDraft(samplePage(), 'v1', HYDRATED);
+		setListChildField(draft, 'block-1', FIELD, 'row-1', 'title', 'Changed', 'strength-item');
+		assert.equal(editedListChildren(draft).length, 1);
+		removeListChild(draft, 'block-1', FIELD, 'row-1');
+		assert.equal(editedListChildren(draft).length, 0, 'the edit must go with the row');
+	});
+
+	test('removing one row leaves the OTHER row’s edit alone', () => {
+		const draft = createDraft(samplePage(), 'v1', HYDRATED);
+		setListChildField(draft, 'block-1', FIELD, 'row-1', 'title', 'One', 'strength-item');
+		setListChildField(draft, 'block-1', FIELD, 'row-2', 'title', 'Two', 'strength-item');
+		removeListChild(draft, 'block-1', FIELD, 'row-1');
+		const edits = editedListChildren(draft);
+		assert.equal(edits.length, 1);
+		assert.equal(edits[0].childId, 'row-2');
 	});
 });

@@ -257,6 +257,11 @@ export function removeListChild(draft, blockId, fieldName, childId) {
 	}
 	const ids = storedIds(block, fieldName);
 	if (!ids.includes(childId)) return false;
+	// The queued edit goes WITH the row. It was keyed by child id and survived the
+	// removal otherwise: the save would PATCH a row the editor can no longer see —
+	// pointlessly if it succeeded, and unfixably if it 422'd, because there is no
+	// row on screen to correct.
+	if (draft.listChildEdits) delete draft.listChildEdits[childId];
 	return setField(
 		draft,
 		block.id,
@@ -394,18 +399,34 @@ export function listChildRows(draft, blockId, fieldName) {
 	const edits = draft.listChildEdits ?? {};
 	// The server-hydrated baseline for this field, by id. Without it a stored row has
 	// no content to draw and every existing row renders "(empty)".
+	const hydratedRows = draft.childRows?.[blockId]?.[fieldName];
 	const hydrated = new Map();
-	for (const row of draft.childRows?.[blockId]?.[fieldName] ?? []) {
+	for (const row of hydratedRows ?? []) {
 		if (row && typeof row.id === 'string') hydrated.set(row.id, row.fields ?? {});
 	}
-	const stored = storedIds(block, fieldName).map((id) => ({
-		id,
-		pending: false,
-		// Edits LAYER over the stored fields rather than replacing them: an edit records
-		// only the fields typed into, so replacing would blank every other one on screen
-		// the moment an editor touched a single input.
-		fields_data: { ...(hydrated.get(id) ?? {}), ...(edits[id]?.fields_data ?? {}) }
-	}));
+	/**
+	 * A row whose entity no longer exists is DROPPED, not drawn empty.
+	 *
+	 * The resolver already filters those out — a referenced child that is gone cannot
+	 * be edited, and re-saving the parent without it is the repair. But the parent's
+	 * array still names it, and listing from the array alone put the blank row
+	 * straight back, so the drop achieved nothing on screen.
+	 *
+	 * Only when this field WAS hydrated. A site that supplies no resolver has no
+	 * hydration for any field, and there every stored id must still be listed —
+	 * otherwise the list would simply render empty.
+	 */
+	const drawOnlyHydrated = Array.isArray(hydratedRows);
+	const stored = storedIds(block, fieldName)
+		.filter((id) => !drawOnlyHydrated || hydrated.has(id))
+		.map((id) => ({
+			id,
+			pending: false,
+			// Edits LAYER over the stored fields rather than replacing them: an edit records
+			// only the fields typed into, so replacing would blank every other one on screen
+			// the moment an editor touched a single input.
+			fields_data: { ...(hydrated.get(id) ?? {}), ...(edits[id]?.fields_data ?? {}) }
+		}));
 	const pending = pendingRows(draft, block.id, fieldName).map((row) => ({
 		id: row.id,
 		pending: true,
