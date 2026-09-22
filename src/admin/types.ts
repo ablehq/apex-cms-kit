@@ -112,7 +112,21 @@ export interface CollectionSource {
 	label: string;
 	defaultCount: number;
 	aliases?: readonly string[];
-	itemCount?: 'count' | 'none';
+	/**
+	 * Whether this source takes a count at all. REQUIRED: the screens read an absent
+	 * value as "no control" while the draft mutation read it as "counts are fine", and
+	 * a disagreement like that surfaces on whichever site adopts the kit next.
+	 */
+	itemCount: 'count' | 'none';
+	/**
+	 * The smallest count this source accepts, when it accepts one.
+	 *
+	 * The sites genuinely differ: one loader reads `item_count || default`, so a stored
+	 * 0 silently becomes the default and a "0" an editor typed does something other
+	 * than what it says — that site sets `minCount: 1`. On the other, 0 is a real value
+	 * meaning "all of them".
+	 */
+	minCount?: number;
 	/**
 	 * One sentence for the editor, shown where the source is chosen.
 	 *

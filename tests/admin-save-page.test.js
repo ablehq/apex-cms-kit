@@ -393,7 +393,7 @@ describe('generated listings (Cms::PageBlock::AutoCollection)', () => {
 			itemCount: 'none',
 			aliases: ['member']
 		},
-		{ refName: 'story', label: 'Stories', defaultCount: 3, itemCount: 'count' }
+		{ refName: 'story', label: 'Stories', defaultCount: 3, itemCount: 'count', minCount: 1 }
 	];
 
 	it('adds a listing from the list, taking its label and count FROM the source', () => {
@@ -415,7 +415,9 @@ describe('generated listings (Cms::PageBlock::AutoCollection)', () => {
 		assert.deepEqual(attr.blockable_attributes, {
 			kind: 'archetype',
 			ref_name: 'story',
-			item_count: 3
+			item_count: 3,
+			// What all nine live bands carry, and what the old admin's create path wrote.
+			sort_expression: ['created_at desc']
 		});
 		assert.equal(attr._destroy, false);
 	});
@@ -456,6 +458,42 @@ describe('generated listings (Cms::PageBlock::AutoCollection)', () => {
 		// while `savePage` skips the structure PATCH: Save looks fine and the number
 		// reverts on reload. `structurePayload` serializes regardless of the flag.
 		assert.equal(isDirty(draft), true, 'a count change must dirty the draft');
+	});
+
+	it('refuses a count below the source’s own floor', () => {
+		// One site's loader reads `item_count || default`, so a stored 0 silently becomes
+		// the default — a box that accepted 0 would say one thing and do another. The
+		// other site means 0 literally, which is why the floor is per source, not global.
+		const page = samplePage();
+		page.blocks.push({
+			id: 'coll',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::AutoCollection',
+			blockable: { id: 'c1', kind: 'archetype', ref_name: 'story', item_count: 3 }
+		});
+		const draft = createDraft(page, 'baseline-v');
+		assert.equal(setCollectionItemCount(draft, 'coll', 0, SOURCES), false, 'below the floor');
+		assert.equal(setCollectionItemCount(draft, 'coll', 1, SOURCES), true, 'at the floor');
+		// A source with no floor takes 0: there it means "all of them".
+		const noFloor = [{ refName: 'story', label: 'S', defaultCount: 0, itemCount: 'count' }];
+		const other = createDraft(structuredClone(page), 'baseline-v');
+		assert.equal(setCollectionItemCount(other, 'coll', 0, noFloor), true);
+	});
+
+	it('refuses a source list entry that does not say whether it takes a count', () => {
+		// Required, because the screens read omission as "no control" and the mutation
+		// read it as "counts are fine".
+		const draft = createDraft(samplePage(), 'baseline-v');
+		assert.equal(
+			addCollectionBlock(draft, 'x', [{ refName: 'x', label: 'X', defaultCount: 1 }]),
+			null
+		);
+		assert.equal(
+			addCollectionBlock(draft, 'x', [
+				{ refName: 'x', label: 'X', defaultCount: 1, itemCount: 'maybe' }
+			]),
+			null
+		);
 	});
 
 	it('refuses a bad count, a non-listing block and a missing blockable', () => {

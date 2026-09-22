@@ -317,6 +317,11 @@ function isUsableSource(source) {
 	if (!source || typeof source !== 'object') return false;
 	if (typeof source.refName !== 'string' || !source.refName) return false;
 	if (typeof source.label !== 'string' || !source.label) return false;
+	// Required, not optional: the screens read omission as "no count control" while a
+	// mutation would have read it as "counts are fine", which is the kind of drift that
+	// only shows up on the third consumer.
+	if (source.itemCount !== 'count' && source.itemCount !== 'none') return false;
+	if (source.minCount !== undefined && !Number.isInteger(source.minCount)) return false;
 	// `0` is MEANINGFUL, not unset: on one site it selects the search-and-filter view.
 	return Number.isInteger(source.defaultCount) && source.defaultCount >= 0;
 }
@@ -424,7 +429,13 @@ export function addCollectionBlock(draft, refName, sources, options = {}) {
 			id: nextTempId('collection'),
 			kind,
 			ref_name: source.refName,
-			item_count: source.defaultCount
+			item_count: source.defaultCount,
+			// Measured 2026-09-22: all nine live bands across both sites carry exactly
+			// this, and it is what the old admin's create path wrote. Apex treats null
+			// identically (`sort_expression || ["created_at desc"]`) and neither site
+			// calls the code that reads it — but a band an editor adds should be
+			// indistinguishable from one that was already there.
+			sort_expression: ['created_at desc']
 		}
 	};
 	draft.page.blocks.push(block);
@@ -456,6 +467,10 @@ export function setCollectionItemCount(draft, blockId, count, sources) {
 	if (!Number.isInteger(count) || /** @type {number} */ (count) < 0) return false;
 	const source = resolveStored(sources, block.blockable.ref_name);
 	if (!source || source.itemCount === 'none') return false;
+	// A site's own floor. On one site 0 means "show them all"; on the other the loader
+	// reads 0 as unset and substitutes a default, so a 0 there is a control that says
+	// one thing and does another.
+	if (Number.isInteger(source.minCount) && count < source.minCount) return false;
 	if (block.blockable.item_count === count) return true;
 	block.blockable.item_count = count;
 	draft.structureDirty = true;
