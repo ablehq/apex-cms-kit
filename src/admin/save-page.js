@@ -28,6 +28,8 @@ import { BLANK_SLUG_MESSAGE, RESERVED_SLUG_MESSAGE } from './field-errors.js';
 //   3b. Fields of the blocks that step 3 just minted (a duplicated section carries
 //       its source's fields on a temp entity; Rails permits no `fields_data` under
 //       `entity_attributes`, so they are PATCHed once the entity has a real id).
+//   3c. Page SEO on its own route, so description-only edits cannot be skipped by
+//       the structure gate (phase-4-plan.md §1.2); STOP on failure.
 //   4. Status event (publish / unpublish), only when asked; never after any failure.
 // Publish is the SAME function with `statusEvent: 'publish'` — it awaits every prior
 // step and never dispatches the status if an earlier step failed (plan M1).
@@ -95,6 +97,17 @@ function messageFor(stage, result) {
 		return status === 422
 			? 'The page layout was rejected. Your field edits were saved; fix the layout and Save again.'
 			: 'Saving the page layout failed. Save again to retry.';
+	}
+	if (stage === 'seo') {
+		if (result?.error === 'missing meta row') {
+			return 'This page has no stored meta description row. Ask an administrator to repair it.';
+		}
+		if (status === 400 && result?.error === 'invalid body') {
+			return 'The meta description could not be accepted. Use 1,000 characters or fewer and Save again.';
+		}
+		return status === 422
+			? 'The meta description was rejected. Check its value and Save again.'
+			: 'Saving the meta description failed. Save again to retry.';
 	}
 	return 'Publishing failed after your changes were saved. Save/Publish again to retry.';
 }
@@ -407,6 +420,23 @@ export async function savePage(draft, client, options = {}) {
 		}
 		// Those PATCHes moved the composite version; the page the structure save
 		// returned is now behind it. Re-read below so the baseline is honest.
+		freshPage = null;
+	}
+
+	// Page SEO has a separate route: a description-only edit must not sit behind
+	// the structureDirty gate (phase-4-plan.md §1.2).
+	if (Object.keys(draft.metaEdits).length > 0) {
+		const res = await client.updatePageSeo(pageId, { ...draft.metaEdits });
+		if (!res.ok) {
+			return failAfterWrites(draft, client, wroteOk, {
+				ok: false,
+				stage: 'seo',
+				status: res.status,
+				message: messageFor('seo', res)
+			});
+		}
+		wroteOk = true;
+		// The earlier structure snapshot predates this write.
 		freshPage = null;
 	}
 

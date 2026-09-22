@@ -41,6 +41,7 @@ export interface RichTextValue {
 
 /** One `meta_properties` entry on a page. The SEO tab shows the `web` group. */
 export interface AdminPageMetaProperty {
+	id: string;
 	name?: string | null;
 	group?: string | null;
 	value?: string | null;
@@ -189,6 +190,8 @@ export interface AdminPageDraft {
 	pageId: string;
 	baselineVersion: string;
 	page: AdminPage;
+	/** Unsaved page SEO values, keyed by existing web meta name. */
+	metaEdits: Record<string, string>;
 	/** The server-hydrated baseline for every `array_ref` list on the page. */
 	childRows: AdminChildRowMap;
 	/** Entity ids whose `fields_data` the editor changed. */
@@ -479,6 +482,8 @@ export interface BffClient {
 	 * is the blank-slug one — `save-page.js` names both.
 	 */
 	savePageStructure(pageId: string, payload: unknown): Promise<BffMutationResult>;
+	/** Poovayya's smaller client type (src/lib/admin/types.d.ts:75) omits page methods. */
+	updatePageSeo?(pageId: string, meta: { description?: string }): Promise<BffMutationResult>;
 	changePageStatus(pageId: string, statusEvent: AdminStatusEvent): Promise<BffMutationResult>;
 	/**
 	 * Named payloads, not `unknown`: the bodies changed shape when the item moved to

@@ -56,9 +56,10 @@ export function createDraft(page, version, childRows) {
 		pageId: page.id,
 		baselineVersion: version,
 		page: clone(page),
+		metaEdits: {},
 		/** Entity ids whose `fields_data` the editor changed. */
 		dirtyEntityIds: new Set(),
-		/** True once blocks were reordered / added / removed, or page meta changed. */
+		/** True once blocks were reordered / added / removed, or page fields changed. */
 		structureDirty: false,
 		/** Real ids of removed blocks, sent as `{ id, _destroy: true }`. */
 		deletedBlockIds: [],
@@ -1005,6 +1006,26 @@ export function setPageField(draft, name, value) {
 }
 
 /**
+ * Page SEO has its own save leg (save-page.js), so it stays out of the structure
+ * payload. Match setPostField: returning to the stored value removes the edit.
+ * Only description renders on both sites (phase-4-plan.md §1.5).
+ *
+ * @param {AdminPageDraft} draft
+ * @param {'description'} name
+ * @param {string} value
+ * @returns {boolean}
+ */
+export function setPageMeta(draft, name, value) {
+	if (name !== 'description') return false;
+	const baseline =
+		draft.page.meta_properties?.find((row) => row?.group === 'web' && row.name === name)?.value ??
+		'';
+	if (value === baseline) delete draft.metaEdits[name];
+	else draft.metaEdits[name] = value;
+	return true;
+}
+
+/**
  * Is there anything to save?
  *
  * This is what the Save button is enabled by, so anything it does not count is
@@ -1032,6 +1053,7 @@ export function isDirty(draft) {
 		draft.dirtyEntityIds.size > 0 ||
 		draft.structureDirty ||
 		draft.deletedBlockIds.length > 0 ||
+		Object.keys(draft.metaEdits).length > 0 ||
 		newListChildren(draft).length > 0 ||
 		editedListChildren(draft).length > 0
 	);
@@ -1094,7 +1116,7 @@ export function dirtyEntityPatches(draft) {
 }
 
 /**
- * The `blocks_attributes` + page-meta payload for the structure save.
+ * The `blocks_attributes` + page-fields payload for the structure save.
  *
  * @param {AdminPageDraft} draft
  * @returns {{
@@ -1133,6 +1155,7 @@ export function reconcile(draft, serverPage, version, childRows) {
 	draft.dirtyEntityIds = new Set();
 	draft.structureDirty = false;
 	draft.deletedBlockIds = [];
+	draft.metaEdits = {};
 	// Or a row whose create already landed is created a SECOND time on the next save:
 	// `reconcile` replaces `draft.page` wholesale and resets every other flag, so a
 	// temp row left here would look new again.

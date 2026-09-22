@@ -179,6 +179,9 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 		savePageStructure(pageId, payload) {
 			return mutate(`/api/admin/pages/${pageId}/structure`, 'PATCH', payload);
 		},
+		updatePageSeo(pageId, meta) {
+			return mutate(`/api/admin/pages/${encodeURIComponent(pageId)}/seo`, 'PATCH', { meta });
+		},
 		changePageStatus(pageId, statusEvent) {
 			return mutate(`/api/admin/pages/${pageId}/status`, 'PATCH', { status_event: statusEvent });
 		},

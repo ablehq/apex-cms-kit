@@ -6,6 +6,7 @@ import { describe, it } from 'node:test';
 
 import {
 	createDraft,
+	setPageMeta,
 	setField,
 	setChildField,
 	reorderBlocks,
@@ -139,6 +140,10 @@ function makeClient(overrides = {}) {
 			const page = overrides.structurePage ? overrides.structurePage(payload) : samplePage();
 			return { ok: true, status: 200, page, version: 'v-after-structure' };
 		},
+		async updatePageSeo(pageId, meta) {
+			calls.push(['updatePageSeo', meta]);
+			return results.seo ? results.seo(meta) : { ok: true, status: 200 };
+		},
 		async changePageStatus(pageId, statusEvent) {
 			calls.push(['changePageStatus', statusEvent]);
 			return results.status ? results.status(statusEvent) : { ok: true, status: 200 };
@@ -154,6 +159,114 @@ function makeClient(overrides = {}) {
 	if (serverVersion === undefined) serverVersion = 'baseline-v';
 	return client;
 }
+
+describe('page meta description — its own save leg', () => {
+	/**
+	 * Phase 4A §1.2: isDirty alone once enabled Save while the structure gate
+	 * skipped the SEO-only write, then reconciled away the editor's change.
+	 */
+	it('writes an SEO-only edit, then clears it on reconcile', async () => {
+		const page = samplePage();
+		page.meta_properties = [
+			{ id: 'meta-description', name: 'description', group: 'web', value: 'Before' }
+		];
+		const draft = createDraft(page, 'baseline-v');
+		setPageMeta(draft, 'description', 'After');
+		assert.equal(isDirty(draft), true);
+		const client = makeClient({
+			structurePage: () => ({
+				...page,
+				meta_properties: [{ ...page.meta_properties[0], value: 'After' }]
+			})
+		});
+		const result = await savePage(draft, client);
+		assert.deepEqual(result, { ok: true, refreshed: true });
+		assert.deepEqual(
+			client.calls.filter(([name]) => name === 'updatePageSeo'),
+			[['updatePageSeo', { description: 'After' }]]
+		);
+		assert.equal(
+			client.calls.some(([name]) => name === 'savePageStructure'),
+			false
+		);
+		assert.deepEqual(draft.metaEdits, {});
+		assert.equal(isDirty(draft), false);
+	});
+
+	/**
+	 * Phase 4A §1.9: typing back to the stored description must remove the edit,
+	 * or Save stays enabled and sends a no-op PATCH.
+	 */
+	it('drops an edit restored to baseline', () => {
+		const page = samplePage();
+		page.meta_properties = [
+			{ id: 'meta-description', name: 'description', group: 'web', value: 'Before' }
+		];
+		const draft = createDraft(page, 'baseline-v');
+		setPageMeta(draft, 'description', 'After');
+		setPageMeta(draft, 'description', 'Before');
+		assert.deepEqual(draft.metaEdits, {});
+		assert.equal(isDirty(draft), false);
+	});
+
+	/**
+	 * Phase 4A §1.7: a refused SEO value must stop Publish, name SEO rather than
+	 * layout, and use failAfterWrites after an earlier structure write landed.
+	 */
+	it('stops on SEO refusal with its own stage and re-baselines after prior writes', async () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		draft.structureDirty = true;
+		setPageMeta(draft, 'description', 'After');
+		const client = makeClient({
+			results: {
+				seo: () => {
+					client.setServerVersion('after-structure');
+					return { ok: false, status: 422 };
+				}
+			}
+		});
+		const result = await savePage(draft, client, { statusEvent: 'publish' });
+		assert.equal(result.ok, false);
+		assert.equal(result.stage, 'seo');
+		assert.match(result.message, /meta description/);
+		assert.equal(
+			client.calls.some(([name]) => name === 'changePageStatus'),
+			false
+		);
+		assert.equal(draft.baselineVersion, 'after-structure');
+	});
+
+	/**
+	 * Phase 4A §1.4b: a page without an existing row cannot safely be written
+	 * by ID, and a retry will keep getting 409 until the stored row is repaired.
+	 */
+	it('names a missing stored row without advising a futile retry', async () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		setPageMeta(draft, 'description', 'After');
+		const client = makeClient({
+			results: { seo: () => ({ ok: false, status: 409, error: 'missing meta row' }) }
+		});
+		const result = await savePage(draft, client);
+		assert.equal(result.stage, 'seo');
+		assert.match(result.message, /no stored meta description row/);
+		assert.doesNotMatch(result.message, /Save again/);
+	});
+
+	/**
+	 * update-page-seo.ts caps description at the post route's 1,000 characters.
+	 * A plain retry message for its 400 leaves an editor stuck on the same value.
+	 */
+	it('explains the description length refusal', async () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		setPageMeta(draft, 'description', 'x'.repeat(1001));
+		const client = makeClient({
+			results: { seo: () => ({ ok: false, status: 400, error: 'invalid body' }) }
+		});
+		const result = await savePage(draft, client);
+		assert.equal(result.stage, 'seo');
+		assert.match(result.message, /1,000 characters/);
+	});
+});
 
 describe("savePage's child legs — the seam the unit tests used to miss", () => {
 	function pageWithList() {
