@@ -167,9 +167,21 @@ export interface AdminPage {
 }
 
 /** `GET /api/admin/pages/:id` — the page plus the stale guard's baseline token. */
+/** The rows an `array_ref` field points at, hydrated by the server for the editor. */
+export type AdminChildRowMap = Record<
+	string,
+	Record<string, { id: string; fields: Record<string, unknown> }[]>
+>;
+
 export interface AdminPageLoad {
 	page: AdminPage;
 	version: string;
+	/**
+	 * `blockId` → `fieldName` → rows. `{}` from a site that supplies no resolver, and
+	 * absent from a deployment whose kit predates it — hence optional, so an older
+	 * page payload still typechecks rather than forcing every caller to assert.
+	 */
+	childRows?: AdminChildRowMap;
 }
 
 /** The local page-draft the editor mutates (`page-draft.js`). */
@@ -177,6 +189,8 @@ export interface AdminPageDraft {
 	pageId: string;
 	baselineVersion: string;
 	page: AdminPage;
+	/** The server-hydrated baseline for every `array_ref` list on the page. */
+	childRows: AdminChildRowMap;
 	/** Entity ids whose `fields_data` the editor changed. */
 	dirtyEntityIds: Set<string>;
 	structureDirty: boolean;
