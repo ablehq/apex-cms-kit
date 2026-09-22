@@ -247,7 +247,11 @@ describe('the create-entity operation', () => {
 				'content-type': 'application/json',
 				cookie: `apex_admin_session=${session}; apex_bff_csrf=${CSRF}`
 			},
-			body: JSON.stringify({ fields_data: { title: 'x' }, position: 3 })
+			// `nope`, not `position`: owner-scoped creation made `position` a LEGAL
+			// top-level key, so it stopped being an example of an unknown one. The rule
+			// under test is unchanged — an unknown key is a 400 rather than something
+			// Apex drops silently.
+			body: JSON.stringify({ fields_data: { title: 'x' }, nope: 3 })
 		});
 		assert.equal(
 			(await handleCreateEntity(withExtra, ctx, { entityType: ENTITY_TYPE })).status,
@@ -256,6 +260,60 @@ describe('the create-entity operation', () => {
 
 		const badName = await create(ctxWith(apex), { 'Title Case': 'x' });
 		assert.equal(badName.status, 400);
+		assert.equal(apex.stored.created, null);
+	});
+
+	it('refuses half an owner, and an owner with no page to check it against', async () => {
+		// `owner_type`/`owner_id` are the one pair Apex will not police: it attaches an
+		// entity to ANY owner id in the account, because `validate_ownership` delegates
+		// only to owners that define `validate_entity_ownership` and the only definer is
+		// ArchetypeItem. So the refusals have to be here.
+		const apex = recordingApex();
+		const ctx = ctxWith(apex);
+		const session = await signIn(ctx);
+		const post = (body) =>
+			handleCreateEntity(
+				new Request(`${ORIGIN}/api/admin/entities/${ENTITY_TYPE}`, {
+					method: 'POST',
+					headers: {
+						origin: ORIGIN,
+						'sec-fetch-site': 'same-origin',
+						'x-csrf-token': CSRF,
+						'content-type': 'application/json',
+						cookie: `apex_admin_session=${session}; apex_bff_csrf=${CSRF}`
+					},
+					body: JSON.stringify(body)
+				}),
+				ctx,
+				{ entityType: ENTITY_TYPE }
+			);
+
+		const uuid = '11111111-1111-4111-8111-111111111111';
+		// An owner type with no id, and an id with no type.
+		assert.equal(
+			(await post({ fields_data: {}, owner_type: 'Cms::PageBlock::EntityBundle' })).status,
+			400
+		);
+		assert.equal((await post({ fields_data: {}, owner_id: uuid })).status, 400);
+		// An owner with no page_id: the rule "a bundle on the page the caller named"
+		// has nothing to check against, so it is refused rather than skipped.
+		assert.equal(
+			(await post({ fields_data: {}, owner_type: 'Cms::PageBlock::EntityBundle', owner_id: uuid }))
+				.status,
+			400
+		);
+		// A caller-chosen owner class is not an option.
+		assert.equal(
+			(
+				await post({
+					fields_data: {},
+					owner_type: 'Specification::ArchetypeItem',
+					owner_id: uuid,
+					page_id: uuid
+				})
+			).status,
+			400
+		);
 		assert.equal(apex.stored.created, null);
 	});
 

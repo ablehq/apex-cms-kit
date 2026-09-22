@@ -2,6 +2,7 @@
 // Deliberately untyped JS to sit beside the legacy-compiled admin components; its
 // behavior is covered by tests/admin-save-page.test.js + tests/bff-realapex.test.js.
 import { isTempId, serializeBlocksForSave } from './block-serialize.js';
+import { sortBundleChildrenInPlace } from '../cms/bundle-order.js';
 
 /**
  * `@ts-nocheck` suppresses errors in THIS file; it does not stop the annotations
@@ -45,9 +46,12 @@ function clone(value) {
  *
  * @param {AdminPage} page
  * @param {string} version
+ * @param {Record<string, Record<string, { id: string, fields: Record<string, unknown> }[]>>} [childRows]
+ *   The stored rows every `array_ref` field points at, hydrated by the server. A
+ *   site with no such field passes nothing.
  * @returns {AdminPageDraft}
  */
-export function createDraft(page, version) {
+export function createDraft(page, version, childRows) {
 	const draft = {
 		pageId: page.id,
 		baselineVersion: version,
@@ -76,7 +80,16 @@ export function createDraft(page, version) {
 		 * the page: `collectEntities` walks blocks, and a list child is free-standing.
 		 * Its own save leg writes them.
 		 */
-		listChildEdits: {}
+		listChildEdits: {},
+		/**
+		 * The STORED rows an `array_ref` points at, hydrated by the server, keyed
+		 * `blockId` → `fieldName` → `[{ id, fields }]`.
+		 *
+		 * Read-only baseline, never edited in place: an editor's changes go to
+		 * `listChildEdits` and are layered over this on read. That split is what lets
+		 * `discard` be "drop the edits" rather than "re-fetch the page".
+		 */
+		childRows: childRows && typeof childRows === 'object' ? clone(childRows) : {}
 	};
 	if (!Array.isArray(draft.page.blocks)) draft.page.blocks = [];
 	sortBlocks(draft);
@@ -379,10 +392,19 @@ export function listChildRows(draft, blockId, fieldName) {
 	const block = findBlock(draft, blockId);
 	if (!block) return [];
 	const edits = draft.listChildEdits ?? {};
+	// The server-hydrated baseline for this field, by id. Without it a stored row has
+	// no content to draw and every existing row renders "(empty)".
+	const hydrated = new Map();
+	for (const row of draft.childRows?.[blockId]?.[fieldName] ?? []) {
+		if (row && typeof row.id === 'string') hydrated.set(row.id, row.fields ?? {});
+	}
 	const stored = storedIds(block, fieldName).map((id) => ({
 		id,
 		pending: false,
-		fields_data: edits[id] ? { ...edits[id].fields_data } : {}
+		// Edits LAYER over the stored fields rather than replacing them: an edit records
+		// only the fields typed into, so replacing would blank every other one on screen
+		// the moment an editor touched a single input.
+		fields_data: { ...(hydrated.get(id) ?? {}), ...(edits[id]?.fields_data ?? {}) }
 	}));
 	const pending = pendingRows(draft, block.id, fieldName).map((row) => ({
 		id: row.id,
@@ -412,10 +434,19 @@ export function isBundleBlock(block) {
 	return block?.blockable_type === BUNDLE_BLOCKABLE;
 }
 
-/** The bundle's children as stored, or `[]`. */
+/**
+ * The bundle's children, IN RENDER ORDER, as the live array.
+ *
+ * Sorted in place on every read. Apex declares no order scope on `has_many :entities`,
+ * so a read-back is heap order — and the panel renders render-order. If this returned
+ * the raw array, the index an editor dragged and the index `moveBundleEntity` splices
+ * would be different rows, and the renumber that follows would write that wrong order
+ * to Apex. Sorting here makes the two the same number everywhere.
+ */
 function ownedChildren(block) {
 	const rows = block?.blockable?.entities;
-	return Array.isArray(rows) ? rows : [];
+	if (!Array.isArray(rows)) return [];
+	return sortBundleChildrenInPlace(rows);
 }
 
 /**
@@ -427,7 +458,10 @@ function ownedChildren(block) {
  * `dirtyEntityPatches` emits none of them and the drag is silently dropped.
  */
 function renumber(draft, block) {
-	ownedChildren(block).forEach((child, index) => {
+	// The RAW array, deliberately: it has just been spliced into the new order, and
+	// `ownedChildren` would re-sort it by the OLD positions and undo the move.
+	const rows = Array.isArray(block?.blockable?.entities) ? block.blockable.entities : [];
+	rows.forEach((child, index) => {
 		if (!child?.id) return;
 		if (child.position !== index) {
 			child.position = index;
@@ -950,11 +984,36 @@ export function setPageField(draft, name, value) {
 }
 
 /**
+ * Is there anything to save?
+ *
+ * This is what the Save button is enabled by, so anything it does not count is
+ * UNSAVEABLE — the editor makes the change, the button stays grey, and the only way
+ * out is to leave the page and lose it.
+ *
+ * ── THE TWO COLLECTIONS IT USED TO MISS ─────────────────────────────────────
+ * `listChildren` and `listChildEdits` live beside the page rather than in it — an
+ * `array_ref` row is a FREE-STANDING entity, so adding one changes no block and
+ * editing one marks no entity on the tree dirty. Neither flag moved, so the whole
+ * repeatable feature was unusable: add a row, type into it, and Save stayed
+ * disabled.
+ *
+ * Found by the browser gate on 2026-09-22, not by the suite — and it could not have
+ * been found by the suite, because the unit tests call `savePage` directly and never
+ * ask whether the button that reaches it is enabled. The bundle operations were
+ * never affected: a bundle OWNS its children, so `addBundleEntity` sets
+ * `structureDirty` and `setBundleEntityField` marks the child's own entity dirty.
+ *
  * @param {AdminPageDraft} draft
  * @returns {boolean}
  */
 export function isDirty(draft) {
-	return draft.dirtyEntityIds.size > 0 || draft.structureDirty || draft.deletedBlockIds.length > 0;
+	return (
+		draft.dirtyEntityIds.size > 0 ||
+		draft.structureDirty ||
+		draft.deletedBlockIds.length > 0 ||
+		newListChildren(draft).length > 0 ||
+		editedListChildren(draft).length > 0
+	);
 }
 
 /** Collect every entity in the tree, keyed by id, so dirty ones can be found. */
@@ -1041,9 +1100,12 @@ export function structurePayload(draft) {
  * @param {AdminPageDraft} draft
  * @param {AdminPage} serverPage
  * @param {string} version
+ * @param {Record<string, Record<string, { id: string, fields: Record<string, unknown> }[]>>} [childRows]
+ *   Fresh hydrated rows, when the caller has them. OMITTED keeps the ones already on
+ *   the draft — a page read-back that does not carry rows must not blank them.
  * @returns {void}
  */
-export function reconcile(draft, serverPage, version) {
+export function reconcile(draft, serverPage, version, childRows) {
 	draft.page = clone(serverPage);
 	if (!Array.isArray(draft.page.blocks)) draft.page.blocks = [];
 	sortBlocks(draft);
@@ -1055,6 +1117,10 @@ export function reconcile(draft, serverPage, version) {
 	// temp row left here would look new again.
 	draft.listChildren = {};
 	draft.listChildEdits = {};
+	// Only when the caller HAS fresh rows. `savePage` reconciles from a page read-back
+	// that may not carry them, and blanking the baseline there would turn every
+	// existing row into "(empty)" the instant a save succeeded.
+	if (childRows && typeof childRows === 'object') draft.childRows = clone(childRows);
 	if (version) draft.baselineVersion = version;
 	draft.pageId = draft.page.id;
 }

@@ -429,7 +429,13 @@ export interface BffClient {
 	patchEntityFields(
 		entityTypeId: string,
 		entityId: string,
-		fieldsData: Record<string, unknown>
+		fieldsData: Record<string, unknown>,
+		/**
+		 * A row's order within the block that owns it. Optional, and travels WITH
+		 * `fields_data` — the entities route makes `fields_data` mandatory, so a bare
+		 * `{position}` body is a 500.
+		 */
+		position?: number
 	): Promise<BffMutationResult>;
 	/**
 	 * Mint one content-library entity and return its id — a child row of an

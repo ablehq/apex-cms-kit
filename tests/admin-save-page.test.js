@@ -119,9 +119,19 @@ function makeClient(overrides = {}) {
 			calls.push(['readVersion']);
 			return { version: serverVersion };
 		},
-		async patchEntityFields(entityTypeId, entityId, fields) {
-			calls.push(['patchEntityFields', entityId, fields]);
+		async patchEntityFields(entityTypeId, entityId, fields, position) {
+			// `position` is RECORDED: without it a leg that forgets to forward it looks
+			// identical to one that does, which is how the bundle reorder shipped
+			// computing an order and dropping it at the transport.
+			calls.push(['patchEntityFields', entityId, fields, position]);
 			return results.fields ? results.fields(entityId) : { ok: true, status: 200 };
+		},
+		async createEntity(entityType, fieldsData, owner) {
+			calls.push(['createEntity', entityType, fieldsData, owner]);
+			if (results.createEntity) return results.createEntity(entityType, fieldsData, owner);
+			// `{ok, entityId}` — the shape `create-entity.ts` actually answers. A fake
+			// that returned `{entity: {id}}` would have let the real defect through.
+			return { ok: true, status: 201, entityId: `real-${calls.length}` };
 		},
 		async savePageStructure(pageId, payload) {
 			calls.push(['savePageStructure', payload]);
@@ -144,6 +154,275 @@ function makeClient(overrides = {}) {
 	if (serverVersion === undefined) serverVersion = 'baseline-v';
 	return client;
 }
+
+describe("savePage's child legs — the seam the unit tests used to miss", () => {
+	function pageWithList() {
+		const page = samplePage();
+		page.blocks[0].blockable.entity.fields_data = {
+			heading: 'Why us',
+			why_choose_points: ['row-1']
+		};
+		return page;
+	}
+
+	it('CREATES a new list row, adopts its REAL id, and names it in the parent', async () => {
+		// The defect this exists for: savePage read `res.entity?.id`, which
+		// `create-entity` never returns, so every Add reported failure WHILE the entity
+		// existed — and the next Save created another. Unbounded orphans on a button an
+		// editor is told to press again.
+		const draft = createDraft(pageWithList(), 'baseline-v');
+		const blockId = getBlocks(draft)[0].id;
+		addListChild(draft, blockId, 'why_choose_points', 'strength-item', { text: 'new' });
+
+		const client = makeClient({
+			results: { createEntity: () => ({ ok: true, status: 201, entityId: 'minted-1' }) }
+		});
+		const saved = await savePage(draft, client);
+		assert.equal(saved.ok, true, JSON.stringify(saved));
+
+		const created = client.calls.find((c) => c[0] === 'createEntity');
+		assert.deepEqual(created.slice(0, 3), ['createEntity', 'strength-item', { text: 'new' }]);
+		// The PARENT PATCH is where the adoption has to show up — after the save,
+		// `reconcile` has already replaced the draft with the server's page, so the
+		// draft is the wrong place to look for it.
+		const parentPatch = client.calls.find((c) => c[0] === 'patchEntityFields');
+		assert.deepEqual(
+			parentPatch[2].why_choose_points,
+			['row-1', 'minted-1'],
+			'the parent must name the REAL id the create returned'
+		);
+		assert.equal(
+			JSON.stringify(parentPatch[2]).includes('temp-'),
+			false,
+			'a temp id in an array_ref is a 422 naming a field the editor never touched'
+		);
+	});
+
+	it('creates children BEFORE the parent that names them', async () => {
+		const draft = createDraft(pageWithList(), 'baseline-v');
+		const blockId = getBlocks(draft)[0].id;
+		addListChild(draft, blockId, 'why_choose_points', 'strength-item');
+		const client = makeClient();
+		await savePage(draft, client);
+		const names = client.calls.map((c) => c[0]);
+		assert.ok(
+			names.indexOf('createEntity') < names.indexOf('patchEntityFields'),
+			`an array_ref element must exist before the parent names it: ${names.join(' → ')}`
+		);
+	});
+
+	it('a failed create writes NOTHING to the page and says so', async () => {
+		const draft = createDraft(pageWithList(), 'baseline-v');
+		const blockId = getBlocks(draft)[0].id;
+		addListChild(draft, blockId, 'why_choose_points', 'strength-item');
+		const client = makeClient({
+			results: { createEntity: () => ({ ok: false, status: 422 }) }
+		});
+		const saved = await savePage(draft, client);
+		assert.equal(saved.ok, false);
+		assert.equal(saved.stage, 'children');
+		assert.match(saved.message, /Nothing on the page was saved/u);
+		assert.equal(
+			client.calls.some((c) => c[0] === 'patchEntityFields' || c[0] === 'savePageStructure'),
+			false,
+			'a child failure must not be followed by a page write'
+		);
+	});
+
+	it('a failed BUNDLE create does NOT claim nothing was saved', async () => {
+		// The three child legs used to share one sentence ending "Nothing on the page
+		// was saved". A bundle child is OWNED by the block, so the cards created before
+		// this one are already on the page. Telling an editor otherwise invites them to
+		// redo work that is done — and each redo mints another card.
+		const page = samplePage();
+		page.blocks.push({
+			id: 'bundle-block',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::EntityBundle',
+			blockable: { id: 'bundle-1', entities: [] }
+		});
+		const draft = createDraft(page, 'baseline-v');
+		addBundleEntity(draft, 'bundle-block', 'card', { heading: 'One' });
+		const client = makeClient({ results: { createEntity: () => ({ ok: false, status: 422 }) } });
+		const saved = await savePage(draft, client);
+		assert.equal(saved.ok, false);
+		assert.equal(saved.stage, 'children-owned');
+		assert.doesNotMatch(saved.message, /Nothing on the page was saved/u);
+		assert.match(saved.message, /cards before it were added/u);
+	});
+
+	it('a failed EDIT says the rows before it were kept', async () => {
+		const draft = createDraft(pageWithList(), 'baseline-v');
+		const blockId = getBlocks(draft)[0].id;
+		setListChildField(draft, blockId, 'why_choose_points', 'row-1', 'text', 'x', 'strength-item');
+		const client = makeClient({
+			results: { fields: () => ({ ok: false, status: 422 }) }
+		});
+		const saved = await savePage(draft, client);
+		assert.equal(saved.ok, false);
+		assert.equal(saved.stage, 'children-edit');
+		assert.doesNotMatch(saved.message, /Nothing on the page was saved/u);
+		assert.match(saved.message, /saved before it were kept/u);
+	});
+
+	it('a failed REORDER is named as a reorder, not as a field edit', async () => {
+		// A reorder renumbers EVERY sibling, so a part-way failure leaves the order
+		// half-written. The 'fields' sentence claims the opposite — "your other changes
+		// were not saved yet" — which is the one thing that is certainly untrue.
+		const page = samplePage();
+		page.blocks.push({
+			id: 'bundle-block',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::EntityBundle',
+			blockable: {
+				id: 'bundle-1',
+				entities: [
+					{ id: 'card-a', position: 0, created_at: '2026-01-01T00:00:00Z', fields_data: {} },
+					{ id: 'card-b', position: 1, created_at: '2026-01-02T00:00:00Z', fields_data: {} }
+				]
+			}
+		});
+		const draft = createDraft(page, 'baseline-v');
+		moveBundleEntity(draft, 'bundle-block', 1, 0);
+		const client = makeClient({
+			results: { fields: () => ({ ok: false, status: 500 }) }
+		});
+		const saved = await savePage(draft, client);
+		assert.equal(saved.ok, false);
+		assert.equal(saved.stage, 'order');
+		assert.match(saved.message, /only partly saved/u);
+		assert.doesNotMatch(saved.message, /were not saved yet/u);
+	});
+
+	it('a RETRY after a half-written save is not refused as stale', async () => {
+		// The stale guard compares once, at the top. A batch that fails part-way has
+		// already moved the server's version, so the retry used to be refused with
+		// "someone else changed this page" — about the editor's OWN half-save — and the
+		// advice that comes with it is to reload, which discards the work the retry was
+		// for. The failure path now re-reads the version and adopts it.
+		const page = samplePage();
+		page.blocks.push({
+			id: 'bundle-block',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::EntityBundle',
+			blockable: { id: 'bundle-1', entities: [] }
+		});
+		const draft = createDraft(page, 'baseline-v');
+		addBundleEntity(draft, 'bundle-block', 'card', { heading: 'One' });
+		addBundleEntity(draft, 'bundle-block', 'card', { heading: 'Two' });
+
+		let created = 0;
+		let client;
+		client = makeClient({
+			results: {
+				createEntity: () => {
+					created += 1;
+					if (created === 1) {
+						// The first card lands — and `belongs_to :owner, touch: true` means its
+						// create moves the owning blockable's `updated_at`, so the page's
+						// composite version moves with it.
+						client.setServerVersion('version-after-card-one');
+						return { ok: true, status: 201, entityId: 'card-real-1' };
+					}
+					return { ok: false, status: 500 };
+				}
+			}
+		});
+		client.setServerVersion('baseline-v');
+
+		const first = await savePage(draft, client);
+		assert.equal(first.ok, false);
+		assert.equal(first.stage, 'children-owned');
+		assert.equal(
+			draft.baselineVersion,
+			'version-after-card-one',
+			'the failure path must adopt the version its own writes produced'
+		);
+
+		// THE POINT: the retry gets through the stale guard and dispatches the card
+		// that did not land — rather than being told to reload and lose it.
+		const retry = await savePage(draft, client);
+		assert.notEqual(retry.stale, true, 'the retry must not be refused as stale');
+		assert.equal(
+			client.calls.filter((c) => c[0] === 'createEntity').length,
+			3,
+			'two on the first save, one more on the retry — the landed card is NOT re-created'
+		);
+	});
+
+	it('a failure that wrote NOTHING keeps its baseline, so a real conflict is still caught', async () => {
+		// The refresh is deliberately conditional. If the very first write is refused,
+		// nothing moved, and quietly adopting whatever the server says now would mask a
+		// genuine concurrent edit.
+		const draft = createDraft(pageWithList(), 'baseline-v');
+		const blockId = getBlocks(draft)[0].id;
+		addListChild(draft, blockId, 'why_choose_points', 'strength-item');
+		const client = makeClient({
+			results: { createEntity: () => ({ ok: false, status: 422 }) }
+		});
+		const saved = await savePage(draft, client);
+		assert.equal(saved.ok, false);
+		// The create was attempted, so the baseline IS refreshed — to the same value,
+		// because a 422 changed nothing. What matters is that it is never left behind
+		// the server.
+		assert.equal(draft.baselineVersion, 'baseline-v');
+	});
+
+	it('a BUNDLE child is created with its owner, its position and its page', async () => {
+		// All four were computed and then dropped at the client, so the card was created
+		// with no owner — never joined the bundle, invisible, one orphan per Save.
+		const page = samplePage();
+		page.blocks.push({
+			id: 'bundle-block',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::EntityBundle',
+			blockable: { id: 'bundle-1', entities: [] }
+		});
+		const draft = createDraft(page, 'baseline-v');
+		addBundleEntity(draft, 'bundle-block', 'card', { heading: 'New' });
+
+		const client = makeClient();
+		const saved = await savePage(draft, client);
+		assert.equal(saved.ok, true, JSON.stringify(saved));
+		const created = client.calls.find((c) => c[0] === 'createEntity');
+		assert.equal(created[1], 'card');
+		assert.deepEqual(created[3], {
+			owner_type: 'Cms::PageBlock::EntityBundle',
+			owner_id: 'bundle-1',
+			position: 0,
+			page_id: draft.pageId
+		});
+	});
+
+	it('a REORDER actually sends position — it used to be computed and discarded', async () => {
+		const page = samplePage();
+		page.blocks.push({
+			id: 'bundle-block',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::EntityBundle',
+			blockable: {
+				id: 'bundle-1',
+				entities: [
+					{ id: 'a', position: 0, created_at: '2026-01-01T00:00:00Z', fields_data: {} },
+					{ id: 'b', position: 0, created_at: '2026-02-01T00:00:00Z', fields_data: {} }
+				]
+			}
+		});
+		const draft = createDraft(page, 'baseline-v');
+		moveBundleEntity(draft, 'bundle-block', 1, 0);
+
+		const client = makeClient();
+		await savePage(draft, client);
+		const patches = client.calls.filter((c) => c[0] === 'patchEntityFields');
+		assert.ok(patches.length > 0, 'a reorder must patch at least one row');
+		// The 4th element is `position`. Discarding it at the transport made the drag
+		// look saved and snap back on the next read.
+		assert.ok(
+			patches.some((c) => Number.isInteger(c[3])),
+			`no position reached the client: ${JSON.stringify(patches)}`
+		);
+	});
+});
 
 describe('savePage (M1 explicit save)', () => {
 	it('writes dirty fields, THEN structure, in the required order', async () => {
@@ -908,6 +1187,36 @@ describe("a bundle's own children", () => {
 		});
 		return page;
 	}
+
+	it('operates in RENDER order, not the heap order Apex returns', () => {
+		// Apex declares no order scope on `has_many :entities`, so a read-back is heap
+		// order — measured in this repo's own committed Apex read, and NOT created_at
+		// order. The panel renders (position ?? 0, created_at). If the draft spliced the
+		// raw array, dragging the top row would move whichever row happened to be first
+		// in the heap, and the renumber would write that to Apex.
+		const page = samplePage();
+		page.blocks.push({
+			id: 'bundle-block',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::EntityBundle',
+			blockable: {
+				id: 'bundle-1',
+				entities: [
+					{ id: 'third', position: 0, created_at: '2026-06-02T05:07:26Z', fields_data: {} },
+					{ id: 'first', position: 0, created_at: '2026-06-02T04:45:05Z', fields_data: {} },
+					{ id: 'second', position: 0, created_at: '2026-06-02T05:06:52Z', fields_data: {} }
+				]
+			}
+		});
+		const draft = createDraft(page, 'v');
+		// Moving index 0 must move `first` — the row the editor sees at the top.
+		assert.equal(moveBundleEntity(draft, 'bundle-block', 0, 2), true);
+		assert.deepEqual(
+			draft.page.blocks[2].blockable.entities.map((r) => r.id),
+			['second', 'third', 'first'],
+			'the drag moved a different row than the one on screen'
+		);
+	});
 
 	it('a REORDER renumbers every sibling and marks each one dirty', () => {
 		// Every live child is position 0 and there is nothing below zero, so moving the
