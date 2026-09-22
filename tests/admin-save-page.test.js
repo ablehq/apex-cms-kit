@@ -1,5 +1,7 @@
 // @ts-nocheck — node:test suite over dynamic JSON shapes; behavior is the contract, run to verify.
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
 import {
@@ -1093,5 +1095,28 @@ describe('page-draft local model', () => {
 		const draft = createDraft(samplePage(), 'baseline-v');
 		// no children in the sample; setting on a missing child returns false.
 		assert.equal(setChildField(draft, 'block-heading', 'nope', 'label', 'x'), false);
+	});
+});
+
+describe('a media field with no picker offers no destructive control', () => {
+	const RAW = readFileSync(
+		fileURLToPath(new URL('../src/admin/ui/BlockFieldEditor.svelte', import.meta.url)),
+		'utf8'
+	);
+
+	it('Remove is gated on onPickMedia, like Replace', () => {
+		// Without this, Remove was the only LIVE control on a media field when no picker
+		// was passed: it writes the delete marker, Apex empties the field, and the editor
+		// cannot put an image back. Reachable the moment a child list carries a media
+		// field, which is exactly what Phase 3's child types do.
+		// The media Remove is the one whose click writes `emptyValue`.
+		const at = RAW.indexOf('onChange(def.field_name, emptyValue)');
+		assert.ok(at > 0, 'the media Remove button was not found');
+		const button = RAW.slice(at - 400, at);
+		assert.match(
+			button,
+			/!onPickMedia/u,
+			'the media Remove must be disabled without a picker — it is a one-way door'
+		);
 	});
 });
