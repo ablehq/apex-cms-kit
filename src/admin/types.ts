@@ -82,6 +82,8 @@ export interface AdminBlockable {
 	/** `Cms::PageBlock::AutoCollection`: which collection, and how much of it. */
 	ref_name?: string | null;
 	item_count?: number | null;
+	/** A real jsonb column on the band's table — carried through a save untouched. */
+	description?: Record<string, unknown> | string | null;
 	/**
 	 * Both are permitted by the pages controller and BOTH ARE UNUSED BY EVERY SITE:
 	 * Apex honours `sort_expression` only inside `AutoCollection#collection_records`,
@@ -111,8 +113,15 @@ export interface CollectionSource {
 	defaultCount: number;
 	aliases?: readonly string[];
 	itemCount?: 'count' | 'none';
-	/** One sentence for the editor, shown where the source is chosen. */
-	description?: string;
+	/**
+	 * One sentence for the editor, shown where the source is chosen.
+	 *
+	 * NOT `description`: `cms_page_block_auto_collections` has a real `description`
+	 * jsonb column, permitted for write. A site wiring `blockable.description =
+	 * source.description` would put this editor sentence into that column on the live
+	 * record. Different name, different thing.
+	 */
+	hint?: string;
 }
 
 /** One section on a page. */

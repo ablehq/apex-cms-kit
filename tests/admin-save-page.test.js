@@ -14,6 +14,7 @@ import {
 	addCollectionBlock,
 	setCollectionItemCount,
 	setCollectionSource,
+	COLLECTION_KINDS,
 	isCollectionBlock,
 	removeBlock,
 	isDirty,
@@ -385,7 +386,13 @@ describe('generated listings (Cms::PageBlock::AutoCollection)', () => {
 	 * a switch that forgets to adopt the new default is visible.
 	 */
 	const SOURCES = [
-		{ refName: 'team member', label: 'Team', defaultCount: 0, itemCount: 'none' },
+		{
+			refName: 'team member',
+			label: 'Team',
+			defaultCount: 0,
+			itemCount: 'none',
+			aliases: ['member']
+		},
 		{ refName: 'story', label: 'Stories', defaultCount: 3, itemCount: 'count' }
 	];
 
@@ -438,13 +445,17 @@ describe('generated listings (Cms::PageBlock::AutoCollection)', () => {
 			blockable: { id: 'c1', kind: 'archetype', ref_name: 'story', item_count: 3 }
 		});
 		const draft = createDraft(page, 'baseline-v');
-		assert.equal(setCollectionItemCount(draft, 'b1', 6), true);
+		assert.equal(setCollectionItemCount(draft, 'b1', 6, SOURCES), true);
 
 		const attr = structurePayload(draft).blocks_attributes.find((block) => block.id === 'b1');
 		assert.equal(attr.id, 'b1', 'the BLOCK id survives');
 		assert.equal(attr.blockable_attributes.id, 'c1', 'the BLOCKABLE id survives');
 		assert.equal(attr.blockable_attributes.item_count, 6);
 		assert.equal(attr.blockable_attributes.ref_name, 'story');
+		// Without this the mutation "drop `structureDirty = true`" passes every test
+		// while `savePage` skips the structure PATCH: Save looks fine and the number
+		// reverts on reload. `structurePayload` serializes regardless of the flag.
+		assert.equal(isDirty(draft), true, 'a count change must dirty the draft');
 	});
 
 	it('refuses a bad count, a non-listing block and a missing blockable', () => {
@@ -465,16 +476,16 @@ describe('generated listings (Cms::PageBlock::AutoCollection)', () => {
 		);
 		const draft = createDraft(page, 'baseline-v');
 
-		assert.equal(setCollectionItemCount(draft, 'coll', -1), false);
-		assert.equal(setCollectionItemCount(draft, 'coll', 1.5), false);
-		assert.equal(setCollectionItemCount(draft, 'coll', '3'), false);
-		assert.equal(setCollectionItemCount(draft, 'headless', 3), false);
-		assert.equal(setCollectionItemCount(draft, 'missing', 3), false);
-		assert.equal(setCollectionItemCount(draft, draft.page.blocks[0].id, 3), false);
+		assert.equal(setCollectionItemCount(draft, 'coll', -1, SOURCES), false);
+		assert.equal(setCollectionItemCount(draft, 'coll', 1.5, SOURCES), false);
+		assert.equal(setCollectionItemCount(draft, 'coll', '3', SOURCES), false);
+		assert.equal(setCollectionItemCount(draft, 'headless', 3, SOURCES), false);
+		assert.equal(setCollectionItemCount(draft, 'missing', 3, SOURCES), false);
+		assert.equal(setCollectionItemCount(draft, draft.page.blocks[0].id, 3, SOURCES), false);
 		assert.equal(isDirty(draft), false, 'no refusal may dirty the draft');
 
 		// A no-op is accepted and still does not dirty.
-		assert.equal(setCollectionItemCount(draft, 'coll', 3), true);
+		assert.equal(setCollectionItemCount(draft, 'coll', 3, SOURCES), true);
 		assert.equal(isDirty(draft), false);
 	});
 
@@ -520,6 +531,123 @@ describe('generated listings (Cms::PageBlock::AutoCollection)', () => {
 		assert.equal(block.label, 'Stories');
 		assert.equal(block.blockable.item_count, 6);
 		assert.equal(isDirty(draft), false);
+	});
+
+	it('REFUSES a kind Apex does not accept — the whole page save depends on it', () => {
+		// `kind` is the ONE field Apex validates, and `validates_associated :blockable`
+		// means a bad value 422s the entire page, not just this block.
+		const draft = createDraft(samplePage(), 'baseline-v');
+		assert.equal(addCollectionBlock(draft, 'story', SOURCES, { kind: 'not-a-kind' }), null);
+		assert.equal(isDirty(draft), false, 'a refused kind must leave the draft alone');
+		// An EMPTY kind is treated as "not given" and takes the default, which is valid:
+		// falling back to a value Apex accepts cannot break a save, and refusing would
+		// only turn a caller's sloppiness into a missing section.
+		assert.equal(
+			addCollectionBlock(draft, 'story', SOURCES, { kind: '' }).blockable.kind,
+			'archetype'
+		);
+		// The three Apex accepts.
+		for (const kind of ['archetype', 'entity_type', 'model']) {
+			const block = addCollectionBlock(draft, 'story', SOURCES, { kind });
+			assert.equal(block.blockable.kind, kind);
+		}
+		// A caller passing null must not throw — `= {}` fires only on undefined.
+		assert.equal(addCollectionBlock(draft, 'story', SOURCES, null).blockable.kind, 'archetype');
+	});
+
+	it('REFUSES a count on a source whose count is a mode switch, not a limit', () => {
+		// Poovayya's team band renders a search-and-filter UI at 0 and a capped grid at
+		// any positive value, so a "count" written there deletes the live search box.
+		const page = samplePage();
+		page.blocks.push({
+			id: 'team',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::AutoCollection',
+			blockable: { id: 'c1', kind: 'archetype', ref_name: 'team member', item_count: 0 }
+		});
+		const draft = createDraft(page, 'baseline-v');
+		assert.equal(setCollectionItemCount(draft, 'team', 8, SOURCES), false);
+		assert.equal(draft.page.blocks[2].blockable.item_count, 0);
+		assert.equal(isDirty(draft), false);
+		// And a band whose ref is not in the list at all.
+		assert.equal(setCollectionItemCount(draft, 'team', 8, []), false);
+	});
+
+	it('re-picking the source a band ALREADY uses changes nothing, even through an alias', () => {
+		// The band is stored under the alias `member`; the dropdown shows "Team" as
+		// selected. Comparing raw strings made re-picking "Team" rewrite the row and
+		// reset a count the editor never touched.
+		const page = samplePage();
+		page.blocks.push({
+			id: 'b1',
+			position: 2,
+			label: 'Team',
+			blockable_type: 'Cms::PageBlock::AutoCollection',
+			blockable: { id: 'c1', kind: 'archetype', ref_name: 'member', item_count: 12 }
+		});
+		const draft = createDraft(page, 'baseline-v');
+		assert.equal(setCollectionSource(draft, 'b1', 'team member', SOURCES), true);
+
+		const block = getBlocks(draft).find((candidate) => candidate.id === 'b1');
+		assert.equal(block.blockable.ref_name, 'member', 'the stored spelling is left alone');
+		assert.equal(block.blockable.item_count, 12, 'the count is NOT reset');
+		assert.equal(isDirty(draft), false, 'a no-op must not dirty the draft');
+	});
+
+	it('REFUSES an alias as the target — one authorable spelling per source', () => {
+		const page = samplePage();
+		page.blocks.push({
+			id: 'b1',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::AutoCollection',
+			blockable: { id: 'c1', kind: 'archetype', ref_name: 'story', item_count: 3 }
+		});
+		const draft = createDraft(page, 'baseline-v');
+		assert.equal(setCollectionSource(draft, 'b1', 'member', SOURCES), false);
+		assert.equal(addCollectionBlock(draft, 'member', SOURCES), null);
+	});
+
+	it('REFUSES switching a block that is not a listing at all', () => {
+		// Writing ref_name onto a TemplateInstance blockable raises
+		// ActiveModel::UnknownAttributeError in Rails and kills the whole page save.
+		const draft = createDraft(samplePage(), 'baseline-v');
+		const templateBlockId = draft.page.blocks[0].id;
+		assert.equal(setCollectionSource(draft, templateBlockId, 'story', SOURCES), false);
+		assert.equal(setCollectionSource(draft, 'nope', 'story', SOURCES), false);
+		assert.equal(isDirty(draft), false);
+	});
+
+	it('a malformed duplicate earlier in the list does not hide a good source', () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		const withDuplicate = [
+			{ refName: 'story' },
+			{ refName: 'story', label: 'Stories', defaultCount: 3, itemCount: 'count' }
+		];
+		const block = addCollectionBlock(draft, 'story', withDuplicate);
+		assert.notEqual(block, null, 'the first USABLE entry wins, not the first entry');
+		assert.equal(block.label, 'Stories');
+	});
+
+	it('refuses source lists that are not lists, and refNames that are not names', () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		for (const bad of [{}, new Map(), 'story', 0, undefined]) {
+			assert.equal(addCollectionBlock(draft, 'story', bad), null);
+		}
+		for (const bad of ['', null, 0, {}, '__proto__', 'constructor']) {
+			assert.equal(addCollectionBlock(draft, bad, SOURCES), null);
+		}
+		assert.equal(isDirty(draft), false);
+	});
+
+	it('positions stay contiguous when the server sent gaps', () => {
+		const page = samplePage();
+		page.blocks[0].position = 7;
+		const draft = createDraft(page, 'baseline-v');
+		addCollectionBlock(draft, 'story', SOURCES);
+		assert.deepEqual(
+			getBlocks(draft).map((block) => block.position),
+			getBlocks(draft).map((_, index) => index)
+		);
 	});
 });
 
