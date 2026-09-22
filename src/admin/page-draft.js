@@ -10,6 +10,7 @@ import { isTempId, serializeBlocksForSave } from './block-serialize.js';
  * @typedef {import('./types').AdminPage} AdminPage
  * @typedef {import('./types').AdminPageBlock} AdminPageBlock
  * @typedef {import('./types').AdminPageDraft} AdminPageDraft
+ * @typedef {import('./types').CollectionSource} CollectionSource
  */
 
 /** Apex's delegated type for a spacer. */
@@ -274,6 +275,132 @@ export function setSpacerKind(draft, blockId, kind) {
 	if (!SPACER_KINDS.includes(kind)) return false;
 	if (block.blockable.kind === kind) return true;
 	block.blockable.kind = kind;
+	draft.structureDirty = true;
+	return true;
+}
+
+/**
+ * A GENERATED LISTING — the bands that render a collection of records.
+ *
+ * `kind` is REQUIRED by Apex: `Cms::PageBlock::AutoCollection` validates it against
+ * `archetype | entity_type | model`, and `Cms::PageBlock` declares
+ * `validates_associated :blockable`, so a nil kind fails the WHOLE page save, not
+ * just this block. Every band live on either site today is `archetype`.
+ */
+export const COLLECTION_BLOCKABLE = 'Cms::PageBlock::AutoCollection';
+
+/** @param {AdminPageBlock | null | undefined} block */
+export function isCollectionBlock(block) {
+	return block?.blockable_type === COLLECTION_BLOCKABLE;
+}
+
+/**
+ * Find a source by its `refName` in the list the CALLER owns.
+ *
+ * The list lives in each site because each site's renderer decides what it can
+ * draw, and **Apex validates `ref_name` not at all** — a typo saves 200 and renders
+ * nothing. So this list is the only guard there is, and every operation below goes
+ * through it rather than taking a caller's word for a string.
+ *
+ * @param {readonly CollectionSource[] | null | undefined} sources
+ * @param {unknown} refName
+ * @returns {CollectionSource | null}
+ */
+function resolveSource(sources, refName) {
+	if (!Array.isArray(sources) || typeof refName !== 'string' || !refName) return null;
+	const found = sources.find((source) => source?.refName === refName);
+	if (!found) return null;
+	// A half-built entry would let a switch write a good `ref_name` beside a missing
+	// label and an undefined count — three fields, one of them wrong, atomically.
+	if (typeof found.label !== 'string' || !found.label) return null;
+	if (!Number.isInteger(found.defaultCount) || found.defaultCount < 0) return null;
+	return found;
+}
+
+/**
+ * Append a generated listing for `refName`, taking its label and count FROM the list.
+ *
+ * Creation is the path that mints these values, so it is the one that most needs the
+ * allow-list: an invented `refName` here would produce a band no renderer can draw
+ * and no dialog can recreate.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string} refName
+ * @param {readonly CollectionSource[]} sources
+ * @param {{ kind?: string }} [options]
+ * @returns {AdminPageBlock | null} the block, or `null` if the source is not listed
+ */
+export function addCollectionBlock(draft, refName, sources, options = {}) {
+	const source = resolveSource(sources, refName);
+	if (!source) return null;
+	const kind = typeof options.kind === 'string' && options.kind ? options.kind : 'archetype';
+	const block = {
+		id: nextTempId('block'),
+		label: source.label,
+		position: draft.page.blocks.length,
+		blockable_type: COLLECTION_BLOCKABLE,
+		// A temp id for the same reason the spacer carries one: `AdminBlockable.id` is
+		// required, and `serializePageBlockForSave` strips temp ids so Apex mints the real
+		// one. `item_count` is always sent — the old admin's writes never omit it.
+		blockable: {
+			id: nextTempId('collection'),
+			kind,
+			ref_name: source.refName,
+			item_count: source.defaultCount
+		}
+	};
+	draft.page.blocks.push(block);
+	applyPositions(draft);
+	draft.structureDirty = true;
+	return block;
+}
+
+/**
+ * Set how many records a listing shows.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {unknown} count
+ * @returns {boolean}
+ */
+export function setCollectionItemCount(draft, blockId, count) {
+	const block = findBlock(draft, blockId);
+	if (!isCollectionBlock(block) || !block.blockable || typeof block.blockable !== 'object')
+		return false;
+	if (!Number.isInteger(count) || /** @type {number} */ (count) < 0) return false;
+	if (block.blockable.item_count === count) return true;
+	block.blockable.item_count = count;
+	draft.structureDirty = true;
+	return true;
+}
+
+/**
+ * Point a listing at a different source — `ref_name`, `label` and `item_count` TOGETHER.
+ *
+ * All three, because the alternative leaves the band half-switched: both admins name
+ * an outline row from the stored `label`, so writing only `ref_name` keeps the old
+ * name on screen; and `item_count` does not mean the same thing to every source. On
+ * Poovayya a testimonials band with a count of 6 switched to team members would
+ * select capped-grid mode with six members, where the live page shows a
+ * search-and-filter UI. Adopting the new source's default is the only transition
+ * that leaves the block self-consistent.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} refName
+ * @param {readonly CollectionSource[]} sources
+ * @returns {boolean}
+ */
+export function setCollectionSource(draft, blockId, refName, sources) {
+	const block = findBlock(draft, blockId);
+	if (!isCollectionBlock(block) || !block.blockable || typeof block.blockable !== 'object')
+		return false;
+	const source = resolveSource(sources, refName);
+	if (!source) return false;
+	if (block.blockable.ref_name === source.refName) return true;
+	block.blockable.ref_name = source.refName;
+	block.blockable.item_count = source.defaultCount;
+	block.label = source.label;
 	draft.structureDirty = true;
 	return true;
 }

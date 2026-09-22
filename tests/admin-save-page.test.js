@@ -11,6 +11,10 @@ import {
 	addTemplateBlock,
 	addSpacerBlock,
 	setSpacerKind,
+	addCollectionBlock,
+	setCollectionItemCount,
+	setCollectionSource,
+	isCollectionBlock,
 	removeBlock,
 	isDirty,
 	canEditFields,
@@ -372,6 +376,150 @@ describe('a duplicated section — the fields the editor seeded on a temp entity
 		assert.equal(result.status, 422);
 		assert.match(result.message, /The new section was added, but its fields could not be saved/u);
 		assert.ok(!client.calls.some((c) => c[0] === 'changePageStatus'), 'no publish after a failure');
+	});
+});
+
+describe('generated listings (Cms::PageBlock::AutoCollection)', () => {
+	/**
+	 * The shape a SITE declares. Two sources, deliberately with different defaults, so
+	 * a switch that forgets to adopt the new default is visible.
+	 */
+	const SOURCES = [
+		{ refName: 'team member', label: 'Team', defaultCount: 0, itemCount: 'none' },
+		{ refName: 'story', label: 'Stories', defaultCount: 3, itemCount: 'count' }
+	];
+
+	it('adds a listing from the list, taking its label and count FROM the source', () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		const block = addCollectionBlock(draft, 'story', SOURCES);
+
+		assert.equal(isCollectionBlock(block), true);
+		assert.equal(block.id.startsWith('temp-'), true);
+		assert.equal(block.label, 'Stories', 'the label comes from the source, not the caller');
+		assert.equal(block.blockable.ref_name, 'story');
+		assert.equal(block.blockable.item_count, 3);
+		assert.equal(block.blockable.kind, 'archetype', 'Apex refuses a nil kind on the whole page');
+		assert.equal(isTempId(block.blockable.id), true, 'the blockable carries a TEMP id');
+		assert.equal(isDirty(draft), true);
+
+		const attr = structurePayload(draft).blocks_attributes[block.position];
+		assert.equal(Object.hasOwn(attr, 'id'), false);
+		assert.equal(attr.blockable_type, 'Cms::PageBlock::AutoCollection');
+		assert.deepEqual(attr.blockable_attributes, {
+			kind: 'archetype',
+			ref_name: 'story',
+			item_count: 3
+		});
+		assert.equal(attr._destroy, false);
+	});
+
+	it('REFUSES a source that is not in the list, and one the list half-declares', () => {
+		// Apex validates `ref_name` not at all, so this list is the only guard there is.
+		const draft = createDraft(samplePage(), 'baseline-v');
+		assert.equal(addCollectionBlock(draft, 'invented', SOURCES), null);
+		assert.equal(addCollectionBlock(draft, 'story', []), null);
+		assert.equal(addCollectionBlock(draft, 'story', null), null);
+		// A half-built entry would write a good ref_name beside a bad label/count.
+		assert.equal(addCollectionBlock(draft, 'x', [{ refName: 'x', defaultCount: 1 }]), null);
+		assert.equal(addCollectionBlock(draft, 'x', [{ refName: 'x', label: 'X' }]), null);
+		assert.equal(getBlocks(draft).some(isCollectionBlock), false);
+		assert.equal(isDirty(draft), false, 'a refusal must not dirty the draft');
+	});
+
+	it('keeps BOTH ids on an edited listing — the orphan-row mutation', () => {
+		// Dropping the blockable id makes Rails build a new record and orphan the old
+		// one, proven against real Apex in poovayya/tests/chrome-realapex.test.ts.
+		const page = samplePage();
+		page.blocks.push({
+			id: 'b1',
+			position: 2,
+			label: 'Stories',
+			blockable_type: 'Cms::PageBlock::AutoCollection',
+			blockable: { id: 'c1', kind: 'archetype', ref_name: 'story', item_count: 3 }
+		});
+		const draft = createDraft(page, 'baseline-v');
+		assert.equal(setCollectionItemCount(draft, 'b1', 6), true);
+
+		const attr = structurePayload(draft).blocks_attributes.find((block) => block.id === 'b1');
+		assert.equal(attr.id, 'b1', 'the BLOCK id survives');
+		assert.equal(attr.blockable_attributes.id, 'c1', 'the BLOCKABLE id survives');
+		assert.equal(attr.blockable_attributes.item_count, 6);
+		assert.equal(attr.blockable_attributes.ref_name, 'story');
+	});
+
+	it('refuses a bad count, a non-listing block and a missing blockable', () => {
+		const page = samplePage();
+		page.blocks.push(
+			{
+				id: 'coll',
+				position: 2,
+				blockable_type: 'Cms::PageBlock::AutoCollection',
+				blockable: { id: 'c1', kind: 'archetype', ref_name: 'story', item_count: 3 }
+			},
+			{
+				id: 'headless',
+				position: 3,
+				blockable_type: 'Cms::PageBlock::AutoCollection',
+				blockable: null
+			}
+		);
+		const draft = createDraft(page, 'baseline-v');
+
+		assert.equal(setCollectionItemCount(draft, 'coll', -1), false);
+		assert.equal(setCollectionItemCount(draft, 'coll', 1.5), false);
+		assert.equal(setCollectionItemCount(draft, 'coll', '3'), false);
+		assert.equal(setCollectionItemCount(draft, 'headless', 3), false);
+		assert.equal(setCollectionItemCount(draft, 'missing', 3), false);
+		assert.equal(setCollectionItemCount(draft, draft.page.blocks[0].id, 3), false);
+		assert.equal(isDirty(draft), false, 'no refusal may dirty the draft');
+
+		// A no-op is accepted and still does not dirty.
+		assert.equal(setCollectionItemCount(draft, 'coll', 3), true);
+		assert.equal(isDirty(draft), false);
+	});
+
+	it('switching a source rewrites ref_name, label AND item_count together', () => {
+		// Writing only ref_name leaves the old name in both admins' outlines and carries
+		// a count across a semantic boundary: on Poovayya a testimonials count of 6
+		// switched to team members selects capped-grid mode where the live page shows a
+		// search UI.
+		const page = samplePage();
+		page.blocks.push({
+			id: 'b1',
+			position: 2,
+			label: 'Stories',
+			blockable_type: 'Cms::PageBlock::AutoCollection',
+			blockable: { id: 'c1', kind: 'archetype', ref_name: 'story', item_count: 6 }
+		});
+		const draft = createDraft(page, 'baseline-v');
+		assert.equal(setCollectionSource(draft, 'b1', 'team member', SOURCES), true);
+
+		const block = getBlocks(draft).find((candidate) => candidate.id === 'b1');
+		assert.equal(block.blockable.ref_name, 'team member');
+		assert.equal(block.label, 'Team', 'the outline name follows the source');
+		assert.equal(block.blockable.item_count, 0, 'the count adopts the new default');
+		assert.equal(block.blockable.id, 'c1', 'the row is updated, never replaced');
+		assert.equal(isDirty(draft), true);
+	});
+
+	it('switching REFUSES an unlisted source and leaves every field alone', () => {
+		const page = samplePage();
+		page.blocks.push({
+			id: 'b1',
+			position: 2,
+			label: 'Stories',
+			blockable_type: 'Cms::PageBlock::AutoCollection',
+			blockable: { id: 'c1', kind: 'archetype', ref_name: 'story', item_count: 6 }
+		});
+		const draft = createDraft(page, 'baseline-v');
+		assert.equal(setCollectionSource(draft, 'b1', 'invented', SOURCES), false);
+		assert.equal(setCollectionSource(draft, 'b1', 'story', [{ refName: 'story' }]), false);
+
+		const block = getBlocks(draft).find((candidate) => candidate.id === 'b1');
+		assert.equal(block.blockable.ref_name, 'story');
+		assert.equal(block.label, 'Stories');
+		assert.equal(block.blockable.item_count, 6);
+		assert.equal(isDirty(draft), false);
 	});
 });
 
