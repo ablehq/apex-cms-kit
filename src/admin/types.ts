@@ -109,8 +109,10 @@ export interface CollectionSource {
 	refName: string;
 	label: string;
 	defaultCount: number;
-	aliases?: string[];
+	aliases?: readonly string[];
 	itemCount?: 'count' | 'none';
+	/** One sentence for the editor, shown where the source is chosen. */
+	description?: string;
 }
 
 /** One section on a page. */
