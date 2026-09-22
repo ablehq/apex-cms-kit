@@ -57,7 +57,26 @@ export function createDraft(page, version) {
 		/** True once blocks were reordered / added / removed, or page meta changed. */
 		structureDirty: false,
 		/** Real ids of removed blocks, sent as `{ id, _destroy: true }`. */
-		deletedBlockIds: []
+		deletedBlockIds: [],
+		/**
+		 * Child rows an editor has added to an `array_ref` field but that do not exist
+		 * in Apex yet, keyed `blockId` → `fieldName` → rows.
+		 *
+		 * Deliberately NOT in `fields_data`. An `array_ref` element must be the id of an
+		 * entity that ALREADY EXISTS — Apex's validator resolves every element and 422s
+		 * on one it cannot find, naming a field the editor never typed into. So a new
+		 * row lives here until its create lands, and `adoptListChildId` moves the real
+		 * id into the parent array.
+		 */
+		listChildren: {},
+		/**
+		 * Field edits to rows that ALREADY exist, keyed `childId` → `fieldName` → value.
+		 *
+		 * Separate from `dirtyEntityIds` because these entities are not reachable from
+		 * the page: `collectEntities` walks blocks, and a list child is free-standing.
+		 * Its own save leg writes them.
+		 */
+		listChildEdits: {}
 	};
 	if (!Array.isArray(draft.page.blocks)) draft.page.blocks = [];
 	sortBlocks(draft);
@@ -144,6 +163,220 @@ export function setChildField(draft, blockId, childId, fieldName, value) {
 	child.entity.fields_data[fieldName] = value;
 	draft.dirtyEntityIds.add(child.entity.id);
 	return true;
+}
+
+/**
+ * ── CHILD ROWS INSIDE A SECTION (`array_ref` fields) ────────────────────────
+ *
+ * An `array_ref` field stores the IDS of free-standing entities. The rows are not
+ * owned by the block — the block references them — which is what makes this
+ * different from a bundle's children and from a nested template instance.
+ *
+ * Two rules shape every operation below:
+ *
+ * 1. **A temp id must never reach the parent array.** Apex resolves every element of
+ *    an `array_ref` on write and 422s on one it cannot find, naming a field the editor
+ *    never touched. So a new row waits in `draft.listChildren` until its create lands.
+ * 2. **Reorder and remove need no child traffic at all.** Both are edits to the
+ *    parent's array, and `setField` already marks the parent entity dirty — the
+ *    existing entity-PATCH leg carries them.
+ */
+
+/** @param {AdminPageDraft} draft @param {string} blockId @param {string} fieldName */
+function pendingRows(draft, blockId, fieldName) {
+	if (!draft.listChildren[blockId]) draft.listChildren[blockId] = {};
+	if (!Array.isArray(draft.listChildren[blockId][fieldName])) {
+		draft.listChildren[blockId][fieldName] = [];
+	}
+	return draft.listChildren[blockId][fieldName];
+}
+
+/** The parent's stored id array for one `array_ref` field, or `[]`. */
+function storedIds(block, fieldName) {
+	const value = block?.blockable?.entity?.fields_data?.[fieldName];
+	return Array.isArray(value) ? value : [];
+}
+
+/**
+ * Add a row to an `array_ref` field. It exists only in the draft until it is saved.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} fieldName
+ * @param {string} childType the entity type SLUG the row will be created as
+ * @param {Record<string, unknown>} [fieldsData]
+ * @returns {{ id: string, childType: string, fields_data: Record<string, unknown> } | null}
+ */
+export function addListChild(draft, blockId, fieldName, childType, fieldsData = {}) {
+	const block = findBlock(draft, blockId);
+	if (!canEditFields(block)) return null;
+	if (typeof fieldName !== 'string' || !fieldName) return null;
+	if (typeof childType !== 'string' || !childType) return null;
+	const row = {
+		id: nextTempId('child'),
+		childType,
+		fields_data: fieldsData && typeof fieldsData === 'object' ? { ...fieldsData } : {}
+	};
+	pendingRows(draft, block.id, fieldName).push(row);
+	return row;
+}
+
+/**
+ * Remove a row — a pending one outright, a stored one from the parent's array.
+ *
+ * The stored row's ENTITY is left in place. It is free-standing and may be referenced
+ * elsewhere; there is also no working delete route for one. The button says so.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} fieldName
+ * @param {string} childId
+ * @returns {boolean}
+ */
+export function removeListChild(draft, blockId, fieldName, childId) {
+	const block = findBlock(draft, blockId);
+	if (!canEditFields(block)) return false;
+	const pending = pendingRows(draft, block.id, fieldName);
+	const at = pending.findIndex((row) => row.id === childId);
+	if (at !== -1) {
+		pending.splice(at, 1);
+		return true;
+	}
+	const ids = storedIds(block, fieldName);
+	if (!ids.includes(childId)) return false;
+	return setField(
+		draft,
+		block.id,
+		fieldName,
+		ids.filter((id) => id !== childId)
+	);
+}
+
+/**
+ * Move a STORED row within the parent's array. Pending rows have no place in it yet.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} fieldName
+ * @param {number} from
+ * @param {number} to
+ * @returns {boolean}
+ */
+export function moveListChild(draft, blockId, fieldName, from, to) {
+	const block = findBlock(draft, blockId);
+	if (!canEditFields(block)) return false;
+	const ids = [...storedIds(block, fieldName)];
+	if (!Number.isInteger(from) || !Number.isInteger(to)) return false;
+	if (from < 0 || to < 0 || from >= ids.length || to >= ids.length) return false;
+	if (from === to) return true;
+	const [moved] = ids.splice(from, 1);
+	ids.splice(to, 0, moved);
+	return setField(draft, block.id, fieldName, ids);
+}
+
+/**
+ * Set a field on one child row, pending or stored.
+ *
+ * A pending row is edited in place here and carried to its create. A stored row's
+ * entity is marked dirty so the existing entity-PATCH leg writes it.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} fieldName
+ * @param {string} childId
+ * @param {string} childField
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function setListChildField(draft, blockId, fieldName, childId, childField, value) {
+	const block = findBlock(draft, blockId);
+	if (!canEditFields(block)) return false;
+	if (typeof childField !== 'string' || !childField) return false;
+	const row = pendingRows(draft, block.id, fieldName).find((item) => item.id === childId);
+	if (row) {
+		row.fields_data[childField] = value;
+		return true;
+	}
+	if (!storedIds(block, fieldName).includes(childId)) return false;
+	if (isTempId(`${childId}`)) return false;
+	if (!draft.listChildEdits) draft.listChildEdits = {};
+	if (!draft.listChildEdits[childId]) draft.listChildEdits[childId] = {};
+	draft.listChildEdits[childId][childField] = value;
+	return true;
+}
+
+/**
+ * Move a created row's REAL id into the parent's array, and drop the pending row.
+ *
+ * Called as each create lands, before the parent is written — so a retry after a
+ * later failure does not create the same row twice.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} fieldName
+ * @param {string} tempId
+ * @param {string} realId
+ * @returns {boolean}
+ */
+export function adoptListChildId(draft, blockId, fieldName, tempId, realId) {
+	const block = findBlock(draft, blockId);
+	if (!canEditFields(block)) return false;
+	if (typeof realId !== 'string' || !realId || isTempId(realId)) return false;
+	const pending = pendingRows(draft, block.id, fieldName);
+	const at = pending.findIndex((row) => row.id === tempId);
+	if (at === -1) return false;
+	pending.splice(at, 1);
+	return setField(draft, block.id, fieldName, [...storedIds(block, fieldName), realId]);
+}
+
+/**
+ * The rows `savePage` must CREATE, in the order the editor added them.
+ * @param {AdminPageDraft} draft
+ */
+export function newListChildren(draft) {
+	const out = [];
+	for (const [blockId, fields] of Object.entries(draft.listChildren ?? {})) {
+		for (const [fieldName, rows] of Object.entries(fields ?? {})) {
+			for (const row of rows) out.push({ blockId, fieldName, ...row });
+		}
+	}
+	return out;
+}
+
+/**
+ * The stored rows `savePage` must PATCH — `{childId, fields_data}` per edited row.
+ * @param {AdminPageDraft} draft
+ */
+export function editedListChildren(draft) {
+	return Object.entries(draft.listChildEdits ?? {}).map(([childId, fields_data]) => ({
+		childId,
+		fields_data
+	}));
+}
+
+/**
+ * What the editor sees: stored rows in the parent's order, then the pending ones.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} fieldName
+ */
+export function listChildRows(draft, blockId, fieldName) {
+	const block = findBlock(draft, blockId);
+	if (!block) return [];
+	const edits = draft.listChildEdits ?? {};
+	const stored = storedIds(block, fieldName).map((id) => ({
+		id,
+		pending: false,
+		fields_data: edits[id] ? { ...edits[id] } : {}
+	}));
+	const pending = pendingRows(draft, block.id, fieldName).map((row) => ({
+		id: row.id,
+		pending: true,
+		childType: row.childType,
+		fields_data: { ...row.fields_data }
+	}));
+	return [...stored, ...pending];
 }
 
 /**
@@ -632,6 +865,11 @@ export function reconcile(draft, serverPage, version) {
 	draft.dirtyEntityIds = new Set();
 	draft.structureDirty = false;
 	draft.deletedBlockIds = [];
+	// Or a row whose create already landed is created a SECOND time on the next save:
+	// `reconcile` replaces `draft.page` wholesale and resets every other flag, so a
+	// temp row left here would look new again.
+	draft.listChildren = {};
+	draft.listChildEdits = {};
 	if (version) draft.baselineVersion = version;
 	draft.pageId = draft.page.id;
 }

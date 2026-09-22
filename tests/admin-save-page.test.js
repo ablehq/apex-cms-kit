@@ -12,6 +12,15 @@ import {
 	addSpacerBlock,
 	setSpacerKind,
 	addCollectionBlock,
+	addListChild,
+	removeListChild,
+	moveListChild,
+	setListChildField,
+	adoptListChildId,
+	newListChildren,
+	editedListChildren,
+	listChildRows,
+	reconcile,
 	setCollectionItemCount,
 	setCollectionSource,
 	COLLECTION_KINDS,
@@ -719,6 +728,141 @@ describe('generated listings (Cms::PageBlock::AutoCollection)', () => {
 			getBlocks(draft).map((block) => block.position),
 			getBlocks(draft).map((_, index) => index)
 		);
+	});
+});
+
+describe('child rows inside a section (array_ref fields)', () => {
+	/** A page whose first block is a template instance with a two-id list. */
+	function pageWithList() {
+		const page = samplePage();
+		page.blocks[0].blockable.entity.fields_data = {
+			heading: 'Why us',
+			why_choose_points: ['row-1', 'row-2']
+		};
+		return page;
+	}
+
+	it('a NEW row never reaches the parent array — a temp id there is a 422', () => {
+		// Apex resolves every array_ref element on write and refuses one it cannot find,
+		// naming a field the editor never typed into.
+		const draft = createDraft(pageWithList(), 'v');
+		const blockId = getBlocks(draft)[0].id;
+		const row = addListChild(draft, blockId, 'why_choose_points', 'strength-item', {
+			text: 'new'
+		});
+		assert.ok(row && row.id.startsWith('temp-'));
+		assert.deepEqual(
+			getBlocks(draft)[0].blockable.entity.fields_data.why_choose_points,
+			['row-1', 'row-2'],
+			'the stored array is untouched until the create lands'
+		);
+		assert.equal(newListChildren(draft).length, 1);
+		assert.equal(newListChildren(draft)[0].fields_data.text, 'new');
+		// It is visible to the editor, though.
+		const rows = listChildRows(draft, blockId, 'why_choose_points');
+		assert.deepEqual(
+			rows.map((r) => r.pending),
+			[false, false, true]
+		);
+	});
+
+	it('adopting a created id puts it in the array and drops the pending row', () => {
+		const draft = createDraft(pageWithList(), 'v');
+		const blockId = getBlocks(draft)[0].id;
+		const row = addListChild(draft, blockId, 'why_choose_points', 'strength-item');
+		assert.equal(adoptListChildId(draft, blockId, 'why_choose_points', row.id, 'row-3'), true);
+		assert.deepEqual(getBlocks(draft)[0].blockable.entity.fields_data.why_choose_points, [
+			'row-1',
+			'row-2',
+			'row-3'
+		]);
+		assert.equal(newListChildren(draft).length, 0, 'no second create on a retry');
+		assert.equal(isDirty(draft), true, 'the parent must be written');
+	});
+
+	it('REFUSES to adopt a temp id, which is the whole point of the leg', () => {
+		const draft = createDraft(pageWithList(), 'v');
+		const blockId = getBlocks(draft)[0].id;
+		const row = addListChild(draft, blockId, 'why_choose_points', 'strength-item');
+		assert.equal(adoptListChildId(draft, blockId, 'why_choose_points', row.id, 'temp-x'), false);
+		assert.equal(adoptListChildId(draft, blockId, 'why_choose_points', row.id, ''), false);
+		assert.deepEqual(getBlocks(draft)[0].blockable.entity.fields_data.why_choose_points, [
+			'row-1',
+			'row-2'
+		]);
+	});
+
+	it('reorder and remove touch only the parent array — no child traffic', () => {
+		const draft = createDraft(pageWithList(), 'v');
+		const blockId = getBlocks(draft)[0].id;
+		assert.equal(moveListChild(draft, blockId, 'why_choose_points', 1, 0), true);
+		assert.deepEqual(getBlocks(draft)[0].blockable.entity.fields_data.why_choose_points, [
+			'row-2',
+			'row-1'
+		]);
+		assert.equal(removeListChild(draft, blockId, 'why_choose_points', 'row-2'), true);
+		assert.deepEqual(getBlocks(draft)[0].blockable.entity.fields_data.why_choose_points, ['row-1']);
+		assert.equal(newListChildren(draft).length, 0);
+		assert.equal(editedListChildren(draft).length, 0);
+		// The parent is dirty, which is the leg that carries both.
+		assert.equal(isDirty(draft), true);
+	});
+
+	it('editing a stored row is its own leg, not the parent entity', () => {
+		// A list child is free-standing: `collectEntities` walks BLOCKS and would never
+		// find it, so marking the parent dirty would write the wrong record.
+		const draft = createDraft(pageWithList(), 'v');
+		const blockId = getBlocks(draft)[0].id;
+		assert.equal(
+			setListChildField(draft, blockId, 'why_choose_points', 'row-1', 'text', 'edited'),
+			true
+		);
+		assert.deepEqual(editedListChildren(draft), [
+			{ childId: 'row-1', fields_data: { text: 'edited' } }
+		]);
+		assert.equal(
+			setListChildField(draft, blockId, 'why_choose_points', 'not-a-row', 'text', 'x'),
+			false,
+			'a row that is not in the array is refused'
+		);
+	});
+
+	it('editing a PENDING row is carried to its create, not a patch', () => {
+		const draft = createDraft(pageWithList(), 'v');
+		const blockId = getBlocks(draft)[0].id;
+		const row = addListChild(draft, blockId, 'why_choose_points', 'strength-item');
+		assert.equal(
+			setListChildField(draft, blockId, 'why_choose_points', row.id, 'text', 'typed'),
+			true
+		);
+		assert.equal(newListChildren(draft)[0].fields_data.text, 'typed');
+		assert.equal(editedListChildren(draft).length, 0, 'a pending row is never patched');
+	});
+
+	it('RECONCILE clears pending rows — or the next save creates them twice', () => {
+		// `reconcile` replaces `draft.page` and resets every other flag, so a temp row
+		// left behind would look new again on the following save. This is the mutation.
+		const draft = createDraft(pageWithList(), 'v');
+		const blockId = getBlocks(draft)[0].id;
+		addListChild(draft, blockId, 'why_choose_points', 'strength-item');
+		setListChildField(draft, blockId, 'why_choose_points', 'row-1', 'text', 'edited');
+		assert.equal(newListChildren(draft).length, 1);
+		assert.equal(editedListChildren(draft).length, 1);
+
+		reconcile(draft, pageWithList(), 'v2');
+		assert.equal(newListChildren(draft).length, 0, 'a pending row survived a reconcile');
+		assert.equal(editedListChildren(draft).length, 0, 'an edit survived a reconcile');
+	});
+
+	it('refuses every operation on a block that is still a temp', () => {
+		const draft = createDraft(samplePage(), 'v');
+		const fresh = addCollectionBlock(draft, 'story', [
+			{ refName: 'story', label: 'S', defaultCount: 1, itemCount: 'count' }
+		]);
+		assert.equal(addListChild(draft, fresh.id, 'f', 'strength-item'), null);
+		assert.equal(removeListChild(draft, fresh.id, 'f', 'x'), false);
+		assert.equal(moveListChild(draft, fresh.id, 'f', 0, 1), false);
+		assert.equal(setListChildField(draft, fresh.id, 'f', 'x', 'y', 'z'), false);
 	});
 });
 
