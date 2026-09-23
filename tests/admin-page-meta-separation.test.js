@@ -1,7 +1,14 @@
 // @ts-nocheck — draft and save behavior is exercised with Apex-shaped page data.
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { createDraft, isDirty, setPageField, setPageMeta } from '../src/admin/page-draft.js';
+import {
+	createDraft,
+	isDirty,
+	PAGE_META_NAMES,
+	setPageField,
+	setPageMeta
+} from '../src/admin/page-draft.js';
+import { META_NAMES } from '../src/server/bff/operations/post-shape.ts';
 
 function draft() {
 	return createDraft(
@@ -28,6 +35,18 @@ describe('page and meta stores', () => {
 		];
 		assert.equal(setPageMeta(d, 'description', 'X'), true);
 		assert.deepEqual(d.metaEdits, {});
+	});
+
+	/** page-draft.js:1093 must accept the same three names post-shape.ts:76 writes. */
+	it('tracks meta title and keywords separately and drops edits at baseline', () => {
+		assert.deepEqual(PAGE_META_NAMES, META_NAMES);
+		const d = draft();
+		assert.equal(setPageMeta(d, 'title', 'M'), true);
+		assert.equal(setPageMeta(d, 'keywords', 'alpha'), true);
+		assert.deepEqual(d.metaEdits, { title: 'M', keywords: 'alpha' });
+		assert.equal(setPageMeta(d, 'title', 'Stored meta'), true);
+		assert.deepEqual(d.metaEdits, { keywords: 'alpha' });
+		assert.equal(setPageMeta(d, 'unknown', 'x'), false);
 	});
 	/** save-page-structure.ts:347-365 accepts only page fields, so other names cannot mutate the draft. */
 	it('setPageField refuses every non-page field without making a draft dirty', () => {

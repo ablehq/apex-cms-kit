@@ -1087,15 +1087,17 @@ export function setPageField(draft, name, value) {
 /**
  * Page SEO has its own save leg (save-page.js), so it stays out of the structure
  * payload. Match setPostField: returning to the stored value removes the edit.
- * Only description renders on both sites (phase-4-plan.md §1.5).
+ * All three web names use this leg (`post-shape.ts:76`); the meta title must
+ * never enter `page.title` or the structure payload (Phase 6 C2).
  *
  * @param {AdminPageDraft} draft
- * @param {'description'} name
+ * @param {'title' | 'description' | 'keywords'} name
  * @param {string} value
  * @returns {boolean}
  */
+export const PAGE_META_NAMES = ['title', 'description', 'keywords'];
 export function setPageMeta(draft, name, value) {
-	if (name !== 'description') return false;
+	if (!PAGE_META_NAMES.includes(name)) return false;
 	// The baseline comes from a row the SERVER CAN ACTUALLY WRITE — one bearing an id.
 	// `update-page-seo.ts` refuses a page with no id-bearing `web` description row, and
 	// its message tells the editor to clear the field to get out of it. If the baseline
