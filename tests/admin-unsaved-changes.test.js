@@ -105,7 +105,7 @@ test('K1 decision table: clean, app route, unload, same screen', () => {
 		'ask'
 	);
 	for (const nav of [
-		{ ...rail, to: { url: url('https://other.test/admin/images') } },
+		{ ...rail, to: { url: url('https://other.test/admin/team/abc') } },
 		{ ...rail, to: { url: rail.from.url }, willUnload: true },
 		{ ...rail, to: { url: rail.from.url }, type: 'link', willUnload: true }
 	]) {
