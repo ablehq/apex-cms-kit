@@ -1066,17 +1066,21 @@ export function removeBlock(draft, blockId) {
 /**
  * Set a page-level string field (title/slug/summary). Marks structure dirty.
  *
- * Those three are the whole list because they are what the structure route's body
- * schema permits (`save-page-structure.ts`).
+ * Only these three names are accepted by the structure body
+ * (`save-page-structure.ts:347-365`). In particular, meta title belongs in
+ * `metaEdits`, never `page.title` (Phase 6 C2).
  *
  * @param {AdminPageDraft} draft
  * @param {'title' | 'slug' | 'summary'} name
  * @param {string} value
- * @returns {void}
+ * @returns {boolean}
  */
+const PAGE_FIELDS = new Set(['title', 'slug', 'summary']);
 export function setPageField(draft, name, value) {
+	if (!PAGE_FIELDS.has(name)) return false;
 	draft.page[name] = value;
 	draft.structureDirty = true;
+	return true;
 }
 
 /**
