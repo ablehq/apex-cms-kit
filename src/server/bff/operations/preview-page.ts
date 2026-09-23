@@ -14,20 +14,15 @@
  * prerender and that file does not exist.)
  *
  * ── Reuse is the design, not a convenience ──────────────────────────────────
- * The projection is `projectCmsPage` / `projectBlocks` / `projectFields` from
- * `$lib/cms/page-data.js` — the SAME functions `cms:setup` calls through
- * `snapshot-projection.js` to write `cms/data/pages.json`, and therefore the same
- * transform that produced everything the public site serves. The media index is
- * built by the same `buildMediaIndex` over the same three asset-library files.
- * The renderer on the other side is `$lib/blocks/CmsPageRenderer.svelte` and the
- * same `Glc*` components, dispatched through the same registry.
+ * The generic operation owns the guard, Apex read and published comparison; a
+ * site adapter owns the projection that its public route actually uses. GLC's
+ * adapter uses `projectCmsPage` and the same media index as its publish path.
+ * Other sites supply their own public projection and comparable rather than
+ * copying GLC's block shape or creating a second projection for preview.
  *
  * That matters for one reason: if the preview and the published page ever look
  * different, the difference is IN THE DATA — someone saved something, or the
- * snapshot is behind — and can never be an artifact of a second renderer drifting
- * from the first. A parallel projection would make "the preview lied" a
- * permanently open question. There is no second projection here, and there must
- * not be one.
+ * snapshot is behind — rather than an artifact of a parallel renderer.
  *
  * ── What it can and cannot show ────────────────────────────────────────────
  * It reads Apex. So it shows the last SAVE, and it cannot show unsaved edits
@@ -50,36 +45,19 @@
 import { unwrapArchetypeRecord } from '../archetype-record';
 import { stringifyCanonical } from '../../../cms/canonical-json.js';
 import { buildMediaIndex } from '../../../cms/media.js';
-import { isCmsPageRoutable, projectCmsPage, projectedPageBySlug } from '../../../cms/page-data.js';
+import {
+	isCmsPageRoutable,
+	normalizeSlugPath,
+	projectCmsPage,
+	projectedPageBySlug
+} from '../../../cms/page-data.js';
 import type { ProjectedCmsPage } from '../../../cms/page-data.js';
 
 import { guardRequest } from '../guard';
 import { ContentUnavailableError, readContent } from '../../content/read';
 import { pageIdSchema } from './get-page';
 import type { BffContext } from '../context';
-
-/**
- * The published snapshot (KV, plan §2.3), read for two things only: the media map
- * (media ids are resolved at publish time, so a request-time projection has to be
- * handed the same index), and the "what is on the site" comparison below.
- *
- * Honest limit: an image uploaded since the last publish is not in this index, so
- * its id stays an unresolved string — exactly as it would on the site until the
- * next publish. The preview is wrong in the same direction as the site, which is
- * the only kind of wrong that is safe here.
- */
-async function siteSnapshot(ctx: BffContext) {
-	const { collections } = await readContent(ctx.content);
-	return {
-		mediaIndex: buildMediaIndex([
-			collections.images ?? [],
-			collections.files ?? [],
-			collections.videos ?? []
-		]),
-		pages: (collections.pages ?? []) as ProjectedCmsPage[],
-		collections
-	};
-}
+import type { ApexAdminClient } from '../apex-admin-client';
 
 /** How the page the public site serves compares to what is saved in Apex now. */
 export type OnSiteState =
@@ -120,25 +98,111 @@ export type PartitionRenderableBlocks = (blocks: any[]) => {
 export type PagePreviewResult =
 	{ ok: true; preview: PagePreview } | { ok: false; status: number; reason: string };
 
-export async function loadPagePreview(
+/** §2.2: adapters may read Apex as the editor, but must leave the shared snapshot untouched. */
+export interface PreviewAdapterInput {
+	/** Apex's saved page; clone before an in-place transform. */
+	raw: Readonly<Record<string, unknown>>;
+	/** An independent copy of read.ts's memo collections. */
+	collections: Record<string, unknown[]>;
+	/** The guard's client, bound to the signed-in editor. */
+	apex: ApexAdminClient;
+}
+
+export type PreviewProjection<Payload> =
+	| { ok: true; payload: Payload; comparable: unknown; unknownTemplates: string[] }
+	| { ok: false; status: 404 | 422 | 502; reason: string };
+
+/** §2.2: each site supplies its public projection and its own comparison rules. */
+export interface SitePreviewAdapter<Payload> {
+	projectSaved(input: PreviewAdapterInput): Promise<PreviewProjection<Payload>>;
+	publishedComparable(input: PreviewAdapterInput): Promise<unknown | null>;
+	routable(raw: Readonly<Record<string, unknown>>): boolean;
+	publicPath(raw: Readonly<Record<string, unknown>>): string;
+}
+
+export interface SitePagePreview<Payload> {
+	pageId: string;
+	payload: Payload;
+	unknownTemplates: string[];
+	status: string;
+	routable: boolean;
+	publicPath: string | null;
+	savedAt: string | null;
+	onSite: OnSiteState;
+}
+
+export type SitePagePreviewResult<Payload> =
+	{ ok: true; preview: SitePagePreview<Payload> } | { ok: false; status: number; reason: string };
+
+/** The original GLC fourth argument, kept structurally identical for its call site. */
+export interface GlcPreviewOptions {
+	partitionRenderableBlocks: PartitionRenderableBlocks;
+	/** Derive the request-time data a derived section needs (GLC: the sermon strip). */
+	messages?: (collections: Record<string, unknown[]>, blocks: unknown[]) => unknown;
+	/**
+	 * The `<title>` fallback for a page with no title of its own — and it MUST be
+	 * the same value the site's publish projection uses. The two projections are
+	 * compared byte-for-byte below to decide `identical` vs `differs`, so a site
+	 * that passes `siteTitle` at publish and not here reports every untitled page
+	 * as `differs` forever, no matter how often it republishes.
+	 */
+	siteTitle?: string;
+}
+
+// Only the GLC callback retains its old memo identity. Generic adapters receive
+// the clone, and cannot reach this private mapping.
+const glcMemoCollections = new WeakMap<Record<string, unknown[]>, Record<string, unknown[]>>();
+const glcCapturedPages = new WeakMap<Record<string, unknown[]>, ProjectedCmsPage[]>();
+
+/** §2.2: keep GLC's media, partition, messages and unpartitioned comparable. */
+export function glcPagePreviewAdapter(
+	options: GlcPreviewOptions
+): SitePreviewAdapter<{ page: ProjectedCmsPage; messages: unknown }> {
+	return {
+		async projectSaved(input) {
+			// The old siteSnapshot captured pages before invoking messages. A callback
+			// may replace collections.pages, but that must not change the comparison.
+			const memo = glcMemoCollections.get(input.collections) ?? input.collections;
+			glcCapturedPages.set(input.collections, (memo.pages ?? []) as ProjectedCmsPage[]);
+			// An unpublished upload is unresolved here, just as it is on the public site.
+			const media = buildMediaIndex([
+				input.collections.images ?? [],
+				input.collections.files ?? [],
+				input.collections.videos ?? []
+			]);
+			const projected = projectCmsPage(input.raw, { media, siteTitle: options.siteTitle });
+			const { renderable, unknownTemplates } = previewBlocks(
+				projected,
+				options.partitionRenderableBlocks
+			);
+			const messages = options.messages ? options.messages(memo, renderable) : [];
+			return {
+				ok: true,
+				payload: { page: { ...projected, blocks: renderable }, messages },
+				comparable: projected,
+				unknownTemplates
+			};
+		},
+		async publishedComparable(input) {
+			return projectedPageBySlug(
+				glcCapturedPages.get(input.collections) ??
+					(((glcMemoCollections.get(input.collections) ?? input.collections).pages ??
+						[]) as ProjectedCmsPage[]),
+				normalizeSlugPath(input.raw.slug)
+			);
+		},
+		routable: isCmsPageRoutable,
+		publicPath: (raw) => normalizeSlugPath(raw.slug)
+	};
+}
+
+/** §2.2: authenticate and read first; adapters handle only site-specific projection. */
+export async function loadSitePagePreview<Payload>(
 	request: Request,
 	ctx: BffContext,
 	params: { pageId: string },
-	options: {
-		partitionRenderableBlocks: PartitionRenderableBlocks;
-		/** Derive the request-time data a derived section needs (GLC: the sermon strip). */
-		messages?: (collections: Record<string, unknown[]>, blocks: unknown[]) => unknown;
-		/**
-		 * The `<title>` fallback for a page with no title of its own — and it MUST be
-		 * the same value the site's publish projection uses. The two projections are
-		 * compared byte-for-byte below to decide `identical` vs `differs`, so a site
-		 * that passes `siteTitle` at publish and not here reports every untitled page
-		 * as `differs` forever, no matter how often it republishes.
-		 */
-		siteTitle?: string;
-	}
-): Promise<PagePreviewResult> {
-	const { partitionRenderableBlocks } = options;
+	adapter: SitePreviewAdapter<Payload>
+): Promise<SitePagePreviewResult<Payload>> {
 	const guard = await guardRequest(request, ctx, { mutation: false });
 	if (!guard.ok) return { ok: false, status: guard.status, reason: guard.reason };
 
@@ -155,43 +219,71 @@ export async function loadPagePreview(
 	const raw = unwrapArchetypeRecord(apexResponse.body);
 	if (!raw) return { ok: false, status: 502, reason: 'unexpected upstream shape' };
 
-	let site: Awaited<ReturnType<typeof siteSnapshot>>;
+	let collections: Record<string, unknown[]>;
 	try {
-		site = await siteSnapshot(ctx);
+		({ collections } = await readContent(ctx.content));
 	} catch (cause) {
 		if (!(cause instanceof ContentUnavailableError)) throw cause;
 		return { ok: false, status: 503, reason: 'the site has not been published yet' };
 	}
 
-	// ── The site's own projection, on live data. No second implementation. ──
-	const projected = projectCmsPage(raw, { media: site.mediaIndex, siteTitle: options.siteTitle });
-	const { renderable, unknownTemplates } = previewBlocks(projected, partitionRenderableBlocks);
-	const messages = options.messages ? options.messages(site.collections, renderable) : [];
-
-	// "What is live" for THIS page, stated as a fact rather than a guess: the
-	// snapshot's entry and the live projection are the output of the same function,
-	// so canonical JSON compares them exactly. `differs` is precisely the state
-	// that made a block reorder look like it had done nothing.
-	const onSnapshot = projectedPageBySlug(site.pages, projected.slug);
-	const onSite: OnSiteState = !onSnapshot
-		? 'absent'
-		: stringifyCanonical(onSnapshot) === stringifyCanonical(projected)
-			? 'identical'
-			: 'differs';
-
-	const routable = isCmsPageRoutable(raw);
+	// Capture every raw-derived fact before an adapter can transform its input.
+	const status = typeof raw.status === 'string' ? raw.status : '';
+	const savedAt = typeof raw.updated_at === 'string' ? raw.updated_at : null;
+	const routable = adapter.routable(raw);
+	const publicPath = routable ? adapter.publicPath(raw) : null;
+	// Preview is admin-only and rare; cloning here costs less than risking an
+	// adapter's in-place sort or splice corrupting the public site's shared memo.
+	const adapterCollections = structuredClone(collections);
+	glcMemoCollections.set(adapterCollections, collections);
+	const input = { raw, collections: adapterCollections, apex: guard.apex };
+	const projected = await adapter.projectSaved(input);
+	if (!projected.ok) return projected;
+	const onSnapshot = await adapter.publishedComparable(input);
+	const onSite: OnSiteState =
+		onSnapshot == null
+			? 'absent'
+			: stringifyCanonical(onSnapshot) === stringifyCanonical(projected.comparable)
+				? 'identical'
+				: 'differs';
 
 	return {
 		ok: true,
 		preview: {
 			pageId: idResult.data,
-			page: { ...projected, blocks: renderable },
-			messages,
-			unknownTemplates,
-			status: typeof raw.status === 'string' ? raw.status : '',
+			payload: projected.payload,
+			unknownTemplates: projected.unknownTemplates,
+			status,
 			routable,
-			publicPath: routable ? projected.slug : null,
-			savedAt: typeof raw.updated_at === 'string' ? raw.updated_at : null,
+			publicPath,
+			savedAt,
+			onSite
+		}
+	};
+}
+
+/** GLC's established result shape and signature, now expressed through the site adapter. */
+export async function loadPagePreview(
+	request: Request,
+	ctx: BffContext,
+	params: { pageId: string },
+	options: GlcPreviewOptions
+): Promise<PagePreviewResult> {
+	const result = await loadSitePagePreview(request, ctx, params, glcPagePreviewAdapter(options));
+	if (!result.ok) return result;
+	const { pageId, payload, unknownTemplates, status, routable, publicPath, savedAt, onSite } =
+		result.preview;
+	return {
+		ok: true,
+		preview: {
+			pageId,
+			page: payload.page,
+			messages: payload.messages,
+			unknownTemplates,
+			status,
+			routable,
+			publicPath,
+			savedAt,
 			onSite
 		}
 	};
