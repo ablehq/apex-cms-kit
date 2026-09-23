@@ -100,14 +100,14 @@ function messageFor(stage, result) {
 	}
 	if (stage === 'seo') {
 		if (result?.error === 'missing meta row') {
-			return 'This page has no stored meta description row. Ask an administrator to repair it.';
+			return 'This page has no stored meta description row. Your field, row and layout changes were saved, but the description was not. Clear the meta description field, then Save or Publish again.';
 		}
 		if (status === 400 && result?.error === 'invalid body') {
-			return 'The meta description could not be accepted. Use 1,000 characters or fewer and Save again.';
+			return 'The meta description could not be accepted. Your field, row and layout changes were saved. Use 1,000 characters or fewer and Save again.';
 		}
 		return status === 422
-			? 'The meta description was rejected. Check its value and Save again.'
-			: 'Saving the meta description failed. Save again to retry.';
+			? 'The meta description was rejected. Your field, row and layout changes were saved. Check its value and Save again.'
+			: 'Saving the meta description failed. Your field, row and layout changes were saved. Save again to retry.';
 	}
 	return 'Publishing failed after your changes were saved. Save/Publish again to retry.';
 }

@@ -237,19 +237,30 @@ describe('page meta description — its own save leg', () => {
 	});
 
 	/**
-	 * Phase 4A §1.4b: a page without an existing row cannot safely be written
-	 * by ID, and a retry will keep getting 409 until the stored row is repaired.
+	 * A page without an existing row cannot safely be written by ID. The editor
+	 * can clear that unsupported description edit and retry Publish.
 	 */
-	it('names a missing stored row without advising a futile retry', async () => {
+	it('names the way past a missing stored row and lets Publish proceed after clearing it', async () => {
 		const draft = createDraft(samplePage(), 'baseline-v');
 		setPageMeta(draft, 'description', 'After');
 		const client = makeClient({
 			results: { seo: () => ({ ok: false, status: 409, error: 'missing meta row' }) }
 		});
-		const result = await savePage(draft, client);
+		const result = await savePage(draft, client, { statusEvent: 'publish' });
 		assert.equal(result.stage, 'seo');
 		assert.match(result.message, /no stored meta description row/);
-		assert.doesNotMatch(result.message, /Save again/);
+		assert.match(result.message, /Clear the meta description field, then Save or Publish again/);
+		assert.match(result.message, /layout changes were saved/);
+		assert.equal(
+			client.calls.some(([name]) => name === 'changePageStatus'),
+			false
+		);
+		setPageMeta(draft, 'description', '');
+		assert.deepEqual(draft.metaEdits, {});
+		const retry = await savePage(draft, client, { statusEvent: 'publish' });
+		assert.equal(retry.ok, true);
+		assert.equal(client.calls.filter(([name]) => name === 'updatePageSeo').length, 1);
+		assert.equal(client.calls.filter(([name]) => name === 'changePageStatus').length, 1);
 	});
 
 	/**
@@ -265,6 +276,18 @@ describe('page meta description — its own save leg', () => {
 		const result = await savePage(draft, client);
 		assert.equal(result.stage, 'seo');
 		assert.match(result.message, /1,000 characters/);
+		assert.match(result.message, /field, row and layout changes were saved/);
+	});
+
+	it('explains which earlier writes landed for other SEO failures', async () => {
+		for (const status of [422, 503]) {
+			const draft = createDraft(samplePage(), 'baseline-v');
+			setPageMeta(draft, 'description', 'After');
+			const client = makeClient({ results: { seo: () => ({ ok: false, status }) } });
+			const result = await savePage(draft, client);
+			assert.equal(result.stage, 'seo');
+			assert.match(result.message, /field, row and layout changes were saved/);
+		}
 	});
 });
 
