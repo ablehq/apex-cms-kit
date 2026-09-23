@@ -1017,9 +1017,16 @@ export function setPageField(draft, name, value) {
  */
 export function setPageMeta(draft, name, value) {
 	if (name !== 'description') return false;
+	// The baseline comes from a row the SERVER CAN ACTUALLY WRITE — one bearing an id.
+	// `update-page-seo.ts` refuses a page with no id-bearing `web` description row, and
+	// its message tells the editor to clear the field to get out of it. If the baseline
+	// were taken from an ID-LESS row with a value, clearing would leave `''` in
+	// `metaEdits` rather than removing it, every Save would 409 again, and the page
+	// could never be published — the exact dead end the message claims to open.
+	// (codex's review of d864899, 2026-09-23.)
 	const baseline =
-		draft.page.meta_properties?.find((row) => row?.group === 'web' && row.name === name)?.value ??
-		'';
+		draft.page.meta_properties?.find((row) => row?.group === 'web' && row.name === name && row.id)
+			?.value ?? '';
 	if (value === baseline) delete draft.metaEdits[name];
 	else draft.metaEdits[name] = value;
 	return true;

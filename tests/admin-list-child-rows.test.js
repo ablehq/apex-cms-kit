@@ -17,6 +17,7 @@ import {
 	editedListChildren,
 	isDirty,
 	removeListChild,
+	setPageMeta,
 	reconcile
 } from '../src/admin/page-draft.js';
 
@@ -185,5 +186,33 @@ describe('removing a row takes its queued edit with it', () => {
 		const edits = editedListChildren(draft);
 		assert.equal(edits.length, 1);
 		assert.equal(edits[0].childId, 'row-2');
+	});
+});
+
+describe('setPageMeta baselines on a row the server can write', () => {
+	test('an ID-LESS description row does not become the baseline', () => {
+		// `update-page-seo.ts` 409s when no id-bearing row exists, and its message says to
+		// clear the field to escape. If an id-less row's value were the baseline, clearing
+		// would store '' instead of dropping the edit — so every Save would 409 again and
+		// the page could never be published. (codex's review, 2026-09-23.)
+		const page = samplePage();
+		page.meta_properties = [{ name: 'description', group: 'web', value: 'Existing' }];
+		const draft = createDraft(page, 'v1');
+		setPageMeta(draft, 'description', '');
+		assert.equal(
+			Object.hasOwn(draft.metaEdits, 'description'),
+			false,
+			'clearing must DROP the edit, or the 409 is inescapable'
+		);
+	});
+
+	test('an id-bearing row still baselines normally', () => {
+		const page = samplePage();
+		page.meta_properties = [{ id: 'm1', name: 'description', group: 'web', value: 'Stored' }];
+		const draft = createDraft(page, 'v1');
+		setPageMeta(draft, 'description', 'Changed');
+		assert.equal(draft.metaEdits.description, 'Changed');
+		setPageMeta(draft, 'description', 'Stored');
+		assert.equal(Object.hasOwn(draft.metaEdits, 'description'), false, 'back to stored = clean');
 	});
 });
