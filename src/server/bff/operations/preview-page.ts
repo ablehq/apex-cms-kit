@@ -102,7 +102,7 @@ export type PagePreviewResult =
 export interface PreviewAdapterInput {
 	/** Apex's saved page; clone before an in-place transform. */
 	raw: Readonly<Record<string, unknown>>;
-	/** read.ts:114 returns the memo across requests; read-only by contract. */
+	/** An independent copy of read.ts's memo collections. */
 	collections: Record<string, unknown[]>;
 	/** The guard's client, bound to the signed-in editor. */
 	apex: ApexAdminClient;
@@ -149,12 +149,21 @@ export interface GlcPreviewOptions {
 	siteTitle?: string;
 }
 
+// Only the GLC callback retains its old memo identity. Generic adapters receive
+// the clone, and cannot reach this private mapping.
+const glcMemoCollections = new WeakMap<Record<string, unknown[]>, Record<string, unknown[]>>();
+const glcCapturedPages = new WeakMap<Record<string, unknown[]>, ProjectedCmsPage[]>();
+
 /** §2.2: keep GLC's media, partition, messages and unpartitioned comparable. */
 export function glcPagePreviewAdapter(
 	options: GlcPreviewOptions
 ): SitePreviewAdapter<{ page: ProjectedCmsPage; messages: unknown }> {
 	return {
 		async projectSaved(input) {
+			// The old siteSnapshot captured pages before invoking messages. A callback
+			// may replace collections.pages, but that must not change the comparison.
+			const memo = glcMemoCollections.get(input.collections) ?? input.collections;
+			glcCapturedPages.set(input.collections, (memo.pages ?? []) as ProjectedCmsPage[]);
 			// An unpublished upload is unresolved here, just as it is on the public site.
 			const media = buildMediaIndex([
 				input.collections.images ?? [],
@@ -166,7 +175,7 @@ export function glcPagePreviewAdapter(
 				projected,
 				options.partitionRenderableBlocks
 			);
-			const messages = options.messages ? options.messages(input.collections, renderable) : [];
+			const messages = options.messages ? options.messages(memo, renderable) : [];
 			return {
 				ok: true,
 				payload: { page: { ...projected, blocks: renderable }, messages },
@@ -176,7 +185,9 @@ export function glcPagePreviewAdapter(
 		},
 		async publishedComparable(input) {
 			return projectedPageBySlug(
-				(input.collections.pages ?? []) as ProjectedCmsPage[],
+				glcCapturedPages.get(input.collections) ??
+					(((glcMemoCollections.get(input.collections) ?? input.collections).pages ??
+						[]) as ProjectedCmsPage[]),
 				normalizeSlugPath(input.raw.slug)
 			);
 		},
@@ -221,12 +232,16 @@ export async function loadSitePagePreview<Payload>(
 	const savedAt = typeof raw.updated_at === 'string' ? raw.updated_at : null;
 	const routable = adapter.routable(raw);
 	const publicPath = routable ? adapter.publicPath(raw) : null;
-	const input = { raw, collections, apex: guard.apex };
+	// Preview is admin-only and rare; cloning here costs less than risking an
+	// adapter's in-place sort or splice corrupting the public site's shared memo.
+	const adapterCollections = structuredClone(collections);
+	glcMemoCollections.set(adapterCollections, collections);
+	const input = { raw, collections: adapterCollections, apex: guard.apex };
 	const projected = await adapter.projectSaved(input);
 	if (!projected.ok) return projected;
 	const onSnapshot = await adapter.publishedComparable(input);
 	const onSite: OnSiteState =
-		onSnapshot === null
+		onSnapshot == null
 			? 'absent'
 			: stringifyCanonical(onSnapshot) === stringifyCanonical(projected.comparable)
 				? 'identical'

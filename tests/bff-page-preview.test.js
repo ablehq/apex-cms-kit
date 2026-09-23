@@ -106,10 +106,10 @@ function harness(raw = page(), pages = [projected()], apexStatus = 200, publishe
 			async put() {}
 		}
 	};
-	return { ctx, calls, client };
+	return { ctx, calls, client, collections };
 }
 
-async function request(ctx, signed = true) {
+async function request(ctx, signed = true, extraHeaders = {}) {
 	let cookie = '';
 	if (signed) {
 		const secret = createSessionSecret();
@@ -130,7 +130,7 @@ async function request(ctx, signed = true) {
 		cookie = `apex_admin_session=${secret}`;
 	}
 	return new Request(`${ORIGIN}/admin/pages/${PAGE_ID}/preview`, {
-		headers: { origin: ORIGIN, 'sec-fetch-site': 'same-origin', cookie }
+		headers: { origin: ORIGIN, 'sec-fetch-site': 'same-origin', cookie, ...extraHeaders }
 	});
 }
 
@@ -172,6 +172,10 @@ function assertOutput(actual, wanted) {
 	assert.equal(JSON.stringify(actual), JSON.stringify(wanted));
 }
 
+it('assertOutput rejects a key-order change even when deepEqual accepts it', () => {
+	assert.throws(() => assertOutput({ a: 1, b: 2 }, { b: 2, a: 1 }));
+});
+
 describe('GLC page preview characterisation', () => {
 	/** The preview must keep the whole published payload and comparison from preview-page.ts:152-275. */
 	it('reports an identical published page', async () => {
@@ -186,7 +190,7 @@ describe('GLC page preview characterisation', () => {
 	/** An older snapshot must be visible as differs; preview-page.ts:227-233 compares projections. */
 	it('reports a changed published page', async () => {
 		const { ctx } = harness(page(), [projected([], { title: 'Old' })]);
-		assert.deepEqual(
+		assertOutput(
 			await loadPagePreview(await request(ctx), ctx, { pageId: PAGE_ID }, options()),
 			expected(projected(), { onSite: 'differs' })
 		);
@@ -195,7 +199,7 @@ describe('GLC page preview characterisation', () => {
 	/** Drafts still render their last save, while preview-page.ts:219-245 withholds a public path. */
 	it('reports a draft', async () => {
 		const { ctx } = harness(page({ status: 'draft' }), []);
-		assert.deepEqual(
+		assertOutput(
 			await loadPagePreview(await request(ctx), ctx, { pageId: PAGE_ID }, options()),
 			expected(projected(), {
 				status: 'draft',
@@ -206,10 +210,28 @@ describe('GLC page preview characterisation', () => {
 		);
 	});
 
+	it('compares a draft that still has a snapshot entry', async () => {
+		const { ctx } = harness(page({ status: 'draft' }), [projected()]);
+		assertOutput(
+			await loadPagePreview(await request(ctx), ctx, { pageId: PAGE_ID }, options()),
+			expected(projected(), { status: 'draft', routable: false, publicPath: null })
+		);
+		const older = harness(page({ status: 'draft' }), [projected([], { title: 'Old' })]);
+		assertOutput(
+			await loadPagePreview(await request(older.ctx), older.ctx, { pageId: PAGE_ID }, options()),
+			expected(projected(), {
+				status: 'draft',
+				routable: false,
+				publicPath: null,
+				onSite: 'differs'
+			})
+		);
+	});
+
 	/** A missing snapshot row gives absent even when Apex marks the page published; preview-page.ts:227-233. */
 	it('reports an absent published page', async () => {
 		const { ctx } = harness(page(), []);
-		assert.deepEqual(
+		assertOutput(
 			await loadPagePreview(await request(ctx), ctx, { pageId: PAGE_ID }, options()),
 			expected(projected(), { onSite: 'absent' })
 		);
@@ -247,27 +269,116 @@ describe('GLC page preview characterisation', () => {
 			meta: { title: SITE_TITLE, description: '' }
 		});
 		const { ctx } = harness(raw, [published]);
-		assert.deepEqual(
+		assertOutput(
 			await loadPagePreview(await request(ctx), ctx, { pageId: PAGE_ID }, options()),
 			expected(published)
 		);
 		assert.equal(projectCmsPage(raw, { siteTitle: SITE_TITLE }).meta.title, SITE_TITLE);
 	});
 
+	it('resolves a saved image id through the snapshot media index', async () => {
+		const raw = page();
+		raw.blocks[0].blockable.entity.fields_data.image = 'image-1';
+		const resolved = projected([
+			{
+				...known,
+				fields: {
+					heading: 'Hello',
+					image: { url: '/image.jpg', alt: 'Portrait', contentType: 'image/jpeg' }
+				}
+			}
+		]);
+		const { ctx, collections } = harness(raw, [resolved]);
+		collections.images.push({
+			id: 'image-1',
+			url: '/image.jpg',
+			alt_text: 'Portrait',
+			file: { content_type: 'image/jpeg' }
+		});
+		assertOutput(
+			await loadPagePreview(await request(ctx), ctx, { pageId: PAGE_ID }, options()),
+			expected(resolved)
+		);
+	});
+
+	it('keeps the pages array captured before messages replaces it', async () => {
+		const { ctx } = harness();
+		const collections = (await readContent(ctx.content)).collections;
+		assertOutput(
+			await loadPagePreview(
+				await request(ctx),
+				ctx,
+				{ pageId: PAGE_ID },
+				{
+					...options(),
+					messages(memo) {
+						assert.equal(memo, collections);
+						memo.pages = [];
+						return [];
+					}
+				}
+			),
+			expected(projected())
+		);
+	});
+
+	it('accepts GLC options without siteTitle', async () => {
+		const { ctx } = harness();
+		assertOutput(
+			await loadPagePreview(
+				await request(ctx),
+				ctx,
+				{ pageId: PAGE_ID },
+				{
+					partitionRenderableBlocks: options().partitionRenderableBlocks,
+					messages: (collections, blocks) => [collections.youtube_videos.length, blocks.length]
+				}
+			),
+			expected(projected(), { messages: [1, 1] })
+		);
+	});
+
 	/** The guard in preview-page.ts:195-196 must run before any draft read. */
 	it('rejects a signed-out request without calling Apex', async () => {
 		const { ctx, calls } = harness();
-		assert.deepEqual(
+		assertOutput(
 			await loadPagePreview(await request(ctx, false), ctx, { pageId: PAGE_ID }, options()),
 			{ ok: false, status: 401, reason: 'unauthorized' }
 		);
 		assert.deepEqual(calls, []);
 	});
 
+	it('rejects an unallowlisted origin and cross-site fetch', async () => {
+		for (const [headers, reason] of [
+			[{ origin: 'https://elsewhere.test' }, 'origin not allowed'],
+			[{ 'sec-fetch-site': 'cross-site' }, 'cross-site request']
+		]) {
+			const { ctx, calls } = harness();
+			assertOutput(
+				await loadPagePreview(
+					await request(ctx, true, headers),
+					ctx,
+					{ pageId: PAGE_ID },
+					options()
+				),
+				{ ok: false, status: 403, reason }
+			);
+			assert.deepEqual(calls, []);
+		}
+	});
+
+	it('returns the old fallbacks for non-string status and updated_at', async () => {
+		const { ctx } = harness(page({ status: 17, updated_at: 42 }));
+		assertOutput(
+			await loadPagePreview(await request(ctx), ctx, { pageId: PAGE_ID }, options()),
+			expected(projected(), { status: '', routable: false, publicPath: null, savedAt: null })
+		);
+	});
+
 	/** Invalid ids and Apex failures must retain the status mapping at preview-page.ts:198-209. */
 	it('maps invalid ids and Apex 404/500', async () => {
 		const { ctx: invalid, calls } = harness();
-		assert.deepEqual(
+		assertOutput(
 			await loadPagePreview(await request(invalid), invalid, { pageId: 'bad' }, options()),
 			{ ok: false, status: 400, reason: 'invalid page id' }
 		);
@@ -277,7 +388,7 @@ describe('GLC page preview characterisation', () => {
 			[500, { ok: false, status: 502, reason: 'upstream error' }]
 		]) {
 			const { ctx } = harness(page(), [], status);
-			assert.deepEqual(
+			assertOutput(
 				await loadPagePreview(await request(ctx), ctx, { pageId: PAGE_ID }, options()),
 				expectedResult
 			);
@@ -287,9 +398,32 @@ describe('GLC page preview characterisation', () => {
 	/** The content reader's unavailable state at preview-page.ts:211-216 must remain a 503. */
 	it('reports an unpublished site snapshot', async () => {
 		const { ctx } = harness(page(), [], 200, false);
-		assert.deepEqual(
-			await loadPagePreview(await request(ctx), ctx, { pageId: PAGE_ID }, options()),
-			{ ok: false, status: 503, reason: 'the site has not been published yet' }
+		assertOutput(await loadPagePreview(await request(ctx), ctx, { pageId: PAGE_ID }, options()), {
+			ok: false,
+			status: 503,
+			reason: 'the site has not been published yet'
+		});
+	});
+
+	it('maps a malformed Apex success to unexpected upstream shape', async () => {
+		const { ctx, client } = harness();
+		client.getPage = async () => ({ ok: true, status: 200, body: { data: null } });
+		assertOutput(await loadPagePreview(await request(ctx), ctx, { pageId: PAGE_ID }, options()), {
+			ok: false,
+			status: 502,
+			reason: 'unexpected upstream shape'
+		});
+	});
+
+	it('rethrows an unexpected content read error', async () => {
+		const { ctx } = harness();
+		const failure = new Error('KV failed');
+		ctx.content.get = async () => {
+			throw failure;
+		};
+		await assert.rejects(
+			loadPagePreview(await request(ctx), ctx, { pageId: PAGE_ID }, options()),
+			(error) => error === failure
 		);
 	});
 });
@@ -322,8 +456,8 @@ describe('site page preview adapter contract', () => {
 		};
 	}
 
-	/** §2.2: a site receives the guarded client and shared snapshot at preview-page.ts:224, never a cloned substitute. */
-	it('passes raw, snapshot collections, and the guarded Apex client', async () => {
+	/** §2.2: a site receives an independent snapshot copy and the guarded Apex client. */
+	it('passes raw, cloned collections, and the guarded Apex client', async () => {
 		const { loadSitePagePreview } = await import('../src/server/bff/operations/preview-page.ts');
 		const raw = page();
 		const { ctx, calls: apexCalls, client } = harness(raw);
@@ -334,7 +468,7 @@ describe('site page preview adapter contract', () => {
 			{ pageId: PAGE_ID },
 			adapter(calls)
 		);
-		assert.deepEqual(result, {
+		assertOutput(result, {
 			ok: true,
 			preview: {
 				pageId: PAGE_ID,
@@ -349,10 +483,41 @@ describe('site page preview adapter contract', () => {
 		});
 		const memo = await readContent(ctx.content);
 		assert.equal(calls[2][1].raw, raw);
-		assert.equal(calls[2][1].collections, memo.collections);
+		assert.notEqual(calls[2][1].collections, memo.collections);
+		assert.deepEqual(calls[2][1].collections, memo.collections);
 		assert.equal(calls[2][1].apex, client);
 		assert.equal(calls[2][1].apex, calls[3][1].apex);
 		assert.deepEqual(apexCalls, [['getPage', PAGE_ID]]);
+	});
+
+	it('keeps the shared memo unchanged when both adapter methods mutate every collection', async () => {
+		const { loadSitePagePreview } = await import('../src/server/bff/operations/preview-page.ts');
+		const { ctx } = harness();
+		const memo = await readContent(ctx.content);
+		const before = structuredClone(memo.collections);
+		const mutate = (collections) => {
+			for (const values of Object.values(collections)) {
+				values.sort(() => -1);
+				values.splice(0, 0, { changed: true });
+				for (const value of values) if (value && typeof value === 'object') value.changed = true;
+			}
+		};
+		await loadSitePagePreview(
+			await request(ctx),
+			ctx,
+			{ pageId: PAGE_ID },
+			adapter([], {
+				async projectSaved(input) {
+					mutate(input.collections);
+					return { ok: true, payload: {}, comparable: {}, unknownTemplates: [] };
+				},
+				async publishedComparable(input) {
+					mutate(input.collections);
+					return null;
+				}
+			})
+		);
+		assert.deepEqual((await readContent(ctx.content)).collections, before);
 	});
 
 	/** §2.2: a site's explicit refusal carries its reason and status unchanged through preview-page.ts:225-226. */
@@ -377,6 +542,7 @@ describe('site page preview adapter contract', () => {
 		const { loadSitePagePreview } = await import('../src/server/bff/operations/preview-page.ts');
 		for (const [published, onSite] of [
 			[null, 'absent'],
+			[undefined, 'absent'],
 			[{ b: 2, a: 1 }, 'identical'],
 			[{ a: 9 }, 'differs']
 		]) {

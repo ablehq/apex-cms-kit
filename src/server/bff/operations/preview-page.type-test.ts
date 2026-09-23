@@ -4,7 +4,7 @@
  * options type, or this site's unchanged loader would stop compiling on repin.
  */
 import { glcPagePreviewAdapter, loadPagePreview } from './preview-page';
-import type { GlcPreviewOptions, PartitionRenderableBlocks } from './preview-page';
+import type { PartitionRenderableBlocks } from './preview-page';
 import type { BffContext } from '../context';
 
 export function typecheckGlcPreviewCall(
@@ -13,16 +13,25 @@ export function typecheckGlcPreviewCall(
 	pageId: string,
 	partitionRenderableBlocks: PartitionRenderableBlocks
 ) {
-	const options: GlcPreviewOptions = {
-		partitionRenderableBlocks,
-		siteTitle: 'GLC',
-		messages: (collections, blocks) => {
-			const videos = collections.youtube_videos as never;
-			return [videos, blocks];
-		}
-	};
 	return {
-		load: loadPagePreview(request, ctx, { pageId }, options),
-		adapter: glcPagePreviewAdapter(options)
+		load: loadPagePreview(
+			request,
+			ctx,
+			{ pageId },
+			{
+				partitionRenderableBlocks,
+				messages: (collections, blocks) => {
+					const videos: unknown[] = collections.youtube_videos;
+					return [videos, blocks.map((block) => block)];
+				}
+			}
+		),
+		adapter: glcPagePreviewAdapter({
+			partitionRenderableBlocks,
+			messages: (collections, blocks) => {
+				const videos: unknown[] = collections.youtube_videos;
+				return [videos, blocks.map((block) => block)];
+			}
+		})
 	};
 }
