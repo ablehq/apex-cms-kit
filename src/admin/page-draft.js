@@ -3,6 +3,7 @@
 // behavior is covered by tests/admin-save-page.test.js + tests/bff-realapex.test.js.
 import { isTempId, serializeBlocksForSave } from './block-serialize.js';
 import { sortBundleChildrenInPlace } from '../cms/bundle-order.js';
+import { pickMetaRow } from '../cms/meta-row.js';
 
 /**
  * `@ts-nocheck` suppresses errors in THIS file; it does not stop the annotations
@@ -1063,44 +1064,50 @@ export function removeBlock(draft, blockId) {
 	draft.structureDirty = true;
 }
 
+const PAGE_FIELDS = new Set(['title', 'slug', 'summary']);
+
 /**
  * Set a page-level string field (title/slug/summary). Marks structure dirty.
  *
- * Those three are the whole list because they are what the structure route's body
- * schema permits (`save-page-structure.ts`).
+ * Only these three names are accepted by the structure body
+ * (`save-page-structure.ts:347-365`). In particular, meta title belongs in
+ * `metaEdits`, never `page.title` (Phase 6 C2).
  *
  * @param {AdminPageDraft} draft
  * @param {'title' | 'slug' | 'summary'} name
  * @param {string} value
- * @returns {void}
+ * @returns {boolean}
  */
 export function setPageField(draft, name, value) {
+	if (!PAGE_FIELDS.has(name)) return false;
 	draft.page[name] = value;
 	draft.structureDirty = true;
+	return true;
 }
+
+export const PAGE_META_NAMES = ['title', 'description', 'keywords'];
 
 /**
  * Page SEO has its own save leg (save-page.js), so it stays out of the structure
  * payload. Match setPostField: returning to the stored value removes the edit.
- * Only description renders on both sites (phase-4-plan.md §1.5).
+ * All three web names use this leg (`post-shape.ts:76`); the meta title must
+ * never enter `page.title` or the structure payload (Phase 6 C2).
  *
  * @param {AdminPageDraft} draft
- * @param {'description'} name
+ * @param {'title' | 'description' | 'keywords'} name
  * @param {string} value
  * @returns {boolean}
  */
 export function setPageMeta(draft, name, value) {
-	if (name !== 'description') return false;
+	if (!PAGE_META_NAMES.includes(name)) return false;
 	// The baseline comes from a row the SERVER CAN ACTUALLY WRITE — one bearing an id.
-	// `update-page-seo.ts` refuses a page with no id-bearing `web` description row, and
+	// `update-page-seo.ts:65-68` refuses a name with no id-bearing `web` row, and
 	// its message tells the editor to clear the field to get out of it. If the baseline
 	// were taken from an ID-LESS row with a value, clearing would leave `''` in
 	// `metaEdits` rather than removing it, every Save would 409 again, and the page
 	// could never be published — the exact dead end the message claims to open.
 	// (codex's review of d864899, 2026-09-23.)
-	const baseline =
-		draft.page.meta_properties?.find((row) => row?.group === 'web' && row.name === name && row.id)
-			?.value ?? '';
+	const baseline = pickMetaRow(draft.page.meta_properties, name, { requireId: true })?.value ?? '';
 	if (value === baseline) delete draft.metaEdits[name];
 	else draft.metaEdits[name] = value;
 	return true;

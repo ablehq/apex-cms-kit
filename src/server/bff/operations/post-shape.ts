@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { bffError, noStoreJson } from '../boundary';
 import { canonicalize } from '../../../cms/canonical-json.js';
 import { sanitizeHtml } from '../../../sanitize/html.js';
+import { pickMetaRow } from '../../../cms/meta-row.js';
 import { MAX_FIELD_VALUE_CHARS } from '../../../sanitize/write-boundary';
 import {
 	archetypeIdSchema,
@@ -337,16 +338,7 @@ export async function readPostArchetype(
 export function readMeta(view: Record<string, unknown>): AdminPostMeta {
 	const meta: AdminPostMeta = { title: '', description: '', keywords: '' };
 	const rows = Array.isArray(view.meta_properties) ? view.meta_properties : [];
-	for (const row of rows) {
-		if (!isRecord(row)) continue;
-		if (cleanString(row.group) !== 'web') continue;
-		const name = cleanString(row.name);
-		if (name === 'title' || name === 'description' || name === 'keywords') {
-			// First row wins: a no-id write can leave a DUPLICATE row behind (measured),
-			// and Apex returns them in creation order, so the original is the one to show.
-			if (!meta[name]) meta[name] = cleanString(row.value);
-		}
-	}
+	for (const name of META_NAMES) meta[name] = cleanString(pickMetaRow(rows, name)?.value);
 	return meta;
 }
 
@@ -366,17 +358,16 @@ export function metaAttributes(
 ): Record<string, unknown>[] {
 	const rows = Array.isArray(view.meta_properties) ? view.meta_properties : [];
 	const attributes: Record<string, unknown>[] = [];
-	const seen = new Set<string>();
+	const survivors = new Map<string, Record<string, unknown> | null>();
 	for (const row of rows) {
 		if (!isRecord(row)) continue;
 		if (cleanString(row.group) !== 'web') continue;
 		const name = cleanString(row.name);
 		const id = cleanString(row.id);
 		if (!id) continue;
-		if (seen.has(name)) {
-			// A SECOND row of the same name is what a no-id write left behind; `readMeta`
-			// shows the first, so the extra is invisible until it is not. Healed here,
-			// the way `coverAttributes` heals a duplicate cover row.
+		if (!survivors.has(name)) survivors.set(name, pickMetaRow(rows, name, { requireId: true }));
+		if (row !== survivors.get(name)) {
+			// Preserve the row readMeta shows, even if a blank row came first.
 			//
 			// NOTE: the culling applies to EVERY name in group `web`, not only the three
 			// in META_NAMES. That is safe today because Apex mints exactly title,
@@ -386,7 +377,6 @@ export function metaAttributes(
 			attributes.push({ id, _destroy: true });
 			continue;
 		}
-		seen.add(name);
 		const next = changes[name as (typeof META_NAMES)[number]];
 		if (next === undefined) continue;
 		attributes.push({ id, name, group: 'web', value_type: 'string', value: next });

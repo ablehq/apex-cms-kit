@@ -5,6 +5,7 @@ import { handleUpdatePageSeo } from '../src/server/bff/operations/update-page-se
 import { createSessionSecret, sessionIdFor } from '../src/server/bff/session.ts';
 import { parseAllowedOrigins } from '../src/server/bff/boundary.ts';
 import { createMemorySessionStore } from './harness/session-store.ts';
+import { createMigratedDatabase } from './harness/d1.ts';
 
 const ORIGIN = 'https://site.test';
 const CSRF = 'csrf-page-seo';
@@ -82,6 +83,89 @@ async function run(stored, body) {
 }
 
 describe('page SEO write boundary', () => {
+	/** PIN: update-page-seo.ts:17-27 has always rejected a page title outside `meta`. */
+	it('rejects a top-level page title without calling Apex', async () => {
+		const { response, calls } = await run(page(), { title: 'P' });
+		assert.equal(response.status, 400);
+		assert.deepEqual(calls, []);
+	});
+	/** update-page-seo.ts:17-27 and :62-70 accept meta title but take its id from Apex. */
+	it('writes meta title by its stored id and never page.title', async () => {
+		const { response, calls } = await run(
+			page([{ id: META, name: 'title', group: 'web', value: '' }]),
+			{ meta: { title: 'M' } }
+		);
+		assert.equal(response.status, 200);
+		assert.deepEqual(calls.find(([name]) => name === 'updatePageStructure')[2], {
+			meta_properties_attributes: [
+				{ id: META, name: 'title', group: 'web', value_type: 'string', value: 'M' }
+			]
+		});
+	});
+
+	/** update-page-seo.ts:62-68 must reject any requested name without a stored row. */
+	it('refuses a missing title row before any write', async () => {
+		const { response, calls } = await run(page([]), { meta: { title: 'M' } });
+		assert.equal(response.status, 409);
+		assert.equal(calls.filter(([name]) => name === 'updatePageStructure').length, 0);
+	});
+
+	/** update-page-seo.ts:62-68 must not partially write when one of several names is absent. */
+	it('refuses the whole request when keywords have no stored row', async () => {
+		const { response, calls } = await run(
+			page([{ id: META, name: 'title', group: 'web', value: '' }]),
+			{ meta: { title: 'M', keywords: 'k' } }
+		);
+		assert.equal(response.status, 409);
+		assert.equal(calls.filter(([name]) => name === 'updatePageStructure').length, 0);
+	});
+
+	/** update-post.ts:68-73 sets the shared SEO ceilings; browser input cannot bypass them. */
+	it('refuses keywords over 500 characters before Apex', async () => {
+		const { response, calls } = await run(page(), { meta: { keywords: 'x'.repeat(501) } });
+		assert.equal(response.status, 400);
+		assert.deepEqual(calls, []);
+	});
+
+	it('refuses a title over 300 characters with invalid body before Apex', async () => {
+		const { response, calls } = await run(
+			page([{ id: META, name: 'title', group: 'web', value: '' }]),
+			{ meta: { title: 'x'.repeat(301) } }
+		);
+		assert.equal(response.status, 400);
+		assert.deepEqual(await response.json(), { error: 'invalid body' });
+		assert.deepEqual(calls, []);
+	});
+
+	/** update-page-seo.ts:72-75 audits the names sent, so the log identifies the edited fields. */
+	it('audits title and keywords by name', async () => {
+		const db = await createMigratedDatabase();
+		try {
+			const calls = [];
+			const ctx = context(
+				page([
+					{ id: META, name: 'title', group: 'web', value: '' },
+					{ id: EXTRA, name: 'keywords', group: 'web', value: '' }
+				]),
+				calls
+			);
+			ctx.db = db;
+			const response = await handleUpdatePageSeo(
+				await signedRequest(ctx, {
+					meta: { title: 'M', keywords: 'k' }
+				}),
+				ctx,
+				{ pageId: PAGE }
+			);
+			assert.equal(response.status, 200);
+			const row = db.sqlite
+				.prepare("SELECT detail FROM bff_audit_log WHERE action = 'pages.seo.update'")
+				.get();
+			assert.deepEqual(JSON.parse(row.detail).fields, ['title', 'keywords']);
+		} finally {
+			db.close();
+		}
+	});
 	/**
 	 * Phase 4A §7: local Apex answered 200 for an id-less write and silently
 	 * appended a duplicate description, which crashes Poovayya's keyed page each.
@@ -111,13 +195,11 @@ describe('page SEO write boundary', () => {
 	});
 
 	/**
-	 * Phase 4A §1.6a: the route must not accept browser-supplied ids or title
-	 * and keywords, since only description is rendered on both sites; its length
-	 * must use the post SEO ceiling rather than passing an unbounded string.
+	 * Phase 6 K3: the route accepts three names, but no browser-supplied ids;
+	 * each name uses the post SEO ceiling rather than an unbounded string.
 	 */
 	it('rejects extra meta names and ids before any Apex call', async () => {
 		for (const body of [
-			{ meta: { title: 'Invisible' } },
 			{ meta: { description: 'x'.repeat(1001) } },
 			{ meta: { description: 'After', id: EXTRA } },
 			{ meta: { description: 'After' }, id: EXTRA }

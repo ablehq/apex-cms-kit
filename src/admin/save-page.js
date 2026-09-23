@@ -37,7 +37,7 @@ import { BLANK_SLUG_MESSAGE, RESERVED_SLUG_MESSAGE } from './field-errors.js';
 export const STALE_MESSAGE =
 	'This page was changed somewhere else since you opened it. Reload to get the latest version, then re-apply your changes.';
 
-function messageFor(stage, result) {
+function messageFor(stage, result, names = []) {
 	const status = result?.status;
 	if (stage === 'fields') {
 		return status === 422
@@ -99,6 +99,24 @@ function messageFor(stage, result) {
 			: 'Saving the page layout failed. Save again to retry.';
 	}
 	if (stage === 'seo') {
+		// Keep the Phase 4 description-only copy byte-identical: admin-save-page.test.js:230-335
+		// pins it. Other names need their own limits and must never point at description.
+		if (names.length !== 1 || names[0] !== 'description') {
+			const labels = names.map((name) => `meta ${name}`).join(' and ');
+			const sentenceLabels = labels[0].toUpperCase() + labels.slice(1);
+			const single = names.length === 1;
+			const limits = { title: '300', description: '1,000', keywords: '500' };
+			const caps = names
+				.map((name) => `${limits[name]} characters or fewer for meta ${name}`)
+				.join(' and ');
+			if (result?.error === 'missing meta row')
+				return `This page has no stored row for ${labels}. Your field, row and layout changes were saved, but ${labels} ${single ? 'was' : 'were'} not. Clear the ${labels} ${single ? 'field' : 'fields'}, then Save or Publish again.`;
+			if (status === 400 && result?.error === 'invalid body')
+				return `${sentenceLabels} could not be accepted. Your field, row and layout changes were saved. Use ${caps} and Save again.`;
+			return status === 422
+				? `${sentenceLabels} ${single ? 'was' : 'were'} rejected. Your field, row and layout changes were saved. Check ${single ? 'its value' : 'their values'} and Save again.`
+				: `Saving ${labels} failed. Your field, row and layout changes were saved. Save again to retry.`;
+		}
 		if (result?.error === 'missing meta row') {
 			return 'This page has no stored meta description row. Your field, row and layout changes were saved, but the description was not. Clear the meta description field, then Save or Publish again.';
 		}
@@ -423,16 +441,17 @@ export async function savePage(draft, client, options = {}) {
 		freshPage = null;
 	}
 
-	// Page SEO has a separate route: a description-only edit must not sit behind
+	// Page SEO has a separate route: meta-only edits must not sit behind
 	// the structureDirty gate (phase-4-plan.md §1.2).
 	if (Object.keys(draft.metaEdits).length > 0) {
+		const names = Object.keys(draft.metaEdits);
 		const res = await client.updatePageSeo(pageId, { ...draft.metaEdits });
 		if (!res.ok) {
 			return failAfterWrites(draft, client, wroteOk, {
 				ok: false,
 				stage: 'seo',
 				status: res.status,
-				message: messageFor('seo', res)
+				message: messageFor('seo', res, names)
 			});
 		}
 		wroteOk = true;
