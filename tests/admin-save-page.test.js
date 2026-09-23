@@ -205,6 +205,20 @@ describe('page meta description — its own save leg', () => {
 		assert.doesNotMatch(result.message, /1,000 characters/);
 	});
 
+	it('capitalizes title and keywords at the start of SEO refusal messages', async () => {
+		for (const [status, error, name, start] of [
+			[400, 'invalid body', 'title', 'Meta title could not be accepted.'],
+			[422, undefined, 'keywords', 'Meta keywords was rejected.']
+		]) {
+			const draft = createDraft(samplePage(), 'baseline-v');
+			setPageMeta(draft, name, 'After');
+			const client = makeClient({ results: { seo: () => ({ ok: false, status, error }) } });
+			const result = await savePage(draft, client);
+			assert.equal(result.stage, 'seo');
+			assert.ok(result.message.startsWith(start));
+		}
+	});
+
 	/**
 	 * Phase 4A §1.2: isDirty alone once enabled Save while the structure gate
 	 * skipped the SEO-only write, then reconciled away the editor's change.

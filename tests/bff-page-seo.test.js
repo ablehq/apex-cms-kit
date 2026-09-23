@@ -127,6 +127,16 @@ describe('page SEO write boundary', () => {
 		assert.deepEqual(calls, []);
 	});
 
+	it('refuses a title over 300 characters with invalid body before Apex', async () => {
+		const { response, calls } = await run(
+			page([{ id: META, name: 'title', group: 'web', value: '' }]),
+			{ meta: { title: 'x'.repeat(301) } }
+		);
+		assert.equal(response.status, 400);
+		assert.deepEqual(await response.json(), { error: 'invalid body' });
+		assert.deepEqual(calls, []);
+	});
+
 	/** update-page-seo.ts:72-75 audits the names sent, so the log identifies the edited fields. */
 	it('audits title and keywords by name', async () => {
 		const db = await createMigratedDatabase();

@@ -1064,6 +1064,8 @@ export function removeBlock(draft, blockId) {
 	draft.structureDirty = true;
 }
 
+const PAGE_FIELDS = new Set(['title', 'slug', 'summary']);
+
 /**
  * Set a page-level string field (title/slug/summary). Marks structure dirty.
  *
@@ -1076,13 +1078,14 @@ export function removeBlock(draft, blockId) {
  * @param {string} value
  * @returns {boolean}
  */
-const PAGE_FIELDS = new Set(['title', 'slug', 'summary']);
 export function setPageField(draft, name, value) {
 	if (!PAGE_FIELDS.has(name)) return false;
 	draft.page[name] = value;
 	draft.structureDirty = true;
 	return true;
 }
+
+export const PAGE_META_NAMES = ['title', 'description', 'keywords'];
 
 /**
  * Page SEO has its own save leg (save-page.js), so it stays out of the structure
@@ -1095,7 +1098,6 @@ export function setPageField(draft, name, value) {
  * @param {string} value
  * @returns {boolean}
  */
-export const PAGE_META_NAMES = ['title', 'description', 'keywords'];
 export function setPageMeta(draft, name, value) {
 	if (!PAGE_META_NAMES.includes(name)) return false;
 	// The baseline comes from a row the SERVER CAN ACTUALLY WRITE — one bearing an id.

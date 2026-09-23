@@ -103,6 +103,7 @@ function messageFor(stage, result, names = []) {
 		// pins it. Other names need their own limits and must never point at description.
 		if (names.length !== 1 || names[0] !== 'description') {
 			const labels = names.map((name) => `meta ${name}`).join(' and ');
+			const sentenceLabels = labels[0].toUpperCase() + labels.slice(1);
 			const single = names.length === 1;
 			const limits = { title: '300', description: '1,000', keywords: '500' };
 			const caps = names
@@ -111,9 +112,9 @@ function messageFor(stage, result, names = []) {
 			if (result?.error === 'missing meta row')
 				return `This page has no stored row for ${labels}. Your field, row and layout changes were saved, but ${labels} ${single ? 'was' : 'were'} not. Clear the ${labels} ${single ? 'field' : 'fields'}, then Save or Publish again.`;
 			if (status === 400 && result?.error === 'invalid body')
-				return `${labels} could not be accepted. Your field, row and layout changes were saved. Use ${caps} and Save again.`;
+				return `${sentenceLabels} could not be accepted. Your field, row and layout changes were saved. Use ${caps} and Save again.`;
 			return status === 422
-				? `${labels} ${single ? 'was' : 'were'} rejected. Your field, row and layout changes were saved. Check ${single ? 'its value' : 'their values'} and Save again.`
+				? `${sentenceLabels} ${single ? 'was' : 'were'} rejected. Your field, row and layout changes were saved. Check ${single ? 'its value' : 'their values'} and Save again.`
 				: `Saving ${labels} failed. Your field, row and layout changes were saved. Save again to retry.`;
 		}
 		if (result?.error === 'missing meta row') {
