@@ -9,13 +9,21 @@ import { metaAttributes } from './post-shape';
 import type { BffContext } from '../context';
 
 /**
- * The dedicated page SEO route accepts only the description that both public
- * sites render (phase-4-plan.md §1.5). Apex silently APPENDS a row without its
- * id (the §7 probe), so ids come solely from this request's page read and the
- * same id-keyed builder used by post SEO.
+ * The dedicated page SEO route accepts the three web meta names, separate from
+ * page.title (`page-draft.js:1212`). Apex silently APPENDS a row without its id
+ * (phase-4-plan.md §7 probe), so ids come solely from this request's page read
+ * and the same id-keyed builder used by post SEO.
  */
 export const updatePageSeoBodySchema = z
-	.object({ meta: z.object({ description: z.string().max(1000).optional() }).strict() })
+	.object({
+		meta: z
+			.object({
+				title: z.string().max(300).optional(),
+				description: z.string().max(1000).optional(),
+				keywords: z.string().max(500).optional()
+			})
+			.strict()
+	})
 	.strict();
 
 export async function handleUpdatePageSeo(
@@ -52,21 +60,19 @@ export async function handleUpdatePageSeo(
 	if (!page) return bffError(502, 'unexpected upstream shape');
 
 	const attributes = metaAttributes(page, parsed.data.meta);
-	// A missing web description has no safe id to PATCH. The builder SKIPS it,
-	// as post-shape.ts:375 does; tell the editor instead of reporting a false save.
-	if (
-		parsed.data.meta.description !== undefined &&
-		!attributes.some((row) => row.name === 'description')
-	) {
-		return rejectMutation(ctx, actor, 409, 'missing meta row', 'missing description row');
-	}
+	// The builder skips a name without an id-bearing row (`post-shape.ts:375`).
+	// Refuse the whole request before writing so no field appears falsely saved.
+	const names = Object.keys(parsed.data.meta);
+	const missing = names.filter((name) => !attributes.some((row) => row.name === name));
+	if (missing.length)
+		return rejectMutation(ctx, actor, 409, 'missing meta row', `missing ${missing.join(', ')} row`);
 	const response = attributes.length
 		? await guard.apex.updatePageStructure(pageId, { meta_properties_attributes: attributes })
 		: { ok: true, status: 200, body: current.body };
 	await auditOutcome(ctx, meta, guard.actor, {
 		outcome: response.ok ? 'accepted' : 'apex_error',
 		pageId,
-		detail: { fields: ['description'], apexStatus: response.status }
+		detail: { fields: names, apexStatus: response.status }
 	});
 	if (!response.ok) {
 		const status = response.status >= 400 && response.status < 500 ? response.status : 502;
