@@ -295,7 +295,9 @@ export interface ApexAdminClient {
 	updateEntityFields(
 		entityTypeId: string,
 		entityId: string,
-		fieldsData: Record<string, unknown>
+		fieldsData: Record<string, unknown>,
+		/** The row's order within its owner. Travels WITH `fields_data`, never alone. */
+		position?: number
 	): Promise<ApexResponse>;
 	/**
 	 * May this client create entities of `entityType`? The BOOLEAN half of
@@ -329,7 +331,12 @@ export interface ApexAdminClient {
 	 * data on a mis-click, and deletion is the top-level `content_library/entities/:id`
 	 * — a separate, deliberate act.
 	 */
-	createEntity(entityType: string, fieldsData: Record<string, unknown>): Promise<ApexResponse>;
+	createEntity(
+		entityType: string,
+		fieldsData: Record<string, unknown>,
+		/** Owner-scoped creation, for a block that owns its rows. */
+		owner?: { owner_type?: string; owner_id?: string; position?: number }
+	): Promise<ApexResponse>;
 	changePageStatus(pageId: string, statusEvent: PageStatusEvent): Promise<ApexResponse>;
 	createGalleryItem(galleryId: string, caption: string, alt: string): Promise<ApexResponse>;
 	createSignedUploadUrl(file: SignedUploadFile): Promise<ApexResponse>;
@@ -725,24 +732,39 @@ export function createApexAdminClient(options: ApexAdminClientOptions): ApexAdmi
 				body: JSON.stringify(body)
 			});
 		},
-		async updateEntityFields(entityTypeId, entityId, fieldsData) {
+		async updateEntityFields(entityTypeId, entityId, fieldsData, position) {
 			// The TYPE may be a uuid or a slug (see `assertEntityTypeRef`); the ENTITY
 			// is always a uuid.
 			assertEntityTypeRef(entityTypeId);
 			assertUuid(entityId);
+			// `entities_controller` permits `:position` beside `fields_data` and assigns
+			// both in one call. It never travels alone — `fields_data` is mandatory on
+			// that route, so a bare `{position}` body is a 500, not a partial update.
+			const body: Record<string, unknown> = { fields_data: fieldsData };
+			if (Number.isInteger(position)) body.position = position;
 			return call(
 				`${ENTITY_TYPES_BASE}/${encodeURIComponent(entityTypeId)}/entities/${encodeURIComponent(entityId)}`,
-				{ method: 'PATCH', body: JSON.stringify({ fields_data: fieldsData }) }
+				{ method: 'PATCH', body: JSON.stringify(body) }
 			);
 		},
 		allowsEntityType(entityType) {
 			const allowed = options.allowedEntityTypes;
 			return Boolean(allowed && allowed.includes(entityType));
 		},
-		async createEntity(entityType, fieldsData) {
+		async createEntity(entityType, fieldsData, owner) {
+			// `entities_controller` permits `:owner_type`, `:owner_id` and `:position`
+			// beside `fields_data` and assigns them in ONE call — which is why a bundle
+			// child is created here rather than through the page PATCH, where
+			// `entities_attributes` mints an empty row and permits no position at all.
+			const body: Record<string, unknown> = { fields_data: fieldsData };
+			if (owner?.owner_type && owner?.owner_id) {
+				body.owner_type = owner.owner_type;
+				body.owner_id = owner.owner_id;
+			}
+			if (owner && Number.isInteger(owner.position)) body.position = owner.position;
 			return call(`${ENTITY_TYPES_BASE}/${entityTypeToCreate(entityType)}/entities`, {
 				method: 'POST',
-				body: JSON.stringify({ fields_data: fieldsData })
+				body: JSON.stringify(body)
 			});
 		},
 		async changePageStatus(pageId, statusEvent) {

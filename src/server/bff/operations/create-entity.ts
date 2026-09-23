@@ -72,6 +72,9 @@ import type { BffContext } from '../context';
  */
 const entityTypeRef = z.string().regex(ENTITY_TYPE_REF);
 
+/** The one blockable that may own an entity created through this route. */
+export const BUNDLE_BLOCKABLE = 'Cms::PageBlock::EntityBundle';
+
 const fieldNameSchema = z.string().regex(/^[a-z][a-z0-9_]*$/u);
 
 /**
@@ -82,9 +85,32 @@ const fieldNameSchema = z.string().regex(/^[a-z][a-z0-9_]*$/u);
  */
 export const createEntityBodySchema = z
 	.object({
-		fields_data: z.record(fieldNameSchema, z.unknown())
+		fields_data: z.record(fieldNameSchema, z.unknown()),
+		/**
+		 * OWNER-SCOPED CREATION — a child of a block that owns its rows.
+		 *
+		 * `owner_type` is a fixed literal, never a caller-chosen class name: Apex will
+		 * attach an entity to ANY owner id in the account, because
+		 * `ContentLibrary::Entity#validate_ownership` delegates only to owners that
+		 * define `validate_entity_ownership`, and the only definer in the app is
+		 * `Specification::ArchetypeItem`. So the BFF is the only guard there is.
+		 *
+		 * `page_id` is read here and NEVER forwarded. It is what makes the rule
+		 * checkable at all: without a page to read, "the owner must be a bundle on the
+		 * page the caller named" is prose rather than code.
+		 */
+		owner_type: z.literal(BUNDLE_BLOCKABLE).optional(),
+		owner_id: z.string().uuid().optional(),
+		position: z.number().int().min(0).optional(),
+		page_id: z.string().uuid().optional()
 	})
-	.strict();
+	.strict()
+	.refine((body) => Boolean(body.owner_type) === Boolean(body.owner_id), {
+		message: 'owner_type and owner_id must be given together'
+	})
+	.refine((body) => !body.owner_id || Boolean(body.page_id), {
+		message: 'owner_id requires page_id, which is what proves the owner is on that page'
+	});
 
 /**
  * Apex's single-entity envelope, EXACTLY as it came back — not yet judged.
@@ -155,6 +181,81 @@ export async function handleCreateEntity(
 	const parsed = createEntityBodySchema.safeParse(bodyJson);
 	if (!parsed.success) return rejectMutation(ctx, actorMeta, 400, 'invalid body', 'invalid body');
 
+	// A BUNDLE-ONLY TYPE MAY ONLY BE CREATED AS A BUNDLE CHILD.
+	//
+	// The account-wide allow-list necessarily contains every child type the site
+	// mints, and it grew to carry `card` when bundles became editable. But a card has
+	// no meaning outside the bundle that owns it: created with no owner it is an
+	// unreferenced row nothing can reach and nothing cleans up. The owner guard below
+	// decides WHICH bundle accepts a type; this is what makes reaching that guard
+	// mandatory rather than optional. (codex's review of this branch, 2026-09-22.)
+	if ((ctx.bundleOnlyEntityTypes ?? []).includes(entityType.data) && !parsed.data.owner_id) {
+		return rejectMutation(ctx, actorMeta, 422, 'field not allowed', 'that type needs an owner');
+	}
+
+	/**
+	 * THE OWNER GUARD. Apex performs none of this, so the refusals live here.
+	 *
+	 * Two separate checks, because they fail for different reasons:
+	 *
+	 * 1. The owner must be an `EntityBundle` blockable ON THE PAGE the caller named.
+	 *    Without it, `owner_id` is any uuid in the account and a card can be attached
+	 *    to a bundle the editor is not even looking at.
+	 * 2. The type must be one THAT BUNDLE accepts. The account-wide allow-list above
+	 *    is not enough: it necessarily contains every child type this site mints, so
+	 *    it would happily let a `strength-item` become a card. Apex does not run the
+	 *    bundle's own `entity_type_ids` validation on a direct entity create — that
+	 *    only runs when the bundle itself is saved.
+	 */
+	if (parsed.data.owner_id) {
+		const pageResponse = await guard.apex.getPage(parsed.data.page_id as string);
+		if (!pageResponse.ok) {
+			return rejectMutation(ctx, actorMeta, 404, 'not found', 'unknown page');
+		}
+		const blocks = (pageResponse.body as { data?: { blocks?: unknown[] } })?.data?.blocks ?? [];
+		const bundle = (Array.isArray(blocks) ? blocks : []).find(
+			(block) =>
+				(block as { blockable_type?: string })?.blockable_type === BUNDLE_BLOCKABLE &&
+				(block as { blockable?: { id?: string } })?.blockable?.id === parsed.data.owner_id
+		) as { blockable?: { entity_type_ids?: unknown } } | undefined;
+		if (!bundle) {
+			return rejectMutation(ctx, actorMeta, 404, 'not found', 'owner is not a bundle on that page');
+		}
+		const accepted = bundle.blockable?.entity_type_ids;
+		const acceptedIds = Array.isArray(accepted) ? accepted.map((id) => `${id}`) : [];
+		// Resolve the requested SLUG to its id through the account's own `cms_config`,
+		// which is the same source the page palette reads. Not optional-chained: a
+		// guard that silently skips when a method is missing is not a guard.
+		const configResponse = await guard.apex.readCmsConfig();
+		if (!configResponse.ok) {
+			return rejectMutation(ctx, actorMeta, 502, 'upstream error', 'could not read cms_config');
+		}
+		const entries =
+			(
+				configResponse.body as {
+					data?: {
+						page_schema?: { page_blocks?: { entity_type?: { id?: string; slug?: string } }[] };
+					};
+				}
+			)?.data?.page_schema?.page_blocks ?? [];
+		const resolved = (Array.isArray(entries) ? entries : []).find(
+			(entry) => entry?.entity_type?.slug === entityType.data
+		)?.entity_type?.id;
+		// FAILS CLOSED ON AN EMPTY LIST. `acceptedIds.length > 0 && …` used to mean a
+		// bundle with no `entity_type_ids` accepted ANY type on the coarse allow-list —
+		// a bundle that has been told to accept nothing is not a bundle that accepts
+		// everything. (codex's review of this branch, 2026-09-22.)
+		if (!resolved || !acceptedIds.includes(`${resolved}`)) {
+			return rejectMutation(
+				ctx,
+				actorMeta,
+				422,
+				'field not allowed',
+				'that bundle does not accept this entity type'
+			);
+		}
+	}
+
 	// The same per-field ceiling and unreadable-URL refusal every other write path
 	// carries — a new write path is exactly where a boundary rule goes missing.
 	const tooLarge = await refuseOversizedFields(ctx, actorMeta, parsed.data.fields_data);
@@ -167,7 +268,11 @@ export async function handleCreateEntity(
 		fieldsData[name] = sanitizeFieldValue(value);
 	}
 
-	const apexResponse = await guard.apex.createEntity(entityType.data, fieldsData);
+	const apexResponse = await guard.apex.createEntity(entityType.data, fieldsData, {
+		owner_type: parsed.data.owner_type,
+		owner_id: parsed.data.owner_id,
+		position: parsed.data.position
+	});
 	// THE VERDICT, TAKEN BEFORE THE AUDIT IS WRITTEN. The rule and the reasoning are
 	// in `created-id.ts`, shared with the three sibling create handlers that had the
 	// same contradiction and did not originally get this fix.

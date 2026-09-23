@@ -69,6 +69,29 @@ export function serializePageBlockForSave(block, index) {
 	if (blockableAttrs.entity_attributes && !blockableAttrs.entity_type_id) {
 		blockableAttrs.entity_type_id = blockableAttrs.entity_attributes.entity_type_id;
 	}
+	// A BUNDLE'S CHILDREN: only the removals travel here.
+	//
+	// `entities_attributes` is permitted on the page PATCH but does NOT permit
+	// `:position`, and it is the ONLY destroy path there is — the nested entities
+	// route has no working DELETE. So removals go through it and everything else
+	// (create, fields, order) goes through the entities route, which does permit all
+	// three.
+	//
+	// The read-back's own `entities` key rides along in the clone and is dropped by
+	// strong params, which is why saving a bundle page has always been harmless.
+	// Sending those rows back deliberately is what must not happen: an entry with no
+	// `id` builds a NEW row.
+	if (Array.isArray(blockableAttrs.entities) || blockableAttrs.deleted_entity_ids) {
+		const destroyed = Array.isArray(blockableAttrs.deleted_entity_ids)
+			? blockableAttrs.deleted_entity_ids
+					.filter((id) => id && !isTempId(`${id}`))
+					.map((id) => ({ id, _destroy: true }))
+			: [];
+		if (destroyed.length > 0) blockableAttrs.entities_attributes = destroyed;
+		delete blockableAttrs.entities;
+		delete blockableAttrs.deleted_entity_ids;
+	}
+
 	const payload = {
 		label: block.label,
 		position: index,
