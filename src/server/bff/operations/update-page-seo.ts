@@ -10,7 +10,7 @@ import type { BffContext } from '../context';
 
 /**
  * The dedicated page SEO route accepts the three web meta names, separate from
- * page.title (`page-draft.js:1212`). Apex silently APPENDS a row without its id
+ * page.title (`page-draft.js:1217`). Apex silently APPENDS a row without its id
  * (phase-4-plan.md §7 probe), so ids come solely from this request's page read
  * and the same id-keyed builder used by post SEO.
  */
@@ -60,7 +60,7 @@ export async function handleUpdatePageSeo(
 	if (!page) return bffError(502, 'unexpected upstream shape');
 
 	const attributes = metaAttributes(page, parsed.data.meta);
-	// The builder skips a name without an id-bearing row (`post-shape.ts:375`).
+	// The builder skips a name without an id-bearing row (`post-shape.ts:363-382`).
 	// Refuse the whole request before writing so no field appears falsely saved.
 	const names = Object.keys(parsed.data.meta);
 	const missing = names.filter((name) => !attributes.some((row) => row.name === name));

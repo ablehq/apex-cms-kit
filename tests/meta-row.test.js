@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { it } from 'node:test';
 import { pickMetaRow } from '../src/cms/meta-row.js';
 
-/** post-shape.ts:345-347 shows the first non-blank web value; every writer must preserve it. */
+/** post-shape.ts:337-342 shows the first non-blank web value; every writer must preserve it. */
 it('picks the first non-blank web row, or the first blank row', () => {
 	const blank = { id: '1', name: 'description', group: 'web', value: '' };
 	const filled = { id: '2', name: 'description', group: 'web', value: 'X' };
@@ -20,7 +20,7 @@ it('picks the first non-blank web row, or the first blank row', () => {
 	);
 });
 
-/** update-page-seo.ts:54 cannot write an id-less row without Apex appending a duplicate. */
+/** update-page-seo.ts:62-70 cannot write an id-less row without Apex appending a duplicate. */
 it('skips id-less rows when an id is required', () => {
 	const idless = { name: 'title', group: 'web', value: 'X' };
 	const stored = { id: '2', name: 'title', group: 'web', value: '' };

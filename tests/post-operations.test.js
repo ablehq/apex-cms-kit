@@ -610,7 +610,7 @@ describe('post body — the reconciliation, and what it never destroys', () => {
 });
 
 describe('SEO and the cover — written by id, never appended', () => {
-	/** post-shape.ts:374-389 must preserve the row readMeta shows for blank-first duplicates. */
+	/** post-shape.ts:363-382 must preserve the row readMeta shows for blank-first duplicates. */
 	it('heals a blank-first duplicate without deleting its non-blank value', () => {
 		const v = view({
 			meta_properties: [

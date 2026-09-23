@@ -1,8 +1,8 @@
 /**
- * Pick the `web` row an editor sees. `post-shape.ts:345-347` already reads the
+ * Pick the `web` row an editor sees. `post-shape.ts:337-342` already reads the
  * first non-blank value; using the same row for writes prevents blank-first
  * duplicates from destroying the visible value. An id is required when Apex
- * must update the row rather than append another one (`update-page-seo.ts:54`).
+ * must update the row rather than append another one (`update-page-seo.ts:62-70`).
  *
  * @param {unknown} rows
  * @param {string} name

@@ -99,7 +99,7 @@ function messageFor(stage, result, names = []) {
 			: 'Saving the page layout failed. Save again to retry.';
 	}
 	if (stage === 'seo') {
-		// Keep the Phase 4 description-only copy byte-identical: admin-save-page.test.js:235-293
+		// Keep the Phase 4 description-only copy byte-identical: admin-save-page.test.js:230-335
 		// pins it. Other names need their own limits and must never point at description.
 		if (names.length !== 1 || names[0] !== 'description') {
 			const labels = names.map((name) => `meta ${name}`).join(' and ');

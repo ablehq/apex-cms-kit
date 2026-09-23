@@ -83,7 +83,13 @@ async function run(stored, body) {
 }
 
 describe('page SEO write boundary', () => {
-	/** update-page-seo.ts:17-19 must accept meta title but take its id from Apex. */
+	/** PIN: update-page-seo.ts:17-27 has always rejected a page title outside `meta`. */
+	it('rejects a top-level page title without calling Apex', async () => {
+		const { response, calls } = await run(page(), { title: 'P' });
+		assert.equal(response.status, 400);
+		assert.deepEqual(calls, []);
+	});
+	/** update-page-seo.ts:17-27 and :62-70 accept meta title but take its id from Apex. */
 	it('writes meta title by its stored id and never page.title', async () => {
 		const { response, calls } = await run(
 			page([{ id: META, name: 'title', group: 'web', value: '' }]),
@@ -97,14 +103,14 @@ describe('page SEO write boundary', () => {
 		});
 	});
 
-	/** update-page-seo.ts:57-62 must reject any requested name without a stored row. */
+	/** update-page-seo.ts:62-68 must reject any requested name without a stored row. */
 	it('refuses a missing title row before any write', async () => {
 		const { response, calls } = await run(page([]), { meta: { title: 'M' } });
 		assert.equal(response.status, 409);
 		assert.equal(calls.filter(([name]) => name === 'updatePageStructure').length, 0);
 	});
 
-	/** update-page-seo.ts:57-62 must not partially write when one of several names is absent. */
+	/** update-page-seo.ts:62-68 must not partially write when one of several names is absent. */
 	it('refuses the whole request when keywords have no stored row', async () => {
 		const { response, calls } = await run(
 			page([{ id: META, name: 'title', group: 'web', value: '' }]),
@@ -121,7 +127,7 @@ describe('page SEO write boundary', () => {
 		assert.deepEqual(calls, []);
 	});
 
-	/** update-page-seo.ts:69 audits the names sent, so the log identifies the edited fields. */
+	/** update-page-seo.ts:72-75 audits the names sent, so the log identifies the edited fields. */
 	it('audits title and keywords by name', async () => {
 		const db = await createMigratedDatabase();
 		try {

@@ -191,7 +191,7 @@ describe('page meta description — its own save leg', () => {
 		assert.doesNotMatch(result.message, /meta description/);
 	});
 
-	/** update-page-seo.ts:17-23 has per-name caps, so a 400 message must name only sent caps. */
+	/** update-page-seo.ts:17-27 has per-name caps, so a 400 message must name only sent caps. */
 	it('reports only the sent title and keywords limits', async () => {
 		const draft = createDraft(samplePage(), 'baseline-v');
 		setPageMeta(draft, 'title', 'M');

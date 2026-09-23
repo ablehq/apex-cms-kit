@@ -26,8 +26,9 @@ import type { PageStructureBody } from '../apex-admin-client';
  * `savePage()` dispatches AFTER the per-entity field PATCHes (plan §8, 3a M1). It
  * maps to the one page PATCH Apex permits (`blocks_attributes`, plus the page-level
  * title/slug/summary). Meta rows go only through the id-keyed `/seo` route
- * (`update-page-seo.ts:54-65`), so structure cannot append or delete them. Publish/unpublish is NOT
- * here — `:status` is not a permitted page param; that stays the status_event op.
+ * (`update-page-seo.ts:57-70`), so structure cannot append or delete them.
+ * Publish/unpublish is NOT here — `:status` is not a permitted page param;
+ * that stays the status_event op.
  *
  * The top-level schema is `.strict()` (unknown keys fail closed). `blocks_attributes`
  * is a passthrough array — it is a deep, recursive Apex-shaped payload the client
