@@ -302,6 +302,33 @@ export function moveListChild(draft, blockId, fieldName, from, to) {
 }
 
 /**
+ * Move the dragged stored row by identity. `listChildRows` can hide a missing child
+ * while its id remains in the parent's array (`page-draft.js:455-457`); screen
+ * indexes could therefore splice out a different row. Pending ids stay outside
+ * that array until their create completes (`page-draft.js:232-248`).
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} fieldName
+ * @param {string} movedId
+ * @param {string} toId
+ * @returns {boolean}
+ */
+export function moveListChildById(draft, blockId, fieldName, movedId, toId) {
+	const block = findBlock(draft, blockId);
+	if (!canEditFields(block)) return false;
+	if (typeof movedId !== 'string' || typeof toId !== 'string') return false;
+	const ids = [...storedIds(block, fieldName)];
+	const from = ids.findIndex((id) => typeof id === 'string' && id === movedId);
+	const to = ids.findIndex((id) => typeof id === 'string' && id === toId);
+	if (from < 0 || to < 0) return false;
+	if (from === to) return true;
+	ids.splice(from, 1);
+	ids.splice(to, 0, movedId);
+	return setField(draft, block.id, fieldName, ids);
+}
+
+/**
  * Set a field on one child row, pending or stored.
  *
  * A pending row is edited in place here and carried to its create. A stored row's

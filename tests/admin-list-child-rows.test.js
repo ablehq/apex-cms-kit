@@ -17,6 +17,7 @@ import {
 	editedListChildren,
 	isDirty,
 	removeListChild,
+	moveListChildById,
 	setPageMeta,
 	reconcile
 } from '../src/admin/page-draft.js';
@@ -101,6 +102,67 @@ describe('listChildRows draws the row, not the id', () => {
 		const rows = listChildRows(draft, 'block-1', FIELD);
 		assert.equal(rows.length, 2);
 		assert.deepEqual(rows[0].fields_data, {});
+	});
+});
+
+/** The stored parent order includes ids that hydration hides (`page-draft.js:455-457`). */
+function storedOrder(draft) {
+	return draft.page.blocks[0].blockable.entity.fields_data[FIELD];
+}
+
+function hydrated(ids) {
+	return { 'block-1': { [FIELD]: ids.map((id) => ({ id, fields: { title: id } })) } };
+}
+
+describe('moveListChildById uses the dragged row and target row', () => {
+	test('M1 hidden id between visible rows does not become the dragged row', () => {
+		const draft = createDraft(samplePage(['a', 'gone', 'b']), 'v1', hydrated(['a', 'b']));
+		assert.deepEqual(
+			listChildRows(draft, 'block-1', FIELD).map((row) => row.id),
+			['a', 'b']
+		);
+		assert.equal(moveListChildById(draft, 'block-1', FIELD, 'b', 'a'), true);
+		assert.deepEqual(storedOrder(draft), ['b', 'a', 'gone']);
+	});
+
+	test('M2 down and up moves preserve hidden ids in the stored order', () => {
+		const down = createDraft(samplePage(['a', 'gone', 'b', 'c']), 'v1', hydrated(['a', 'b', 'c']));
+		assert.equal(moveListChildById(down, 'block-1', FIELD, 'a', 'c'), true);
+		assert.deepEqual(storedOrder(down), ['gone', 'b', 'c', 'a']);
+		assert.deepEqual(
+			listChildRows(down, 'block-1', FIELD).map((row) => row.id),
+			['b', 'c', 'a']
+		);
+		const up = createDraft(samplePage(['a', 'b', 'gone', 'c']), 'v1', hydrated(['a', 'b', 'c']));
+		assert.equal(moveListChildById(up, 'block-1', FIELD, 'c', 'b'), true);
+		assert.deepEqual(storedOrder(up), ['a', 'c', 'b', 'gone']);
+	});
+
+	test('M3 pending, unknown, and non-string ids cannot move stored rows', () => {
+		const draft = createDraft(samplePage(['a', 7, 'b']), 'v1', hydrated(['a', 'b']));
+		const pending = addListChild(draft, 'block-1', FIELD, 'strength-item');
+		const before = structuredClone(storedOrder(draft));
+		const wasDirty = isDirty(draft);
+		for (const [from, to] of [
+			[pending.id, 'a'],
+			['a', pending.id],
+			['unknown', 'a'],
+			['a', 'unknown'],
+			[7, 'a'],
+			['a', 7]
+		]) {
+			assert.equal(moveListChildById(draft, 'block-1', FIELD, from, to), false);
+			assert.deepEqual(storedOrder(draft), before);
+			assert.equal(isDirty(draft), wasDirty);
+		}
+	});
+
+	test('M4 moving a row to itself is successful without making the draft dirty', () => {
+		const draft = createDraft(samplePage(['a', 'b']), 'v1', hydrated(['a', 'b']));
+		assert.equal(isDirty(draft), false);
+		assert.equal(moveListChildById(draft, 'block-1', FIELD, 'a', 'a'), true);
+		assert.deepEqual(storedOrder(draft), ['a', 'b']);
+		assert.equal(isDirty(draft), false);
 	});
 });
 
