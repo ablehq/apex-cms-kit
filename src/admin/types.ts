@@ -167,9 +167,21 @@ export interface AdminPage {
 }
 
 /** `GET /api/admin/pages/:id` — the page plus the stale guard's baseline token. */
+/** The rows an `array_ref` field points at, hydrated by the server for the editor. */
+export type AdminChildRowMap = Record<
+	string,
+	Record<string, { id: string; fields: Record<string, unknown> }[]>
+>;
+
 export interface AdminPageLoad {
 	page: AdminPage;
 	version: string;
+	/**
+	 * `blockId` → `fieldName` → rows. `{}` from a site that supplies no resolver, and
+	 * absent from a deployment whose kit predates it — hence optional, so an older
+	 * page payload still typechecks rather than forcing every caller to assert.
+	 */
+	childRows?: AdminChildRowMap;
 }
 
 /** The local page-draft the editor mutates (`page-draft.js`). */
@@ -177,6 +189,8 @@ export interface AdminPageDraft {
 	pageId: string;
 	baselineVersion: string;
 	page: AdminPage;
+	/** The server-hydrated baseline for every `array_ref` list on the page. */
+	childRows: AdminChildRowMap;
 	/** Entity ids whose `fields_data` the editor changed. */
 	dirtyEntityIds: Set<string>;
 	structureDirty: boolean;
@@ -429,8 +443,37 @@ export interface BffClient {
 	patchEntityFields(
 		entityTypeId: string,
 		entityId: string,
-		fieldsData: Record<string, unknown>
+		fieldsData: Record<string, unknown>,
+		/**
+		 * A row's order within the block that owns it. Optional, and travels WITH
+		 * `fields_data` — the entities route makes `fields_data` mandatory, so a bare
+		 * `{position}` body is a 500.
+		 */
+		position?: number
 	): Promise<BffMutationResult>;
+	/**
+	 * Mint one content-library entity and return its id — a child row of an
+	 * `array_ref` field, created BEFORE the section that will name it (§7.1).
+	 * `entityType` is the type's SLUG; the route takes an id or a slug and the
+	 * BFF's allow-list holds slugs.
+	 */
+	createEntity(
+		entityType: string,
+		fieldsData: Record<string, unknown>,
+		/**
+		 * Owner-scoped creation, for a block that OWNS its children.
+		 *
+		 * `page_id` is read by the BFF and never forwarded: it is what lets the guard
+		 * prove `owner_id` is a bundle on the page the caller named. Without it the
+		 * rule "the owner must be a block on this page" has nothing to check against.
+		 */
+		owner?: {
+			owner_type: string;
+			owner_id: string;
+			position?: number;
+			page_id?: string;
+		}
+	): Promise<BffMutationResult & { entity?: { id?: string } }>;
 	/**
 	 * `400 reserved-slug` is a refusal here too, on a RENAME, and `400 invalid-slug`
 	 * is the blank-slug one — `save-page.js` names both.

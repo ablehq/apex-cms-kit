@@ -57,8 +57,9 @@ function recordingApex({ status = 200, body, allowed = [ENTITY_TYPE] } = {}) {
 	};
 }
 
-function ctxWith(apex, db) {
+function ctxWith(apex, db, extra = {}) {
 	return {
+		...extra,
 		allowedOrigins: parseAllowedOrigins(ORIGIN),
 		sessions: createMemorySessionStore(),
 		...(db ? { db } : {}),
@@ -247,7 +248,11 @@ describe('the create-entity operation', () => {
 				'content-type': 'application/json',
 				cookie: `apex_admin_session=${session}; apex_bff_csrf=${CSRF}`
 			},
-			body: JSON.stringify({ fields_data: { title: 'x' }, position: 3 })
+			// `nope`, not `position`: owner-scoped creation made `position` a LEGAL
+			// top-level key, so it stopped being an example of an unknown one. The rule
+			// under test is unchanged — an unknown key is a 400 rather than something
+			// Apex drops silently.
+			body: JSON.stringify({ fields_data: { title: 'x' }, nope: 3 })
 		});
 		assert.equal(
 			(await handleCreateEntity(withExtra, ctx, { entityType: ENTITY_TYPE })).status,
@@ -257,6 +262,99 @@ describe('the create-entity operation', () => {
 		const badName = await create(ctxWith(apex), { 'Title Case': 'x' });
 		assert.equal(badName.status, 400);
 		assert.equal(apex.stored.created, null);
+	});
+
+	it('refuses half an owner, and an owner with no page to check it against', async () => {
+		// `owner_type`/`owner_id` are the one pair Apex will not police: it attaches an
+		// entity to ANY owner id in the account, because `validate_ownership` delegates
+		// only to owners that define `validate_entity_ownership` and the only definer is
+		// ArchetypeItem. So the refusals have to be here.
+		const apex = recordingApex();
+		const ctx = ctxWith(apex);
+		const session = await signIn(ctx);
+		const post = (body) =>
+			handleCreateEntity(
+				new Request(`${ORIGIN}/api/admin/entities/${ENTITY_TYPE}`, {
+					method: 'POST',
+					headers: {
+						origin: ORIGIN,
+						'sec-fetch-site': 'same-origin',
+						'x-csrf-token': CSRF,
+						'content-type': 'application/json',
+						cookie: `apex_admin_session=${session}; apex_bff_csrf=${CSRF}`
+					},
+					body: JSON.stringify(body)
+				}),
+				ctx,
+				{ entityType: ENTITY_TYPE }
+			);
+
+		const uuid = '11111111-1111-4111-8111-111111111111';
+		// An owner type with no id, and an id with no type.
+		assert.equal(
+			(await post({ fields_data: {}, owner_type: 'Cms::PageBlock::EntityBundle' })).status,
+			400
+		);
+		assert.equal((await post({ fields_data: {}, owner_id: uuid })).status, 400);
+		// An owner with no page_id: the rule "a bundle on the page the caller named"
+		// has nothing to check against, so it is refused rather than skipped.
+		assert.equal(
+			(await post({ fields_data: {}, owner_type: 'Cms::PageBlock::EntityBundle', owner_id: uuid }))
+				.status,
+			400
+		);
+		// A caller-chosen owner class is not an option.
+		assert.equal(
+			(
+				await post({
+					fields_data: {},
+					owner_type: 'Specification::ArchetypeItem',
+					owner_id: uuid,
+					page_id: uuid
+				})
+			).status,
+			400
+		);
+		assert.equal(apex.stored.created, null);
+	});
+
+	it('a BUNDLE-ONLY type cannot be created without an owner', async () => {
+		// The account-wide allow-list has to contain every child type the site mints, so
+		// it necessarily contains `card` — a type that only means anything inside the
+		// bundle that owns it. Without this, a caller could omit every owner field and
+		// mint free-standing cards nothing references and nothing cleans up, never
+		// reaching the owner guard that decides which bundle accepts which type.
+		// (codex's review of the child-content branch, 2026-09-22.)
+		const apex = recordingApex();
+		const ctx = ctxWith(apex, undefined, { bundleOnlyEntityTypes: [ENTITY_TYPE] });
+		const session = await signIn(ctx);
+		const response = await handleCreateEntity(
+			new Request(`${ORIGIN}/api/admin/entities/${ENTITY_TYPE}`, {
+				method: 'POST',
+				headers: {
+					origin: ORIGIN,
+					'sec-fetch-site': 'same-origin',
+					'x-csrf-token': CSRF,
+					'content-type': 'application/json',
+					cookie: `apex_admin_session=${session}; apex_bff_csrf=${CSRF}`
+				},
+				body: JSON.stringify({ fields_data: { title: 'orphan' } })
+			}),
+			ctx,
+			{ entityType: ENTITY_TYPE }
+		);
+		assert.equal(response.status, 422);
+		assert.equal(apex.stored.created, null, 'nothing may reach Apex');
+	});
+
+	it('a type NOT named bundle-only is still created free-standing', async () => {
+		// The rule is per type, not a blanket ban: an `array_ref` row is free-standing
+		// by construction and must still be creatable with no owner.
+		const apex = recordingApex();
+		const response = await create(ctxWith(apex, undefined, { bundleOnlyEntityTypes: ['card'] }), {
+			title: 'a normal row'
+		});
+		assert.equal(response.status, 200);
 	});
 
 	it('SANITIZES every value on the way through — the same judge as every other write', async () => {

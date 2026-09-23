@@ -2,6 +2,7 @@
 // Deliberately untyped JS to sit beside the legacy-compiled admin components; its
 // behavior is covered by tests/admin-save-page.test.js + tests/bff-realapex.test.js.
 import { isTempId, serializeBlocksForSave } from './block-serialize.js';
+import { sortBundleChildrenInPlace } from '../cms/bundle-order.js';
 
 /**
  * `@ts-nocheck` suppresses errors in THIS file; it does not stop the annotations
@@ -45,9 +46,12 @@ function clone(value) {
  *
  * @param {AdminPage} page
  * @param {string} version
+ * @param {Record<string, Record<string, { id: string, fields: Record<string, unknown> }[]>>} [childRows]
+ *   The stored rows every `array_ref` field points at, hydrated by the server. A
+ *   site with no such field passes nothing.
  * @returns {AdminPageDraft}
  */
-export function createDraft(page, version) {
+export function createDraft(page, version, childRows) {
 	const draft = {
 		pageId: page.id,
 		baselineVersion: version,
@@ -57,7 +61,35 @@ export function createDraft(page, version) {
 		/** True once blocks were reordered / added / removed, or page meta changed. */
 		structureDirty: false,
 		/** Real ids of removed blocks, sent as `{ id, _destroy: true }`. */
-		deletedBlockIds: []
+		deletedBlockIds: [],
+		/**
+		 * Child rows an editor has added to an `array_ref` field but that do not exist
+		 * in Apex yet, keyed `blockId` → `fieldName` → rows.
+		 *
+		 * Deliberately NOT in `fields_data`. An `array_ref` element must be the id of an
+		 * entity that ALREADY EXISTS — Apex's validator resolves every element and 422s
+		 * on one it cannot find, naming a field the editor never typed into. So a new
+		 * row lives here until its create lands, and `adoptListChildId` moves the real
+		 * id into the parent array.
+		 */
+		listChildren: {},
+		/**
+		 * Field edits to rows that ALREADY exist, keyed `childId` → `fieldName` → value.
+		 *
+		 * Separate from `dirtyEntityIds` because these entities are not reachable from
+		 * the page: `collectEntities` walks blocks, and a list child is free-standing.
+		 * Its own save leg writes them.
+		 */
+		listChildEdits: {},
+		/**
+		 * The STORED rows an `array_ref` points at, hydrated by the server, keyed
+		 * `blockId` → `fieldName` → `[{ id, fields }]`.
+		 *
+		 * Read-only baseline, never edited in place: an editor's changes go to
+		 * `listChildEdits` and are layered over this on read. That split is what lets
+		 * `discard` be "drop the edits" rather than "re-fetch the page".
+		 */
+		childRows: childRows && typeof childRows === 'object' ? clone(childRows) : {}
 	};
 	if (!Array.isArray(draft.page.blocks)) draft.page.blocks = [];
 	sortBlocks(draft);
@@ -144,6 +176,434 @@ export function setChildField(draft, blockId, childId, fieldName, value) {
 	child.entity.fields_data[fieldName] = value;
 	draft.dirtyEntityIds.add(child.entity.id);
 	return true;
+}
+
+/**
+ * ── CHILD ROWS INSIDE A SECTION (`array_ref` fields) ────────────────────────
+ *
+ * An `array_ref` field stores the IDS of free-standing entities. The rows are not
+ * owned by the block — the block references them — which is what makes this
+ * different from a bundle's children and from a nested template instance.
+ *
+ * Two rules shape every operation below:
+ *
+ * 1. **A temp id must never reach the parent array.** Apex resolves every element of
+ *    an `array_ref` on write and 422s on one it cannot find, naming a field the editor
+ *    never touched. So a new row waits in `draft.listChildren` until its create lands.
+ * 2. **Reorder and remove need no child traffic at all.** Both are edits to the
+ *    parent's array, and `setField` already marks the parent entity dirty — the
+ *    existing entity-PATCH leg carries them.
+ */
+
+/** @param {AdminPageDraft} draft @param {string} blockId @param {string} fieldName */
+function pendingRows(draft, blockId, fieldName) {
+	if (!draft.listChildren[blockId]) draft.listChildren[blockId] = {};
+	if (!Array.isArray(draft.listChildren[blockId][fieldName])) {
+		draft.listChildren[blockId][fieldName] = [];
+	}
+	return draft.listChildren[blockId][fieldName];
+}
+
+/** The parent's stored id array for one `array_ref` field, or `[]`. */
+function storedIds(block, fieldName) {
+	const value = block?.blockable?.entity?.fields_data?.[fieldName];
+	return Array.isArray(value) ? value : [];
+}
+
+/**
+ * Add a row to an `array_ref` field. It exists only in the draft until it is saved.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} fieldName
+ * @param {string} childType the entity type SLUG the row will be created as
+ * @param {Record<string, unknown>} [fieldsData]
+ * @returns {{ id: string, childType: string, fields_data: Record<string, unknown> } | null}
+ */
+export function addListChild(draft, blockId, fieldName, childType, fieldsData = {}) {
+	const block = findBlock(draft, blockId);
+	if (!canEditFields(block)) return null;
+	if (typeof fieldName !== 'string' || !fieldName) return null;
+	if (typeof childType !== 'string' || !childType) return null;
+	const row = {
+		id: nextTempId('child'),
+		childType,
+		fields_data: fieldsData && typeof fieldsData === 'object' ? { ...fieldsData } : {}
+	};
+	pendingRows(draft, block.id, fieldName).push(row);
+	return row;
+}
+
+/**
+ * Remove a row — a pending one outright, a stored one from the parent's array.
+ *
+ * The stored row's ENTITY is left in place. It is free-standing and may be referenced
+ * elsewhere; there is also no working delete route for one. The button says so.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} fieldName
+ * @param {string} childId
+ * @returns {boolean}
+ */
+export function removeListChild(draft, blockId, fieldName, childId) {
+	const block = findBlock(draft, blockId);
+	if (!canEditFields(block)) return false;
+	const pending = pendingRows(draft, block.id, fieldName);
+	const at = pending.findIndex((row) => row.id === childId);
+	if (at !== -1) {
+		pending.splice(at, 1);
+		return true;
+	}
+	const ids = storedIds(block, fieldName);
+	if (!ids.includes(childId)) return false;
+	// The queued edit goes WITH the row. It was keyed by child id and survived the
+	// removal otherwise: the save would PATCH a row the editor can no longer see —
+	// pointlessly if it succeeded, and unfixably if it 422'd, because there is no
+	// row on screen to correct.
+	if (draft.listChildEdits) delete draft.listChildEdits[childId];
+	return setField(
+		draft,
+		block.id,
+		fieldName,
+		ids.filter((id) => id !== childId)
+	);
+}
+
+/**
+ * Move a STORED row within the parent's array. Pending rows have no place in it yet.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} fieldName
+ * @param {number} from
+ * @param {number} to
+ * @returns {boolean}
+ */
+export function moveListChild(draft, blockId, fieldName, from, to) {
+	const block = findBlock(draft, blockId);
+	if (!canEditFields(block)) return false;
+	const ids = [...storedIds(block, fieldName)];
+	if (!Number.isInteger(from) || !Number.isInteger(to)) return false;
+	if (from < 0 || to < 0 || from >= ids.length || to >= ids.length) return false;
+	if (from === to) return true;
+	const [moved] = ids.splice(from, 1);
+	ids.splice(to, 0, moved);
+	return setField(draft, block.id, fieldName, ids);
+}
+
+/**
+ * Set a field on one child row, pending or stored.
+ *
+ * A pending row is edited in place here and carried to its create. A stored row's
+ * entity is marked dirty so the existing entity-PATCH leg writes it.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} fieldName
+ * @param {string} childId
+ * @param {string} childField
+ * @param {unknown} value
+ * @param {string} [childType] required for a STORED row — the PATCH route is
+ *   `entity_types/:ref/entities/:id`, so the type travels with the edit
+ * @returns {boolean}
+ */
+export function setListChildField(
+	draft,
+	blockId,
+	fieldName,
+	childId,
+	childField,
+	value,
+	childType
+) {
+	const block = findBlock(draft, blockId);
+	if (!canEditFields(block)) return false;
+	if (typeof childField !== 'string' || !childField) return false;
+	const row = pendingRows(draft, block.id, fieldName).find((item) => item.id === childId);
+	if (row) {
+		row.fields_data[childField] = value;
+		return true;
+	}
+	if (!storedIds(block, fieldName).includes(childId)) return false;
+	if (isTempId(`${childId}`)) return false;
+	if (typeof childType !== 'string' || !childType) return false;
+	if (!draft.listChildEdits) draft.listChildEdits = {};
+	if (!draft.listChildEdits[childId]) {
+		draft.listChildEdits[childId] = { childType, fields_data: {} };
+	}
+	draft.listChildEdits[childId].fields_data[childField] = value;
+	return true;
+}
+
+/**
+ * Move a created row's REAL id into the parent's array, and drop the pending row.
+ *
+ * Called as each create lands, before the parent is written — so a retry after a
+ * later failure does not create the same row twice.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} fieldName
+ * @param {string} tempId
+ * @param {string} realId
+ * @returns {boolean}
+ */
+export function adoptListChildId(draft, blockId, fieldName, tempId, realId) {
+	const block = findBlock(draft, blockId);
+	if (!canEditFields(block)) return false;
+	if (typeof realId !== 'string' || !realId || isTempId(realId)) return false;
+	const pending = pendingRows(draft, block.id, fieldName);
+	const at = pending.findIndex((row) => row.id === tempId);
+	if (at === -1) return false;
+	pending.splice(at, 1);
+	return setField(draft, block.id, fieldName, [...storedIds(block, fieldName), realId]);
+}
+
+/**
+ * The rows `savePage` must CREATE, in the order the editor added them.
+ * @param {AdminPageDraft} draft
+ */
+export function newListChildren(draft) {
+	const out = [];
+	for (const [blockId, fields] of Object.entries(draft.listChildren ?? {})) {
+		for (const [fieldName, rows] of Object.entries(fields ?? {})) {
+			for (const row of rows) out.push({ blockId, fieldName, ...row });
+		}
+	}
+	return out;
+}
+
+/**
+ * The stored rows `savePage` must PATCH — `{childId, fields_data}` per edited row.
+ * @param {AdminPageDraft} draft
+ */
+export function editedListChildren(draft) {
+	return Object.entries(draft.listChildEdits ?? {}).map(([childId, edit]) => ({
+		childId,
+		childType: edit.childType,
+		fields_data: edit.fields_data
+	}));
+}
+
+/**
+ * What the editor sees: stored rows in the parent's order, then the pending ones.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} fieldName
+ */
+export function listChildRows(draft, blockId, fieldName) {
+	const block = findBlock(draft, blockId);
+	if (!block) return [];
+	const edits = draft.listChildEdits ?? {};
+	// The server-hydrated baseline for this field, by id. Without it a stored row has
+	// no content to draw and every existing row renders "(empty)".
+	const hydratedRows = draft.childRows?.[blockId]?.[fieldName];
+	const hydrated = new Map();
+	for (const row of hydratedRows ?? []) {
+		if (row && typeof row.id === 'string') hydrated.set(row.id, row.fields ?? {});
+	}
+	/**
+	 * A row whose entity no longer exists is DROPPED, not drawn empty.
+	 *
+	 * The resolver already filters those out — a referenced child that is gone cannot
+	 * be edited, and re-saving the parent without it is the repair. But the parent's
+	 * array still names it, and listing from the array alone put the blank row
+	 * straight back, so the drop achieved nothing on screen.
+	 *
+	 * Only when this field WAS hydrated. A site that supplies no resolver has no
+	 * hydration for any field, and there every stored id must still be listed —
+	 * otherwise the list would simply render empty.
+	 */
+	const drawOnlyHydrated = Array.isArray(hydratedRows);
+	const stored = storedIds(block, fieldName)
+		.filter((id) => !drawOnlyHydrated || hydrated.has(id))
+		.map((id) => ({
+			id,
+			pending: false,
+			// Edits LAYER over the stored fields rather than replacing them: an edit records
+			// only the fields typed into, so replacing would blank every other one on screen
+			// the moment an editor touched a single input.
+			fields_data: { ...(hydrated.get(id) ?? {}), ...(edits[id]?.fields_data ?? {}) }
+		}));
+	const pending = pendingRows(draft, block.id, fieldName).map((row) => ({
+		id: row.id,
+		pending: true,
+		childType: row.childType,
+		fields_data: { ...row.fields_data }
+	}));
+	return [...stored, ...pending];
+}
+
+/**
+ * ── A BUNDLE'S OWN CHILDREN (`Cms::PageBlock::EntityBundle`) ────────────────
+ *
+ * Different from an `array_ref` list in every way that matters: the bundle OWNS
+ * these rows (`has_many :entities, as: :owner, dependent: :destroy`), their order
+ * lives on the row as `position` rather than in an array, and destroying the block
+ * destroys them.
+ *
+ * `Cms::PageBlock::EntityGroup` has the identical mechanism. Nothing on these sites
+ * uses one, and `isBundleBlock` deliberately does not claim it — but the operations
+ * take the block, not a hard-coded type, so adopting it later is a predicate change.
+ */
+export const BUNDLE_BLOCKABLE = 'Cms::PageBlock::EntityBundle';
+
+/** @param {AdminPageBlock | null | undefined} block */
+export function isBundleBlock(block) {
+	return block?.blockable_type === BUNDLE_BLOCKABLE;
+}
+
+/**
+ * The bundle's children, IN RENDER ORDER, as the live array.
+ *
+ * Sorted in place on every read. Apex declares no order scope on `has_many :entities`,
+ * so a read-back is heap order — and the panel renders render-order. If this returned
+ * the raw array, the index an editor dragged and the index `moveBundleEntity` splices
+ * would be different rows, and the renumber that follows would write that wrong order
+ * to Apex. Sorting here makes the two the same number everywhere.
+ */
+function ownedChildren(block) {
+	const rows = block?.blockable?.entities;
+	if (!Array.isArray(rows)) return [];
+	return sortBundleChildrenInPlace(rows);
+}
+
+/**
+ * Give every sibling a contiguous `position`, and mark each one dirty.
+ *
+ * Renumbering the WHOLE set is not tidiness. Every live child is `position: 0` and
+ * there is no value below zero, so moving the last row to the front cannot be
+ * expressed by writing that one row. And each renumbered row must be marked dirty or
+ * `dirtyEntityPatches` emits none of them and the drag is silently dropped.
+ */
+function renumber(draft, block) {
+	// The RAW array, deliberately: it has just been spliced into the new order, and
+	// `ownedChildren` would re-sort it by the OLD positions and undo the move.
+	const rows = Array.isArray(block?.blockable?.entities) ? block.blockable.entities : [];
+	rows.forEach((child, index) => {
+		if (!child?.id) return;
+		if (child.position !== index) {
+			child.position = index;
+			draft.dirtyEntityIds.add(child.id);
+		}
+	});
+}
+
+/**
+ * Add a child to a bundle. It is created by its own leg, so it carries a temp id
+ * until then — but unlike an `array_ref` row there is no parent array to keep it out
+ * of, so it lives in the block where the editor can see it.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} childType the entity type SLUG
+ * @param {Record<string, unknown>} [fieldsData]
+ * @returns {{ id: string } | null}
+ */
+export function addBundleEntity(draft, blockId, childType, fieldsData = {}) {
+	const block = findBlock(draft, blockId);
+	if (!isBundleBlock(block) || !block.blockable) return null;
+	if (typeof childType !== 'string' || !childType) return null;
+	if (!Array.isArray(block.blockable.entities)) block.blockable.entities = [];
+	const child = {
+		id: nextTempId('bundle-child'),
+		childType,
+		position: block.blockable.entities.length,
+		fields_data: fieldsData && typeof fieldsData === 'object' ? { ...fieldsData } : {}
+	};
+	block.blockable.entities.push(child);
+	draft.structureDirty = true;
+	return child;
+}
+
+/**
+ * Remove a child. A stored row is destroyed with the page save; a temp one just goes.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} childId
+ * @returns {boolean}
+ */
+export function removeBundleEntity(draft, blockId, childId) {
+	const block = findBlock(draft, blockId);
+	if (!isBundleBlock(block) || !block.blockable) return false;
+	const rows = ownedChildren(block);
+	const at = rows.findIndex((row) => row?.id === childId);
+	if (at === -1) return false;
+	const [removed] = rows.splice(at, 1);
+	if (!isTempId(`${removed.id}`)) {
+		if (!Array.isArray(block.blockable.deleted_entity_ids)) {
+			block.blockable.deleted_entity_ids = [];
+		}
+		block.blockable.deleted_entity_ids.push(removed.id);
+	}
+	draft.dirtyEntityIds.delete(removed.id);
+	// Explicitly: pushing onto `deleted_entity_ids` does not dirty the draft by
+	// itself, and without this `savePage` skips the structure PATCH and the removal
+	// is silently dropped.
+	draft.structureDirty = true;
+	renumber(draft, block);
+	return true;
+}
+
+/**
+ * Move a child within its bundle. Renumbers every sibling — see `renumber`.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {number} from
+ * @param {number} to
+ * @returns {boolean}
+ */
+export function moveBundleEntity(draft, blockId, from, to) {
+	const block = findBlock(draft, blockId);
+	if (!isBundleBlock(block) || !block.blockable) return false;
+	const rows = ownedChildren(block);
+	if (!Number.isInteger(from) || !Number.isInteger(to)) return false;
+	if (from < 0 || to < 0 || from >= rows.length || to >= rows.length) return false;
+	if (from === to) return true;
+	const [moved] = rows.splice(from, 1);
+	rows.splice(to, 0, moved);
+	renumber(draft, block);
+	return true;
+}
+
+/**
+ * Set a field on one of a bundle's children.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} childId
+ * @param {string} fieldName
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+export function setBundleEntityField(draft, blockId, childId, fieldName, value) {
+	const block = findBlock(draft, blockId);
+	if (!isBundleBlock(block) || !block.blockable) return false;
+	if (typeof fieldName !== 'string' || !fieldName) return false;
+	const child = ownedChildren(block).find((row) => row?.id === childId);
+	if (!child) return false;
+	if (!child.fields_data || typeof child.fields_data !== 'object') child.fields_data = {};
+	child.fields_data[fieldName] = value;
+	// A temp child is created by its own leg and carries its fields there; only a
+	// stored one goes through the dirty-entity patch.
+	if (!isTempId(`${child.id}`)) draft.dirtyEntityIds.add(child.id);
+	return true;
+}
+
+/** The children a save must CREATE, with the block that owns them. */
+export function newBundleEntities(draft) {
+	const out = [];
+	for (const block of draft.page.blocks) {
+		if (!isBundleBlock(block)) continue;
+		for (const child of ownedChildren(block)) {
+			if (isTempId(`${child.id}`)) out.push({ blockId: block.id, ...child });
+		}
+	}
+	return out;
 }
 
 /**
@@ -545,11 +1005,36 @@ export function setPageField(draft, name, value) {
 }
 
 /**
+ * Is there anything to save?
+ *
+ * This is what the Save button is enabled by, so anything it does not count is
+ * UNSAVEABLE — the editor makes the change, the button stays grey, and the only way
+ * out is to leave the page and lose it.
+ *
+ * ── THE TWO COLLECTIONS IT USED TO MISS ─────────────────────────────────────
+ * `listChildren` and `listChildEdits` live beside the page rather than in it — an
+ * `array_ref` row is a FREE-STANDING entity, so adding one changes no block and
+ * editing one marks no entity on the tree dirty. Neither flag moved, so the whole
+ * repeatable feature was unusable: add a row, type into it, and Save stayed
+ * disabled.
+ *
+ * Found by the browser gate on 2026-09-22, not by the suite — and it could not have
+ * been found by the suite, because the unit tests call `savePage` directly and never
+ * ask whether the button that reaches it is enabled. The bundle operations were
+ * never affected: a bundle OWNS its children, so `addBundleEntity` sets
+ * `structureDirty` and `setBundleEntityField` marks the child's own entity dirty.
+ *
  * @param {AdminPageDraft} draft
  * @returns {boolean}
  */
 export function isDirty(draft) {
-	return draft.dirtyEntityIds.size > 0 || draft.structureDirty || draft.deletedBlockIds.length > 0;
+	return (
+		draft.dirtyEntityIds.size > 0 ||
+		draft.structureDirty ||
+		draft.deletedBlockIds.length > 0 ||
+		newListChildren(draft).length > 0 ||
+		editedListChildren(draft).length > 0
+	);
 }
 
 /** Collect every entity in the tree, keyed by id, so dirty ones can be found. */
@@ -563,6 +1048,13 @@ function collectEntities(draft) {
 			for (const child of children) {
 				if (child.entity?.id) entities.set(child.entity.id, child.entity);
 			}
+		}
+		// A bundle OWNS its children, so a field edit on one rides the dirty-entity leg.
+		// List children are deliberately NOT here: those are free-standing, written by
+		// their own leg, and collecting them would write each row twice.
+		const owned = block.blockable?.entities;
+		if (Array.isArray(owned)) {
+			for (const child of owned) if (child?.id) entities.set(child.id, child);
 		}
 	}
 	return entities;
@@ -586,11 +1078,17 @@ export function dirtyEntityPatches(draft) {
 	for (const entityId of draft.dirtyEntityIds) {
 		const entity = entities.get(entityId);
 		if (!entity || isTempId(`${entity.id}`)) continue;
-		patches.push({
+		const patch = {
 			entityTypeId: entity.entity_type_id,
 			entityId: entity.id,
 			fields_data: clone(entity.fields_data || {})
-		});
+		};
+		// A bundle child's row order lives on the row. `position` can never travel
+		// without `fields_data` — the entities route assigns both in one call and a
+		// bare `{position}` body is a 500 — so it rides this patch rather than a leg
+		// of its own.
+		if (Number.isInteger(entity.position)) patch.position = entity.position;
+		patches.push(patch);
 	}
 	return patches;
 }
@@ -623,15 +1121,27 @@ export function structurePayload(draft) {
  * @param {AdminPageDraft} draft
  * @param {AdminPage} serverPage
  * @param {string} version
+ * @param {Record<string, Record<string, { id: string, fields: Record<string, unknown> }[]>>} [childRows]
+ *   Fresh hydrated rows, when the caller has them. OMITTED keeps the ones already on
+ *   the draft — a page read-back that does not carry rows must not blank them.
  * @returns {void}
  */
-export function reconcile(draft, serverPage, version) {
+export function reconcile(draft, serverPage, version, childRows) {
 	draft.page = clone(serverPage);
 	if (!Array.isArray(draft.page.blocks)) draft.page.blocks = [];
 	sortBlocks(draft);
 	draft.dirtyEntityIds = new Set();
 	draft.structureDirty = false;
 	draft.deletedBlockIds = [];
+	// Or a row whose create already landed is created a SECOND time on the next save:
+	// `reconcile` replaces `draft.page` wholesale and resets every other flag, so a
+	// temp row left here would look new again.
+	draft.listChildren = {};
+	draft.listChildEdits = {};
+	// Only when the caller HAS fresh rows. `savePage` reconciles from a page read-back
+	// that may not carry them, and blanking the baseline there would turn every
+	// existing row into "(empty)" the instant a save succeeded.
+	if (childRows && typeof childRows === 'object') draft.childRows = clone(childRows);
 	if (version) draft.baselineVersion = version;
 	draft.pageId = draft.page.id;
 }
