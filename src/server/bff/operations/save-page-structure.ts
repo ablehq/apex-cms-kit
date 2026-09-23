@@ -25,7 +25,8 @@ import type { PageStructureBody } from '../apex-admin-client';
  * PATCH /api/admin/pages/[pageId]/structure — the block-order / add / remove save
  * `savePage()` dispatches AFTER the per-entity field PATCHes (plan §8, 3a M1). It
  * maps to the one page PATCH Apex permits (`blocks_attributes`, plus the page-level
- * title/slug/summary and `meta_properties_attributes`). Publish/unpublish is NOT
+ * title/slug/summary). Meta rows go only through the id-keyed `/seo` route
+ * (`update-page-seo.ts:54-65`), so structure cannot append or delete them. Publish/unpublish is NOT
  * here — `:status` is not a permitted page param; that stays the status_event op.
  *
  * The top-level schema is `.strict()` (unknown keys fail closed). `blocks_attributes`
@@ -361,8 +362,7 @@ export const savePageStructureBodySchema = z
 			.regex(/^\s*$|^[a-z0-9/_-]+$/iu)
 			.optional(),
 		summary: z.string().max(5000).optional(),
-		blocks_attributes: z.array(jsonRecord).max(200).optional(),
-		meta_properties_attributes: z.array(jsonRecord).max(50).optional()
+		blocks_attributes: z.array(jsonRecord).max(200).optional()
 	})
 	.strict();
 
@@ -495,11 +495,6 @@ export async function handleSavePageStructure(
 		...parsed.data,
 		...(parsed.data.blocks_attributes
 			? { blocks_attributes: sanitizeFieldValue(parsed.data.blocks_attributes) }
-			: {}),
-		...(parsed.data.meta_properties_attributes
-			? {
-					meta_properties_attributes: sanitizeFieldValue(parsed.data.meta_properties_attributes)
-				}
 			: {})
 	};
 
