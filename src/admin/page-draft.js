@@ -3,6 +3,7 @@
 // behavior is covered by tests/admin-save-page.test.js + tests/bff-realapex.test.js.
 import { isTempId, serializeBlocksForSave } from './block-serialize.js';
 import { sortBundleChildrenInPlace } from '../cms/bundle-order.js';
+import { pickMetaRow } from '../cms/meta-row.js';
 
 /**
  * `@ts-nocheck` suppresses errors in THIS file; it does not stop the annotations
@@ -1102,9 +1103,7 @@ export function setPageMeta(draft, name, value) {
 	// `metaEdits` rather than removing it, every Save would 409 again, and the page
 	// could never be published — the exact dead end the message claims to open.
 	// (codex's review of d864899, 2026-09-23.)
-	const baseline =
-		draft.page.meta_properties?.find((row) => row?.group === 'web' && row.name === name && row.id)
-			?.value ?? '';
+	const baseline = pickMetaRow(draft.page.meta_properties, name, { requireId: true })?.value ?? '';
 	if (value === baseline) delete draft.metaEdits[name];
 	else draft.metaEdits[name] = value;
 	return true;
