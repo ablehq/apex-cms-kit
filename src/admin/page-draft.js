@@ -23,6 +23,14 @@ export function isSpacerBlock(block) {
 	return block?.blockable_type === SPACER_BLOCKABLE;
 }
 
+/** The 2026-09-23 Apex probe accepts Divider with the same nullable size values as Spacer. */
+export const DIVIDER_BLOCKABLE = 'Cms::PageBlock::Divider';
+export const DIVIDER_KINDS = Object.freeze(['small', 'medium', 'large']);
+
+export function isDividerBlock(block) {
+	return block?.blockable_type === DIVIDER_BLOCKABLE;
+}
+
 // Local page-draft state (plan §8, 3a M1). Edits mutate THIS, not Apex. There is no
 // autosave, no debounce, no coordinator — a single explicit `savePage()` (save-page.js)
 // reads the dirty set off a draft and writes it. The draft is a plain object graph
@@ -734,6 +742,45 @@ export function setSpacerKind(draft, blockId, kind) {
 	if (!isSpacerBlock(block) || !block.blockable || typeof block.blockable !== 'object')
 		return false;
 	if (!SPACER_KINDS.includes(kind)) return false;
+	if (block.blockable.kind === kind) return true;
+	block.blockable.kind = kind;
+	draft.structureDirty = true;
+	return true;
+}
+
+/**
+ * Append a medium divider. The 2026-09-23 Apex create probe accepts its kind; the
+ * temp blockable id satisfies AdminBlockable until the serializer strips it on save.
+ * @param {AdminPageDraft} draft
+ * @returns {AdminPageBlock}
+ */
+export function addDividerBlock(draft) {
+	const block = {
+		id: nextTempId('block'),
+		label: null,
+		position: draft.page.blocks.length,
+		blockable_type: DIVIDER_BLOCKABLE,
+		blockable: { id: nextTempId('divider'), kind: 'medium' }
+	};
+	draft.page.blocks.push(block);
+	applyPositions(draft);
+	draft.structureDirty = true;
+	return block;
+}
+
+/**
+ * Update the hydrated delegated record: the 2026-09-23 Apex update probe requires
+ * both its real id and the block id, which the structure serializer preserves.
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {unknown} kind
+ * @returns {boolean}
+ */
+export function setDividerKind(draft, blockId, kind) {
+	const block = findBlock(draft, blockId);
+	if (!isDividerBlock(block) || !block.blockable || typeof block.blockable !== 'object')
+		return false;
+	if (!DIVIDER_KINDS.includes(kind)) return false;
 	if (block.blockable.kind === kind) return true;
 	block.blockable.kind = kind;
 	draft.structureDirty = true;

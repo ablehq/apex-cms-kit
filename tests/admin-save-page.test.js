@@ -14,6 +14,10 @@ import {
 	addTemplateBlock,
 	addSpacerBlock,
 	setSpacerKind,
+	addDividerBlock,
+	setDividerKind,
+	isDividerBlock,
+	DIVIDER_KINDS,
 	addCollectionBlock,
 	addListChild,
 	addBundleEntity,
@@ -1478,6 +1482,64 @@ describe("a bundle's own children", () => {
 });
 
 describe('page-draft local model', () => {
+	/**
+	 * The 2026-09-23 Apex probe accepts Divider create/update only with the full
+	 * structure payload; these assertions pin both ids and the delegated kind.
+	 */
+	it('adds, resizes and removes a divider through the structure payload', () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		const added = addDividerBlock(draft);
+		assert.equal(isDirty(draft), true);
+		assert.equal(isDividerBlock(added), true);
+		assert.deepEqual(DIVIDER_KINDS, ['small', 'medium', 'large']);
+		assert.equal(isTempId(added.blockable.id), true);
+		let attr = structurePayload(draft).blocks_attributes.find(
+			(block) => block.position === added.position
+		);
+		assert.equal(Object.hasOwn(attr, 'id'), false);
+		assert.deepEqual(attr.blockable_attributes, { kind: 'medium' });
+		assert.equal(setDividerKind(draft, added.id, 'large'), true);
+		assert.equal(isDirty(draft), true);
+		attr = structurePayload(draft).blocks_attributes.find(
+			(block) => block.position === added.position
+		);
+		assert.deepEqual(attr.blockable_attributes, { kind: 'large' });
+		removeBlock(draft, added.id);
+		assert.equal(
+			getBlocks(draft).some((block) => block.id === added.id),
+			false
+		);
+	});
+
+	it('keeps hydrated divider ids and refuses invalid or missing delegated records', () => {
+		const page = samplePage();
+		page.blocks.push({
+			id: 'divider-block',
+			position: 2,
+			blockable_type: 'Cms::PageBlock::Divider',
+			blockable: { id: 'divider-record', kind: null }
+		});
+		page.blocks.push({
+			id: 'empty-divider',
+			position: 3,
+			blockable_type: 'Cms::PageBlock::Divider',
+			blockable: null
+		});
+		const draft = createDraft(page, 'baseline-v');
+		for (const kind of ['huge', '', null])
+			assert.equal(setDividerKind(draft, 'divider-block', kind), false);
+		assert.equal(setDividerKind(draft, 'empty-divider', 'small'), false);
+		assert.equal(setDividerKind(draft, 'block-heading', 'small'), false);
+		assert.equal(isDirty(draft), false);
+		assert.equal(setDividerKind(draft, 'divider-block', 'small'), true);
+		assert.equal(isDirty(draft), true);
+		const attrs = structurePayload(draft).blocks_attributes;
+		assert.equal(attrs.length, page.blocks.length, 'structure save includes every block');
+		const attr = attrs.find((block) => block.id === 'divider-block');
+		assert.equal(attr.blockable_attributes.id, 'divider-record');
+		assert.equal(attr.blockable_attributes.kind, 'small');
+	});
+
 	it('adds a medium spacer locally and serializes it without server ids', () => {
 		const draft = createDraft(samplePage(), 'baseline-v');
 		const block = addSpacerBlock(draft);
