@@ -10,6 +10,7 @@ import { isTempId, serializeBlocksForSave } from './block-serialize.js';
  * @typedef {import('./types').AdminPage} AdminPage
  * @typedef {import('./types').AdminPageBlock} AdminPageBlock
  * @typedef {import('./types').AdminPageDraft} AdminPageDraft
+ * @typedef {import('./types').CollectionSource} CollectionSource
  */
 
 /** Apex's delegated type for a spacer. */
@@ -274,6 +275,239 @@ export function setSpacerKind(draft, blockId, kind) {
 	if (!SPACER_KINDS.includes(kind)) return false;
 	if (block.blockable.kind === kind) return true;
 	block.blockable.kind = kind;
+	draft.structureDirty = true;
+	return true;
+}
+
+/**
+ * A GENERATED LISTING — the bands that render a collection of records.
+ *
+ * `kind` is REQUIRED by Apex: `Cms::PageBlock::AutoCollection` validates it against
+ * `archetype | entity_type | model`, and `Cms::PageBlock` declares
+ * `validates_associated :blockable`, so a nil kind fails the WHOLE page save, not
+ * just this block. Every band live on either site today is `archetype`.
+ */
+export const COLLECTION_BLOCKABLE = 'Cms::PageBlock::AutoCollection';
+
+/**
+ * The only three values Apex accepts, and it ENFORCES them.
+ *
+ * `auto_collection.rb` validates `kind` for inclusion, and `Cms::PageBlock` declares
+ * `validates_associated :blockable` — so a bad kind 422s the WHOLE page save, not
+ * just this block. That makes it the one field here worth validating most: `ref_name`
+ * is unvalidated upstream and its worst case is a band that renders nothing, while a
+ * bad `kind` means nothing on the page saves at all.
+ */
+export const COLLECTION_KINDS = Object.freeze(['archetype', 'entity_type', 'model']);
+
+/** @param {AdminPageBlock | null | undefined} block */
+export function isCollectionBlock(block) {
+	return block?.blockable_type === COLLECTION_BLOCKABLE;
+}
+
+/**
+ * Is this list entry complete enough to write three fields from?
+ *
+ * A half-built entry would let a switch write a good `ref_name` beside a missing
+ * label and an undefined count — three fields, one of them wrong, atomically.
+ *
+ * @param {CollectionSource | null | undefined} source
+ */
+function isUsableSource(source) {
+	if (!source || typeof source !== 'object') return false;
+	if (typeof source.refName !== 'string' || !source.refName) return false;
+	if (typeof source.label !== 'string' || !source.label) return false;
+	// Required, not optional: the screens read omission as "no count control" while a
+	// mutation would have read it as "counts are fine", which is the kind of drift that
+	// only shows up on the third consumer.
+	if (source.itemCount !== 'count' && source.itemCount !== 'none') return false;
+	if (source.minCount !== undefined && !Number.isInteger(source.minCount)) return false;
+	// `0` is MEANINGFUL, not unset: on one site it selects the search-and-filter view.
+	return Number.isInteger(source.defaultCount) && source.defaultCount >= 0;
+}
+
+/**
+ * The source an editor may point a band AT — exact `refName` only.
+ *
+ * Aliases are deliberately not accepted here: they are spellings already out there
+ * that the renderer must keep reading, not values this admin offers. One canonical
+ * spelling per source is what lets a site test assert its renderer branches and its
+ * source list match with nothing left over.
+ *
+ * The FIRST USABLE match wins rather than the first match: a malformed duplicate
+ * earlier in a site's list would otherwise make a perfectly good source unauthorable,
+ * with no signal to the editor beyond a missing card.
+ *
+ * @param {readonly CollectionSource[] | null | undefined} sources
+ * @param {unknown} refName
+ * @returns {CollectionSource | null}
+ */
+function resolveTarget(sources, refName) {
+	if (!Array.isArray(sources) || typeof refName !== 'string' || !refName) return null;
+	return sources.filter((source) => source?.refName === refName).find(isUsableSource) ?? null;
+}
+
+/**
+ * A stored `ref_name`, in the spelling this comparison works in.
+ *
+ * Apex stores whatever was written: `team member`, `team_member`, `Focus-Area`. Both
+ * sites already normalise the same way before dispatching, so the kit has to as well
+ * — matching the raw string here made `setCollectionItemCount` return false for an
+ * underscored band whose panel the site had already decided to show, which reads as a
+ * "How many" box that silently does nothing.
+ *
+ * @param {unknown} value
+ */
+function normalizeRef(value) {
+	return String(value ?? '')
+		.toLowerCase()
+		.trim()
+		.replace(/[_-]+/gu, ' ')
+		.replace(/\s+/gu, ' ');
+}
+
+/**
+ * The source a STORED `ref_name` belongs to — canonical spelling or alias.
+ *
+ * This is the comparison half, and it has to accept aliases where `resolveTarget`
+ * must not. A band stored as `member` IS the `team member` source; without this the
+ * kit would read "switch to team member" as a change, rewrite the row, and reset a
+ * count the editor never touched — while the dropdown showed that source as already
+ * selected. Alias knowledge lives here rather than in three sites, which is the
+ * whole reason the list is passed in.
+ *
+ * @param {readonly CollectionSource[] | null | undefined} sources
+ * @param {unknown} refName
+ * @returns {CollectionSource | null}
+ */
+function resolveStored(sources, refName) {
+	if (!Array.isArray(sources)) return null;
+	const wanted = normalizeRef(refName);
+	if (!wanted) return null;
+	return (
+		sources
+			.filter(
+				(source) =>
+					normalizeRef(source?.refName) === wanted ||
+					(Array.isArray(source?.aliases) &&
+						source.aliases.some((alias) => normalizeRef(alias) === wanted))
+			)
+			.find(isUsableSource) ?? null
+	);
+}
+
+/**
+ * Append a generated listing for `refName`, taking its label and count FROM the list.
+ *
+ * Creation is the path that mints these values, so it is the one that most needs the
+ * allow-list: an invented `refName` here would produce a band no renderer can draw
+ * and no dialog can recreate.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string} refName
+ * @param {readonly CollectionSource[]} sources
+ * @param {{ kind?: string }} [options]
+ * @returns {AdminPageBlock | null} the block, or `null` if the source is not listed
+ */
+export function addCollectionBlock(draft, refName, sources, options = {}) {
+	const source = resolveTarget(sources, refName);
+	if (!source) return null;
+	// `options` is guarded rather than defaulted: `= {}` fires only on `undefined`, and
+	// every other refusal in this file survives a caller passing null.
+	const kind = (options && typeof options === 'object' && options.kind) || 'archetype';
+	// The field Apex actually enforces. A bad value here 422s the whole page save.
+	if (!COLLECTION_KINDS.includes(kind)) return null;
+	const block = {
+		id: nextTempId('block'),
+		label: source.label,
+		position: draft.page.blocks.length,
+		blockable_type: COLLECTION_BLOCKABLE,
+		// A temp id for the same reason the spacer carries one: `AdminBlockable.id` is
+		// required, and `serializePageBlockForSave` strips temp ids so Apex mints the real
+		// one. `item_count` is always sent — the old admin's writes never omit it.
+		blockable: {
+			id: nextTempId('collection'),
+			kind,
+			ref_name: source.refName,
+			item_count: source.defaultCount,
+			// Measured 2026-09-22: all nine live bands across both sites carry exactly
+			// this, and it is what the old admin's create path wrote. Apex treats null
+			// identically (`sort_expression || ["created_at desc"]`) and neither site
+			// calls the code that reads it — but a band an editor adds should be
+			// indistinguishable from one that was already there.
+			sort_expression: ['created_at desc']
+		}
+	};
+	draft.page.blocks.push(block);
+	applyPositions(draft);
+	draft.structureDirty = true;
+	return block;
+}
+
+/**
+ * Set how many records a listing shows.
+ *
+ * Takes the source list too, and REFUSES a source that declares `itemCount: 'none'`.
+ * That is not symmetry for its own sake: on one site this field is a mode switch
+ * rather than a limit — `item_count` of 0 renders a search-and-filter view and any
+ * positive value replaces it with a capped grid — so writing a count there deletes a
+ * live search box. Leaving that to each site's screen would make the one operation
+ * that can destroy a page's behaviour the only unguarded one.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {unknown} count
+ * @param {readonly CollectionSource[]} sources
+ * @returns {boolean}
+ */
+export function setCollectionItemCount(draft, blockId, count, sources) {
+	const block = findBlock(draft, blockId);
+	if (!isCollectionBlock(block) || !block.blockable || typeof block.blockable !== 'object')
+		return false;
+	if (!Number.isInteger(count) || /** @type {number} */ (count) < 0) return false;
+	const source = resolveStored(sources, block.blockable.ref_name);
+	if (!source || source.itemCount === 'none') return false;
+	// A site's own floor. On one site 0 means "show them all"; on the other the loader
+	// reads 0 as unset and substitutes a default, so a 0 there is a control that says
+	// one thing and does another.
+	if (Number.isInteger(source.minCount) && count < source.minCount) return false;
+	if (block.blockable.item_count === count) return true;
+	block.blockable.item_count = count;
+	draft.structureDirty = true;
+	return true;
+}
+
+/**
+ * Point a listing at a different source — `ref_name`, `label` and `item_count` TOGETHER.
+ *
+ * All three, because the alternative leaves the band half-switched: both admins name
+ * an outline row from the stored `label`, so writing only `ref_name` keeps the old
+ * name on screen; and `item_count` does not mean the same thing to every source. On
+ * Poovayya a testimonials band with a count of 6 switched to team members would
+ * select capped-grid mode with six members, where the live page shows a
+ * search-and-filter UI. Adopting the new source's default is the only transition
+ * that leaves the block self-consistent.
+ *
+ * @param {AdminPageDraft} draft
+ * @param {string | null | undefined} blockId
+ * @param {string} refName
+ * @param {readonly CollectionSource[]} sources
+ * @returns {boolean}
+ */
+export function setCollectionSource(draft, blockId, refName, sources) {
+	const block = findBlock(draft, blockId);
+	if (!isCollectionBlock(block) || !block.blockable || typeof block.blockable !== 'object')
+		return false;
+	const source = resolveTarget(sources, refName);
+	if (!source) return false;
+	// Compared through the SOURCE, not through the raw string. A band stored under an
+	// alias (`member`) already IS the `team member` source, and the dropdown shows it
+	// as selected — so re-picking it must be a no-op. Comparing strings instead made
+	// that re-pick rewrite the row and reset a count the editor never touched.
+	if (resolveStored(sources, block.blockable.ref_name) === source) return true;
+	block.blockable.ref_name = source.refName;
+	block.blockable.item_count = source.defaultCount;
+	block.label = source.label;
 	draft.structureDirty = true;
 	return true;
 }

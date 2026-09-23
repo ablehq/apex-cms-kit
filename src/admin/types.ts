@@ -71,7 +71,7 @@ export interface AdminChildTemplateInstance {
 	entity?: AdminEntity | null;
 }
 
-/** What a page block points at. Only the template-instance case is authored here. */
+/** What a page block points at. */
 export interface AdminBlockable {
 	id: string;
 	kind?: string | null;
@@ -79,6 +79,63 @@ export interface AdminBlockable {
 	page_block_template?: AdminPageBlockTemplate | null;
 	entity?: AdminEntity | null;
 	child_template_instances?: AdminChildTemplateInstance[];
+	/** `Cms::PageBlock::AutoCollection`: which collection, and how much of it. */
+	ref_name?: string | null;
+	item_count?: number | null;
+	/** A real jsonb column on the band's table — carried through a save untouched. */
+	description?: Record<string, unknown> | string | null;
+	/**
+	 * Both are permitted by the pages controller and BOTH ARE UNUSED BY EVERY SITE:
+	 * Apex honours `sort_expression` only inside `AutoCollection#collection_records`,
+	 * which no site calls — each fetches and orders the records itself. They are typed
+	 * so a `structuredClone` of the blockable carries them through a save unchanged.
+	 */
+	sort_expression?: string[] | null;
+	filter_expression?: Record<string, unknown> | null;
+}
+
+/**
+ * One authorable collection source, as a SITE declares it.
+ *
+ * The site owns this list because its renderer decides what it can draw, and because
+ * Apex validates `ref_name` not at all — a typo saves 200 and renders nothing.
+ *
+ * `refName` is the single authorable spelling and must match what the renderer
+ * dispatches on; every live band today uses the spaced singular form (`team member`,
+ * `focus area`), never the Apex archetype slug. `aliases` are the other spellings a
+ * renderer must keep READING for bands already published, which are not offered for
+ * authoring. `itemCount: 'none'` means the source has no meaningful count control —
+ * on one site that field is a mode switch rather than a limit.
+ */
+export interface CollectionSource {
+	refName: string;
+	label: string;
+	defaultCount: number;
+	aliases?: readonly string[];
+	/**
+	 * Whether this source takes a count at all. REQUIRED: the screens read an absent
+	 * value as "no control" while the draft mutation read it as "counts are fine", and
+	 * a disagreement like that surfaces on whichever site adopts the kit next.
+	 */
+	itemCount: 'count' | 'none';
+	/**
+	 * The smallest count this source accepts, when it accepts one.
+	 *
+	 * The sites genuinely differ: one loader reads `item_count || default`, so a stored
+	 * 0 silently becomes the default and a "0" an editor typed does something other
+	 * than what it says — that site sets `minCount: 1`. On the other, 0 is a real value
+	 * meaning "all of them".
+	 */
+	minCount?: number;
+	/**
+	 * One sentence for the editor, shown where the source is chosen.
+	 *
+	 * NOT `description`: `cms_page_block_auto_collections` has a real `description`
+	 * jsonb column, permitted for write. A site wiring `blockable.description =
+	 * source.description` would put this editor sentence into that column on the live
+	 * record. Different name, different thing.
+	 */
+	hint?: string;
 }
 
 /** One section on a page. */
