@@ -165,6 +165,46 @@ function makeClient(overrides = {}) {
 }
 
 describe('page meta description — its own save leg', () => {
+	/** save-page.js:103 must name the field whose missing row stopped this SEO save. */
+	it('names a missing meta title row without mentioning description', async () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		setPageMeta(draft, 'title', 'M');
+		const client = makeClient({
+			results: { seo: () => ({ ok: false, status: 409, error: 'missing meta row' }) }
+		});
+		const result = await savePage(draft, client);
+		assert.match(result.message, /meta title/);
+		assert.doesNotMatch(result.message, /meta description/);
+	});
+
+	/** save-page.js:103 must list both names when a multi-field SEO save fails. */
+	it('names title and keywords in a combined missing-row refusal', async () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		setPageMeta(draft, 'title', 'M');
+		setPageMeta(draft, 'keywords', 'k');
+		const client = makeClient({
+			results: { seo: () => ({ ok: false, status: 409, error: 'missing meta row' }) }
+		});
+		const result = await savePage(draft, client);
+		assert.match(result.message, /meta title/);
+		assert.match(result.message, /meta keywords/);
+		assert.doesNotMatch(result.message, /meta description/);
+	});
+
+	/** update-page-seo.ts:17-23 has per-name caps, so a 400 message must name only sent caps. */
+	it('reports only the sent title and keywords limits', async () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		setPageMeta(draft, 'title', 'M');
+		setPageMeta(draft, 'keywords', 'k');
+		const client = makeClient({
+			results: { seo: () => ({ ok: false, status: 400, error: 'invalid body' }) }
+		});
+		const result = await savePage(draft, client);
+		assert.match(result.message, /300 characters/);
+		assert.match(result.message, /500 characters/);
+		assert.doesNotMatch(result.message, /1,000 characters/);
+	});
+
 	/**
 	 * Phase 4A §1.2: isDirty alone once enabled Save while the structure gate
 	 * skipped the SEO-only write, then reconciled away the editor's change.
