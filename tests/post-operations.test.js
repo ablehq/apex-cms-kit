@@ -625,6 +625,26 @@ describe('SEO and the cover — written by id, never appended', () => {
 			{ id: uuid(3), name: 'title', group: 'web', value_type: 'string', value: 'T' }
 		]);
 	});
+	/**
+	 * kit#12 review (Isaac, minor): a nameless `web` row got survivor
+	 * `pickMetaRow(rows, '')`, always null, so EVERY nameless id-bearing row was
+	 * destroyed. The pre-#12 builder kept the first and culled only the rest.
+	 */
+	it('keeps the first nameless web row and destroys only its duplicates', () => {
+		const v = view({
+			meta_properties: [
+				{ id: uuid(1), group: 'web', value: 'first' },
+				{ id: uuid(2), group: 'web', value: 'second' },
+				{ id: uuid(3), name: '', group: 'web', value: 'third' },
+				{ id: uuid(4), name: 'title', group: 'web', value: 'M' }
+			]
+		});
+		assert.deepEqual(metaAttributes(v, { title: 'T' }), [
+			{ id: uuid(2), _destroy: true },
+			{ id: uuid(3), _destroy: true },
+			{ id: uuid(4), name: 'title', group: 'web', value_type: 'string', value: 'T' }
+		]);
+	});
 	it('writes SEO by id, only for the names that changed, and never invents a row', () => {
 		const attributes = metaAttributes(view(), { title: 'New' });
 		assert.deepEqual(attributes, [

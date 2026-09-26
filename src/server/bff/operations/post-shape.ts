@@ -365,7 +365,11 @@ export function metaAttributes(
 		const name = cleanString(row.name);
 		const id = cleanString(row.id);
 		if (!id) continue;
-		if (!survivors.has(name)) survivors.set(name, pickMetaRow(rows, name, { requireId: true }));
+		// A nameless row has no visible value to protect, so the first id-bearing one
+		// survives as it did before `pickMetaRow` (kit#12 review): `pickMetaRow(rows, '')`
+		// matches only a string name, and a null survivor destroyed every such row.
+		if (!survivors.has(name))
+			survivors.set(name, (name && pickMetaRow(rows, name, { requireId: true })) || row);
 		if (row !== survivors.get(name)) {
 			// Preserve the row readMeta shows, even if a blank row came first.
 			//
