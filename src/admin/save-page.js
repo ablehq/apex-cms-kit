@@ -109,8 +109,19 @@ function messageFor(stage, result, names = []) {
 			const caps = names
 				.map((name) => `${limits[name]} characters or fewer for meta ${name}`)
 				.join(' and ');
-			if (result?.error === 'missing meta row')
-				return `This page has no stored row for ${labels}. Your field, row and layout changes were saved, but ${labels} ${single ? 'was' : 'were'} not. Clear the ${labels} ${single ? 'field' : 'fields'}, then Save or Publish again.`;
+			if (result?.error === 'missing meta row') {
+				// The route names the rowless names (`update-page-seo.ts`). Clear ONLY
+				// those: clearing a field that has a row would write '' over its value on
+				// the retry. The whole request was refused, so every sent name is unsaved.
+				const reported = Array.isArray(result.missing)
+					? names.filter((name) => result.missing.includes(name))
+					: [];
+				const clear = (reported.length ? reported : names)
+					.map((name) => `meta ${name}`)
+					.join(' and ');
+				const clearOne = (reported.length || names.length) === 1;
+				return `This page has no stored row for ${clear}. Your field, row and layout changes were saved, but ${labels} ${single ? 'was' : 'were'} not. Clear the ${clear} ${clearOne ? 'field' : 'fields'}, then Save or Publish again.`;
+			}
 			if (status === 400 && result?.error === 'invalid body')
 				return `${sentenceLabels} could not be accepted. Your field, row and layout changes were saved. Use ${caps} and Save again.`;
 			return status === 422

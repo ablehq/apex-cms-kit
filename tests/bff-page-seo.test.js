@@ -120,6 +120,17 @@ describe('page SEO write boundary', () => {
 		assert.equal(calls.filter(([name]) => name === 'updatePageStructure').length, 0);
 	});
 
+	/**
+	 * kit#12 review (Isaac): the 409 names the rowless names, so the editor is
+	 * told to clear only those. Here the description has a row and title does not.
+	 */
+	it('names only the rowless names in the missing-row refusal', async () => {
+		const { response, calls } = await run(page(), { meta: { title: 'M', description: 'After' } });
+		assert.equal(response.status, 409);
+		assert.deepEqual(await response.json(), { missing: ['title'], error: 'missing meta row' });
+		assert.equal(calls.filter(([name]) => name === 'updatePageStructure').length, 0);
+	});
+
 	/** update-post.ts:68-73 sets the shared SEO ceilings; browser input cannot bypass them. */
 	it('refuses keywords over 500 characters before Apex', async () => {
 		const { response, calls } = await run(page(), { meta: { keywords: 'x'.repeat(501) } });

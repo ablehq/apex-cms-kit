@@ -64,8 +64,19 @@ export async function handleUpdatePageSeo(
 	// Refuse the whole request before writing so no field appears falsely saved.
 	const names = Object.keys(parsed.data.meta);
 	const missing = names.filter((name) => !attributes.some((row) => row.name === name));
+	// `missing` names only the refused names, so the editor is told to clear those
+	// alone: clearing a field that HAS a row would write '' over its stored value.
 	if (missing.length)
-		return rejectMutation(ctx, actor, 409, 'missing meta row', `missing ${missing.join(', ')} row`);
+		return rejectMutation(
+			ctx,
+			actor,
+			409,
+			'missing meta row',
+			`missing ${missing.join(', ')} row`,
+			{
+				missing
+			}
+		);
 	const response = attributes.length
 		? await guard.apex.updatePageStructure(pageId, { meta_properties_attributes: attributes })
 		: { ok: true, status: 200, body: current.body };

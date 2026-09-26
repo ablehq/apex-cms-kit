@@ -191,6 +191,28 @@ describe('page meta description — its own save leg', () => {
 		assert.doesNotMatch(result.message, /meta description/);
 	});
 
+	/**
+	 * kit#12 review (Isaac): with a description row and no title row, editing both
+	 * used to say "Clear the meta title and meta description fields" — and clearing
+	 * the description would write '' over it on the retry. The route now names the
+	 * rowless names; the message asks to clear those alone.
+	 */
+	it('asks to clear only the names the route reports missing', async () => {
+		const draft = createDraft(samplePage(), 'baseline-v');
+		setPageMeta(draft, 'title', 'M');
+		setPageMeta(draft, 'description', 'After');
+		const client = makeClient({
+			results: {
+				seo: () => ({ ok: false, status: 409, error: 'missing meta row', missing: ['title'] })
+			}
+		});
+		const result = await savePage(draft, client);
+		assert.equal(
+			result.message,
+			'This page has no stored row for meta title. Your field, row and layout changes were saved, but meta title and meta description were not. Clear the meta title field, then Save or Publish again.'
+		);
+	});
+
 	/** update-page-seo.ts:17-27 has per-name caps, so a 400 message must name only sent caps. */
 	it('reports only the sent title and keywords limits', async () => {
 		const draft = createDraft(samplePage(), 'baseline-v');
