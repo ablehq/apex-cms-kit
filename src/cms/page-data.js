@@ -20,6 +20,7 @@
  */
 
 import { plainTextForAttribute, sanitizeRichText } from '../sanitize/html.js';
+import { pickMetaRow } from './meta-row.js';
 import { isReservedSlug, normalizeSlugPath } from './page-slug-validation.js';
 import { RESERVED_SLUG_PREFIX } from './slug.js';
 
@@ -212,9 +213,18 @@ export function projectBlocks(page, media) {
 export function cmsPageMeta(page, options = {}) {
 	const record = /** @type {Record<string, any>} */ (page ?? {});
 	const properties = Array.isArray(record.meta_properties) ? record.meta_properties : [];
-	/** @param {string} name */
+	/**
+	 * The row the admin shows (`pickMetaRow`: first non-blank `web` row), so a
+	 * blank-first duplicate renders the value the editor sees, not the fallback.
+	 * A page with no `web` row by that name keeps the old first-by-name read, so
+	 * records without a `group` render exactly as before.
+	 *
+	 * @param {string} name
+	 */
 	const value = (name) => {
-		const found = properties.find((property) => property?.name === name)?.value;
+		const row =
+			pickMetaRow(properties, name) ?? properties.find((property) => property?.name === name);
+		const found = row?.value;
 		return typeof found === 'string' ? found.trim() : '';
 	};
 

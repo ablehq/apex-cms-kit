@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { before, describe, it } from 'node:test';
 
 import {
+	cmsPageMeta,
 	isCmsPageRoutable,
 	projectFields,
 	routableCmsPages,
@@ -165,5 +166,62 @@ describe('toAnchorId — an editor string becoming a DOM id', () => {
 
 	it('is bounded, so one field cannot mint an unbounded id', () => {
 		assert.equal(toAnchorId('a'.repeat(200)).length, 64);
+	});
+});
+
+/**
+ * kit#12 review (Isaac): the public reader must pick the row the admin shows.
+ * `pickMetaRow` takes the first non-blank `web` row; the old `find` took the
+ * first row by name, so a blank-first duplicate rendered `page.title` on the
+ * site while the admin showed the second row's value.
+ */
+describe('cmsPageMeta — the same meta row the admin edits', () => {
+	it('renders the non-blank row of a blank-first web duplicate', () => {
+		const page = {
+			title: 'Page title',
+			meta_properties: [
+				{ id: 'a', group: 'web', name: 'title', value: '' },
+				{ id: 'b', group: 'web', name: 'title', value: 'Firm X' },
+				{ id: 'c', group: 'web', name: 'description', value: '  ' },
+				{ id: 'd', group: 'web', name: 'description', value: 'Firm X does law.' }
+			]
+		};
+		assert.deepEqual(cmsPageMeta(page), { title: 'Firm X', description: 'Firm X does law.' });
+	});
+
+	it('prefers the web row over another group of the same name', () => {
+		const page = {
+			title: 'Page title',
+			meta_properties: [
+				{ id: 's', group: 'social', name: 'title', value: 'Wrong group' },
+				{ id: 'w', group: 'web', name: 'title', value: 'Right group' }
+			]
+		};
+		assert.equal(cmsPageMeta(page).title, 'Right group');
+	});
+
+	it('keeps the single-row and group-less reads unchanged', () => {
+		const single = {
+			title: 'Page title',
+			summary: 'Summary',
+			meta_properties: [{ id: 'a', group: 'web', name: 'title', value: ' Meta ' }]
+		};
+		assert.deepEqual(cmsPageMeta(single), { title: 'Meta', description: 'Summary' });
+		const groupless = {
+			title: 'Page title',
+			meta_properties: [
+				{ name: 'title', value: 'Legacy' },
+				{ name: 'description', value: 'Legacy description' }
+			]
+		};
+		assert.deepEqual(cmsPageMeta(groupless), {
+			title: 'Legacy',
+			description: 'Legacy description'
+		});
+		const blank = {
+			title: 'Page title',
+			meta_properties: [{ id: 'a', group: 'web', name: 'title', value: '' }]
+		};
+		assert.equal(cmsPageMeta(blank, { siteTitle: 'Site' }).title, 'Page title');
 	});
 });
