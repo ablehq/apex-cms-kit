@@ -94,3 +94,9 @@ extension) — `list-posts.ts`, `objs.js`. Vite 6.2's package `exports` matcher 
 bare import of such a subpath as a hit for this package's `./*.ts` / `./*.js` patterns
 and looks for a file that does not exist, so the consumer's build fails while Node
 resolves it fine (measured 2026-09-05). `tests/module-names.test.js` enforces the rule.
+
+### Workflow dispatch and Node snapshot files
+
+`server/github/workflow-dispatch` exports `dispatchWorkflow(config, input)`. Configuration is `{ repo, workflow, ref, userAgent }`; input carries the token, actor, optional reason/allowEmpty/dryRun and injectable fetch. It makes one GitHub request and returns run details or a workflow-list fallback. Callers retain authentication, missing-token policy, auditing, response mapping and background-task ownership.
+
+`server/content/snapshot-file.node` exports `fileContentStore`, `snapshotCollections`, `snapshotPath`, `DEFAULT_SNAPSHOT_PATH` and `SnapshotFileError`. This is a Node-only build/CLI adapter, not a browser export. Import it lazily behind the site's existing `building` branch; a Worker build can retain its module in the registry, so verify runtime startup with the site's compatibility flags. Only ENOENT means an absent file. The underlying reader retains its memo and JSON parsing behavior; it does not validate the full snapshot envelope shape.
