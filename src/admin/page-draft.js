@@ -82,27 +82,20 @@ function findBlock(draft, blockId) {
 	return draft.page.blocks.find((block) => block.id === blockId) || null;
 }
 
-/**
- * The temp-id fix (plan M1): a block the editor just added has a temp id and NO
- * server-side entity, so its fields must not be editable until a structure save has
- * minted real ids. Anything with a temp block id or temp entity id is locked.
- *
+/** Local fields are editable when an owned entity exists, including temp seeds.
  * @param {AdminPageBlock | null | undefined} block
  * @returns {boolean}
  */
 export function canEditFields(block) {
 	if (!block) return false;
-	if (isTempId(`${block.id}`)) return false;
 	const entity = block.blockable?.entity;
-	if (entity && isTempId(`${entity.id}`)) return false;
+	if (!entity?.id) return false;
 	return true;
 }
 
 /**
- * Set one field value on a block's backing entity. Refuses (returns false) while the
- * block is still a temp — the caller must persist the structure to get a real id
- * first. On success it marks exactly that entity dirty, so `savePage()` PATCHes only
- * the entities that actually changed.
+ * Set a backing entity value locally. Stored entities become dirty field patches;
+ * temporary entities stay structure seeds until verified IDs are returned.
  *
  * @param {AdminPageDraft} draft
  * @param {string | null | undefined} blockId a block that is not there is a no-op
@@ -117,7 +110,8 @@ export function setField(draft, blockId, fieldName, value) {
 	if (!entity) return false;
 	if (!entity.fields_data || typeof entity.fields_data !== 'object') entity.fields_data = {};
 	entity.fields_data[fieldName] = value;
-	draft.dirtyEntityIds.add(entity.id);
+	if (isTempId(entity.id)) draft.structureDirty = true;
+	else draft.dirtyEntityIds.add(entity.id);
 	return true;
 }
 
@@ -137,14 +131,15 @@ export function setChildField(draft, blockId, childId, fieldName, value) {
 	const children = block.blockable?.child_template_instances;
 	if (!Array.isArray(children)) return false;
 	const child = children.find((item) => item.id === childId);
-	if (!child || isTempId(`${child.id}`) || !child.entity || isTempId(`${child.entity.id}`)) {
+	if (!child || !child.entity) {
 		return false;
 	}
 	if (!child.entity.fields_data || typeof child.entity.fields_data !== 'object') {
 		child.entity.fields_data = {};
 	}
 	child.entity.fields_data[fieldName] = value;
-	draft.dirtyEntityIds.add(child.entity.id);
+	if (isTempId(child.entity.id)) draft.structureDirty = true;
+	else draft.dirtyEntityIds.add(child.entity.id);
 	return true;
 }
 
@@ -292,6 +287,7 @@ export function removeBlock(draft, blockId) {
 	const index = draft.page.blocks.findIndex((block) => block.id === blockId);
 	if (index === -1) return;
 	const [removed] = draft.page.blocks.splice(index, 1);
+	forgetOwnedFields(draft, removed?.blockable);
 	if (removed && !isTempId(`${removed.id}`)) draft.deletedBlockIds.push(removed.id);
 	applyPositions(draft);
 	draft.structureDirty = true;
@@ -427,4 +423,123 @@ export function setPageMeta(draft, name, value) {
 	if (value === pageMetaValue(draft.page.meta_properties, name)) delete draft.metaEdits[name];
 	else draft.metaEdits[name] = value;
 	return true;
+}
+
+/** Owned-template operations take site policy as data; no site slugs live in the kit.
+ * @typedef {{templateId:string, entityTypeId:string, fields:string[], anchors:string[], children:string[]}} OwnedTemplate
+ * @typedef {Record<string, OwnedTemplate>} OwnedTemplates
+ */
+function forgetOwnedFields(draft, instance) {
+	if (instance?.entity?.id) draft.dirtyEntityIds.delete(instance.entity.id);
+	for (const child of instance?.child_template_instances ?? []) forgetOwnedFields(draft, child);
+}
+function ownedSpec(instance, registry, depth = 0) {
+	const slug = instance?.page_block_template?.slug;
+	const spec = registry[slug];
+	if (!spec?.templateId || !spec.entityTypeId || depth > 1)
+		throw new Error('This template is unavailable or has unsupported nested items.');
+	for (const child of instance.child_template_instances ?? []) {
+		if (!spec.children.includes(child?.page_block_template?.slug))
+			throw new Error('This child template is unavailable.');
+		ownedSpec(child, registry, depth + 1);
+	}
+	return spec;
+}
+function ownedInstance(slug, registry, source) {
+	const spec = registry[slug];
+	if (!spec?.templateId || !spec.entityTypeId) throw new Error('This template is not configured.');
+	const fields = {};
+	for (const name of spec.fields)
+		if (Object.hasOwn(source?.entity?.fields_data ?? {}, name))
+			fields[name] = clone(source.entity.fields_data[name]);
+	for (const name of spec.anchors) if (Object.hasOwn(fields, name)) fields[name] = '';
+	return {
+		id: nextTempId('inst'),
+		page_block_template_id: spec.templateId,
+		page_block_template: { id: spec.templateId, slug },
+		entity: { id: nextTempId('entity'), entity_type_id: spec.entityTypeId, fields_data: fields },
+		child_template_instances: []
+	};
+}
+function ownedParent(draft, blockId, registry) {
+	const block = findBlock(draft, blockId);
+	if (!block || block.blockable_type !== 'Cms::PageBlock::TemplateInstance')
+		throw new Error('Section unavailable.');
+	ownedSpec(block.blockable, registry);
+	return block.blockable;
+}
+function childPositions(parent) {
+	parent.child_template_instances.forEach((child, index) => {
+		child.position = index;
+	});
+}
+/** @param {AdminPageDraft} draft @param {string} blockId @param {string} slug @param {OwnedTemplates} registry */
+export function addOwnedChild(draft, blockId, slug, registry) {
+	const parent = ownedParent(draft, blockId, registry);
+	if (!registry[parent.page_block_template.slug].children.includes(slug))
+		throw new Error('This child template is unavailable.');
+	const child = ownedInstance(slug, registry);
+	parent.child_template_instances ??= [];
+	parent.child_template_instances.push(child);
+	childPositions(parent);
+	draft.structureDirty = true;
+	return child;
+}
+/** @param {AdminPageDraft} draft @param {string} blockId @param {string} childId @param {OwnedTemplates} registry */
+export function duplicateOwnedChild(draft, blockId, childId, registry) {
+	const parent = ownedParent(draft, blockId, registry);
+	const index = parent.child_template_instances.findIndex((child) => child.id === childId);
+	if (index < 0) throw new Error('Item unavailable.');
+	const source = parent.child_template_instances[index];
+	const child = ownedInstance(source.page_block_template.slug, registry, source);
+	parent.child_template_instances.splice(index + 1, 0, child);
+	childPositions(parent);
+	draft.structureDirty = true;
+	return child;
+}
+/** @param {AdminPageDraft} draft @param {string} blockId @param {string} childId @param {OwnedTemplates} registry */
+export function removeOwnedChild(draft, blockId, childId, registry) {
+	const parent = ownedParent(draft, blockId, registry);
+	const index = parent.child_template_instances.findIndex((child) => child.id === childId);
+	if (index < 0) return;
+	const [child] = parent.child_template_instances.splice(index, 1);
+	forgetOwnedFields(draft, child);
+	if (!isTempId(child.id)) {
+		parent.deleted_child_template_instance_ids ??= [];
+		parent.deleted_child_template_instance_ids.push(child.id);
+	}
+	childPositions(parent);
+	draft.structureDirty = true;
+}
+/** @param {AdminPageDraft} draft @param {string} blockId @param {string} childId @param {number} offset @param {OwnedTemplates} registry */
+export function moveOwnedChild(draft, blockId, childId, offset, registry) {
+	const parent = ownedParent(draft, blockId, registry);
+	const index = parent.child_template_instances.findIndex((child) => child.id === childId);
+	const target = index + offset;
+	if (index < 0 || target < 0 || target >= parent.child_template_instances.length) return;
+	const [child] = parent.child_template_instances.splice(index, 1);
+	parent.child_template_instances.splice(target, 0, child);
+	childPositions(parent);
+	draft.structureDirty = true;
+}
+/** @param {AdminPageDraft} draft @param {string} blockId @param {OwnedTemplates} registry */
+export function duplicateOwnedSection(draft, blockId, registry) {
+	const source = ownedParent(draft, blockId, registry);
+	const original = findBlock(draft, blockId);
+	const root = ownedInstance(source.page_block_template.slug, registry, source);
+	root.child_template_instances = (source.child_template_instances ?? []).map((child) =>
+		ownedInstance(child.page_block_template.slug, registry, child)
+	);
+	childPositions(root);
+	const block = {
+		id: nextTempId('block'),
+		label: `${original.label || source.page_block_template.slug} copy`,
+		position: 0,
+		blockable_type: 'Cms::PageBlock::TemplateInstance',
+		blockable: root
+	};
+	draft.page.blocks.splice(draft.page.blocks.indexOf(original) + 1, 0, block);
+	applyPositions(draft);
+	draft.structureDirty = true;
+	return block;
 }

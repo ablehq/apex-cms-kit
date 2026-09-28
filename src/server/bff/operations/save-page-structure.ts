@@ -1,3 +1,4 @@
+import { validPageTreeOwnership } from '../page-tree-ownership';
 import { unwrapArchetypeRecord } from '../archetype-record';
 import { z } from 'zod';
 import { appendAuditEntry } from '../audit';
@@ -438,6 +439,20 @@ export async function handleSavePageStructure(
 	}
 	const currentPage = unwrapArchetypeRecord(current.body);
 	if (!currentPage) return noStoreJson({ error: 'upstream error' }, 502);
+	if (
+		!validPageTreeOwnership(
+			currentPage as Record<string, unknown>,
+			parsed.data.blocks_attributes ?? []
+		)
+	) {
+		return rejectMutation(
+			ctx,
+			validMeta,
+			400,
+			'block not on this page',
+			'invalid owned tree correspondence'
+		);
+	}
 	const owned = collectPageIds(currentPage);
 	owned.add(idResult.data);
 	const foreign = findForeignId(parsed.data, owned);

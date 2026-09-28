@@ -102,8 +102,7 @@ function honestBody() {
 					id: A.inst,
 					entity_attributes: { id: A.entity },
 					child_template_instances_attributes: [
-						{ id: A.child, entity_attributes: { id: A.childEntity } },
-						{ id: A.child, _destroy: true }
+						{ id: A.child, entity_attributes: { id: A.childEntity } }
 					],
 					parent_template_instance_id: null,
 					group_member_template_instance_ids: [A.child]
@@ -316,7 +315,9 @@ describe('PATCH /pages/:id/structure — only this page’s rows', () => {
 
 	it('refuses even owned metadata at the structure boundary before writes', async () => {
 		const body = honestBody();
-		body.meta_properties_attributes = [{ id: A.meta, name: 'title', group: 'web', value: 'Bypass' }];
+		body.meta_properties_attributes = [
+			{ id: A.meta, name: 'title', group: 'web', value: 'Bypass' }
+		];
 		const { res, patches } = await save(body);
 		assert.equal(res.status, 400);
 		assert.deepEqual(await res.json(), { error: 'invalid body' });
@@ -358,4 +359,78 @@ describe('PATCH /pages/:id/structure — only this page’s rows', () => {
 			['getPage']
 		);
 	});
+});
+
+it('valid-in-page wrong entity correspondence rejects and audits before any Apex mutation', async () => {
+	const calls = [];
+	const audit = [];
+	const ctx = ctxWith(calls);
+	ctx.db = {
+		prepare() {
+			return {
+				bind(...values) {
+					audit.push(values);
+					return {
+						async run() {
+							return { success: true };
+						}
+					};
+				}
+			};
+		}
+	};
+	const session = await signIn(ctx);
+	const body = honestBody();
+	body.blocks_attributes[2].blockable_attributes.entity_attributes.id = A.childEntity;
+	assert.equal(
+		findForeignId(body, collectPageIds(pageA())),
+		null,
+		'all IDs belong to this page; contextual pairing must refuse'
+	);
+	const response = await handleSavePageStructure(patch(session, body), ctx, { pageId: PAGE_A });
+	assert.equal(response.status, 400);
+	assert.deepEqual(await response.json(), { error: 'block not on this page' });
+	assert.deepEqual(
+		calls.map(([name]) => name),
+		['getPage']
+	);
+	assert.equal(audit.length, 1);
+	assert.equal(audit[0][5], 'pages.structure.save');
+	assert.equal(audit[0][11], 'rejected');
+	assert.equal(JSON.parse(audit[0][12]).reason, 'invalid owned tree correspondence');
+});
+
+it('string false destroy cannot bypass contextual ownership or reach Apex', async () => {
+	const calls = [];
+	const audit = [];
+	const ctx = ctxWith(calls);
+	ctx.db = {
+		prepare() {
+			return {
+				bind(...values) {
+					audit.push(values);
+					return {
+						async run() {
+							return { success: true };
+						}
+					};
+				}
+			};
+		}
+	};
+	const session = await signIn(ctx);
+	const body = honestBody();
+	const root = body.blocks_attributes[2];
+	root._destroy = 'false';
+	root.blockable_id = A.child;
+	root.blockable_attributes.entity_attributes.id = A.childEntity;
+	assert.equal(findForeignId(body, collectPageIds(pageA())), null);
+	const response = await handleSavePageStructure(patch(session, body), ctx, { pageId: PAGE_A });
+	assert.equal(response.status, 400);
+	assert.deepEqual(
+		calls.map(([name]) => name),
+		['getPage']
+	);
+	assert.equal(audit.length, 1);
+	assert.equal(JSON.parse(audit[0][12]).reason, 'invalid owned tree correspondence');
 });

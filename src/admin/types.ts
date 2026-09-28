@@ -68,6 +68,11 @@ export interface AdminPageBlockTemplate {
 /** A repeatable item inside a section (Apex: a child template instance). */
 export interface AdminChildTemplateInstance {
 	id: string;
+	position?: number | null;
+	parent_template_instance_id?: string | null;
+	page_block_template_id?: string;
+	child_template_instances?: AdminChildTemplateInstance[];
+	deleted_child_template_instance_ids?: string[];
 	page_block_template?: AdminPageBlockTemplate | null;
 	entity?: AdminEntity | null;
 }
@@ -75,6 +80,7 @@ export interface AdminChildTemplateInstance {
 /** What a page block points at. Only the template-instance case is authored here. */
 export interface AdminBlockable {
 	id: string;
+	deleted_child_template_instance_ids?: string[];
 	kind?: string | null;
 	page_block_template_id?: string;
 	page_block_template?: AdminPageBlockTemplate | null;

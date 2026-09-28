@@ -348,8 +348,8 @@ describe('a duplicated section — the fields the editor seeded on a temp entity
 		assert.equal((await savePage(draft, client)).ok, true);
 		assert.deepEqual(
 			client.calls.map((c) => c[0]),
-			['readVersion', 'savePageStructure'],
-			"nothing to copy: no PATCH, and the structure save's page is baseline enough"
+			['readVersion', 'savePageStructure', 'getPage'],
+			'blank newly minted nodes still require final readback'
 		);
 	});
 
@@ -482,7 +482,7 @@ describe('page-draft local model', () => {
 		assert.equal(isDirty(draft), false);
 	});
 
-	it('the temp-id rule: a new block is not field-editable until it has a real id', () => {
+	it('temp fields are local seeds until a verified structure save', () => {
 		const draft = createDraft(samplePage(), 'baseline-v');
 		const block = addTemplateBlock(draft, {
 			templateId: 'tpl-prose',
@@ -491,14 +491,14 @@ describe('page-draft local model', () => {
 			entityTypeId: ET_PROSE,
 			fieldsData: { body: { editor: 'tiptap', html: '', content: {} } }
 		});
-		assert.equal(canEditFields(block), false);
-		// setField refuses while the block is a temp.
+		assert.equal(canEditFields(block), true);
+		// setField stores local seed values, without scheduling a temp entity PATCH.
 		const accepted = setField(draft, block.id, 'body', {
 			editor: 'tiptap',
 			html: '<p>x</p>',
 			content: {}
 		});
-		assert.equal(accepted, false);
+		assert.equal(accepted, true);
 		assert.equal(draft.dirtyEntityIds.size, 0);
 		// structure is dirty though — the add needs to be persisted to mint real ids.
 		assert.equal(draft.structureDirty, true);
@@ -523,7 +523,7 @@ describe('page-draft local model', () => {
 				blockable_type: 'Cms::PageBlock::TemplateInstance',
 				blockable: {
 					id: 'inst-new-real',
-					page_block_template: { slug: 'glc-prose' },
+					page_block_template: { id: 'tpl-prose', slug: 'glc-prose' },
 					entity: { id: 'entity-new-real', entity_type_id: ET_PROSE, fields_data: { body: '' } },
 					child_template_instances: []
 				}

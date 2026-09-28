@@ -14,36 +14,23 @@ function isTempId(id) {
 }
 
 function serializeTemplateInstance(instance) {
-	const templateInstance = structuredClone(instance || {});
-	if (isTempId(templateInstance.id)) delete templateInstance.id;
-	if (templateInstance.entity && isTempId(templateInstance.entity.id)) {
-		delete templateInstance.entity.id;
+	const payload = {};
+	if (instance.id && !isTempId(instance.id)) payload.id = instance.id;
+	const templateId = instance.page_block_template_id || instance.page_block_template?.id;
+	if (templateId) payload.page_block_template_id = templateId;
+	if (Number.isInteger(instance.position)) payload.position = instance.position;
+	const entity = instance.entity;
+	if (entity) {
+		payload.entity_attributes = { entity_type_id: entity.entity_type_id };
+		if (entity.id && !isTempId(entity.id)) payload.entity_attributes.id = entity.id;
 	}
-	if (templateInstance.entity) {
-		templateInstance.entity_attributes = templateInstance.entity;
-		delete templateInstance.entity;
-	}
-	// The hydrated read carries the template object; the write only needs its id.
-	if (templateInstance.page_block_template) {
-		if (!templateInstance.page_block_template_id && templateInstance.page_block_template.id) {
-			templateInstance.page_block_template_id = templateInstance.page_block_template.id;
-		}
-		delete templateInstance.page_block_template;
-	}
-	if (Array.isArray(templateInstance.child_template_instances)) {
-		const deletedChildren = Array.isArray(templateInstance.deleted_child_template_instance_ids)
-			? templateInstance.deleted_child_template_instance_ids
-					.filter((id) => id && !isTempId(`${id}`))
-					.map((id) => ({ id, _destroy: true }))
-			: [];
-		templateInstance.child_template_instances_attributes = [
-			...templateInstance.child_template_instances.map((child) => serializeTemplateInstance(child)),
-			...deletedChildren
-		];
-		delete templateInstance.child_template_instances;
-	}
-	delete templateInstance.deleted_child_template_instance_ids;
-	return templateInstance;
+	payload.child_template_instances_attributes = (instance.child_template_instances ?? []).map(
+		serializeTemplateInstance
+	);
+	for (const id of instance.deleted_child_template_instance_ids ?? [])
+		if (id && !isTempId(id))
+			payload.child_template_instances_attributes.push({ id, _destroy: true });
+	return payload;
 }
 
 export function serializePageBlockForSave(block, index) {
