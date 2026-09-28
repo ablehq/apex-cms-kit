@@ -23,6 +23,7 @@ export const updatePageSeoBodySchema = z
 				keywords: z.string().max(500).optional()
 			})
 			.strict()
+			.refine((meta) => Object.keys(meta).length > 0)
 	})
 	.strict();
 
@@ -86,9 +87,9 @@ export async function handleUpdatePageSeo(
 		}
 	}
 
-	const response = attributes.length
-		? await guard.apex.updatePageStructure(pageId, { meta_properties_attributes: attributes })
-		: { ok: true, status: 200, body: current.body };
+	const response = await guard.apex.updatePageStructure(pageId, {
+		meta_properties_attributes: attributes
+	});
 	await auditOutcome(ctx, meta, guard.actor, {
 		outcome: response.ok ? 'accepted' : 'apex_error',
 		pageId,

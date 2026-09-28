@@ -159,6 +159,7 @@ describe('page-only SEO boundary', () => {
 			null,
 			[],
 			{ title: 'wrong' },
+			{ meta: {} },
 			{ meta: { title: null } },
 			{ meta: { title: 'x'.repeat(301) } },
 			{ meta: { description: 'x'.repeat(1001) } },
