@@ -90,6 +90,35 @@ function seededNewBlockFields(draft) {
 export async function savePage(draft, client, options = {}) {
 	const { statusEvent } = options;
 	const pageId = draft.pageId;
+	let wrote = false;
+	const failure = (stage, result = {}) => {
+		if (wrote) draft.recoveryRequired = true;
+		return {
+			ok: false,
+			stage,
+			status: result.status,
+			recoveryRequired: Boolean(draft.recoveryRequired || wrote),
+			message:
+				draft.recoveryRequired || wrote
+					? 'Some changes may already be saved. Reload the latest page before saving again; keep your unsaved values for recovery.'
+					: stage === 'seo'
+						? 'SEO could not be saved. Check that each field has a writable metadata row and meets its length limit.'
+						: messageFor(stage, result)
+		};
+	};
+	if (draft.recoveryRequired) return failure('refresh');
+	// Any rejected transport can follow a committed write. Never retry a temp tree blindly.
+	const write = async (operation) => {
+		try {
+			const result = await operation();
+			if (result.ok) wrote = true;
+			else if (wrote || result.status >= 500) draft.recoveryRequired = true;
+			return result;
+		} catch {
+			draft.recoveryRequired = true;
+			return { ok: false };
+		}
+	};
 
 	// 1. Stale guard — compared ONCE, before any write. page.updated_at alone would
 	// miss block-field edits, so this is the composite version (page-version.ts).
@@ -110,13 +139,11 @@ export async function savePage(draft, client, options = {}) {
 	// 2. Dirty entity field PATCHes, in order. Stop on the first failure so the
 	// structure/status writes below are never dispatched after a partial failure.
 	for (const patch of dirtyEntityPatches(draft)) {
-		const res = await client.patchEntityFields(
-			patch.entityTypeId,
-			patch.entityId,
-			patch.fields_data
+		const res = await write(() =>
+			client.patchEntityFields(patch.entityTypeId, patch.entityId, patch.fields_data)
 		);
 		if (!res.ok) {
-			return { ok: false, stage: 'fields', status: res.status, message: messageFor('fields', res) };
+			return failure('fields', res);
 		}
 	}
 
@@ -126,15 +153,8 @@ export async function savePage(draft, client, options = {}) {
 	// Captured BEFORE the structure save: after it, `reconcile` replaces the tree.
 	const seeded = draft.structureDirty ? seededNewBlockFields(draft) : [];
 	if (draft.structureDirty || draft.deletedBlockIds.length > 0) {
-		const res = await client.savePageStructure(pageId, structurePayload(draft));
-		if (!res.ok) {
-			return {
-				ok: false,
-				stage: 'structure',
-				status: res.status,
-				message: messageFor('structure', res)
-			};
-		}
+		const res = await write(() => client.savePageStructure(pageId, structurePayload(draft)));
+		if (!res.ok) return failure('structure', res);
 		freshPage = res.page ?? null;
 		freshVersion = res.version ?? null;
 	}
@@ -150,7 +170,8 @@ export async function savePage(draft, client, options = {}) {
 			try {
 				minted = (await client.getPage(pageId)).page;
 			} catch {
-				return { ok: false, stage: 'new-block-fields', message: messageFor('new-block-fields') };
+				draft.recoveryRequired = true;
+				return failure('new-block-fields');
 			}
 		}
 		const byPosition = [...(Array.isArray(minted?.blocks) ? minted.blocks : [])].sort(
@@ -159,20 +180,23 @@ export async function savePage(draft, client, options = {}) {
 		for (const { position, fields_data } of seeded) {
 			const entity = byPosition[position]?.blockable?.entity;
 			if (!entity?.id || isTempId(`${entity.id}`) || !entity.entity_type_id) {
-				return { ok: false, stage: 'new-block-fields', message: messageFor('new-block-fields') };
+				draft.recoveryRequired = true;
+				return failure('new-block-fields');
 			}
-			const res = await client.patchEntityFields(entity.entity_type_id, entity.id, fields_data);
-			if (!res.ok) {
-				return {
-					ok: false,
-					stage: 'new-block-fields',
-					status: res.status,
-					message: messageFor('new-block-fields', res)
-				};
-			}
+			const res = await write(() =>
+				client.patchEntityFields(entity.entity_type_id, entity.id, fields_data)
+			);
+			if (!res.ok) return failure('new-block-fields', res);
 		}
 		// Those PATCHes moved the composite version; the page the structure save
 		// returned is now behind it. Re-read below so the baseline is honest.
+		freshPage = null;
+	}
+
+	// SEO is independent of page structure and always precedes publication.
+	if (Object.keys(draft.metaEdits ?? {}).length) {
+		const res = await write(() => client.updatePageSeo(pageId, draft.metaEdits));
+		if (!res.ok) return failure('seo', res);
 		freshPage = null;
 	}
 
@@ -180,9 +204,9 @@ export async function savePage(draft, client, options = {}) {
 	// step above returned. A status change invalidates the structure snapshot, so we
 	// force a fresh read below.
 	if (statusEvent) {
-		const res = await client.changePageStatus(pageId, statusEvent);
+		const res = await write(() => client.changePageStatus(pageId, statusEvent));
 		if (!res.ok) {
-			return { ok: false, stage: 'status', status: res.status, message: messageFor('status', res) };
+			return failure('status', res);
 		}
 		freshPage = null;
 	}
@@ -198,6 +222,7 @@ export async function savePage(draft, client, options = {}) {
 		} catch {
 			// The writes succeeded; only the refresh failed. Report success but flag
 			// that the draft may be behind, so the UI can prompt a reload.
+			draft.recoveryRequired = true;
 			return { ok: true, refreshed: false };
 		}
 	}

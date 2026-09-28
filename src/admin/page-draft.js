@@ -1,6 +1,7 @@
 // @ts-nocheck — legacy-mode admin browser module (plan §8, 3a compile-mode (a)).
 // Deliberately untyped JS to sit beside the legacy-compiled admin components; its
 // behavior is covered by tests/admin-save-page.test.js + tests/bff-realapex.test.js.
+import { PAGE_META_NAMES, pageMetaValue, pageMetaProblem } from '../cms/page-meta.js';
 import { isTempId, serializeBlocksForSave } from './block-serialize.js';
 
 /**
@@ -56,7 +57,9 @@ export function createDraft(page, version) {
 		/** True once blocks were reordered / added / removed, or page meta changed. */
 		structureDirty: false,
 		/** Real ids of removed blocks, sent as `{ id, _destroy: true }`. */
-		deletedBlockIds: []
+		deletedBlockIds: [],
+		metaEdits: {},
+		recoveryRequired: false
 	};
 	if (!Array.isArray(draft.page.blocks)) draft.page.blocks = [];
 	sortBlocks(draft);
@@ -315,7 +318,12 @@ export function setPageField(draft, name, value) {
  * @returns {boolean}
  */
 export function isDirty(draft) {
-	return draft.dirtyEntityIds.size > 0 || draft.structureDirty || draft.deletedBlockIds.length > 0;
+	return (
+		draft.dirtyEntityIds.size > 0 ||
+		draft.structureDirty ||
+		draft.deletedBlockIds.length > 0 ||
+		Object.keys(draft.metaEdits ?? {}).length > 0
+	);
 }
 
 /** Collect every entity in the tree, keyed by id, so dirty ones can be found. */
@@ -398,6 +406,25 @@ export function reconcile(draft, serverPage, version) {
 	draft.dirtyEntityIds = new Set();
 	draft.structureDirty = false;
 	draft.deletedBlockIds = [];
+	draft.metaEdits = {};
+	draft.recoveryRequired = false;
 	if (version) draft.baselineVersion = version;
 	draft.pageId = draft.page.id;
+}
+
+/** SEO remains separate from page title/slug/structure.
+ * @param {AdminPageDraft} draft @param {'title' | 'description' | 'keywords'} name @param {string} value
+ * @returns {boolean}
+ */
+export function setPageMeta(draft, name, value) {
+	if (
+		!PAGE_META_NAMES.includes(name) ||
+		typeof value !== 'string' ||
+		pageMetaProblem(draft.page.meta_properties, name)
+	)
+		return false;
+	draft.metaEdits ??= {};
+	if (value === pageMetaValue(draft.page.meta_properties, name)) delete draft.metaEdits[name];
+	else draft.metaEdits[name] = value;
+	return true;
 }

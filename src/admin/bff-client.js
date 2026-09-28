@@ -153,6 +153,9 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 				fields_data: fieldsData
 			});
 		},
+		updatePageSeo(pageId, meta) {
+			return mutate(`/api/admin/pages/${encodeURIComponent(pageId)}/seo`, 'PATCH', { meta });
+		},
 		savePageStructure(pageId, payload) {
 			return mutate(`/api/admin/pages/${pageId}/structure`, 'PATCH', payload);
 		},

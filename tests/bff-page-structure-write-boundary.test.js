@@ -96,8 +96,7 @@ function body(overrides = {}) {
 					}
 				}
 			}
-		],
-		meta_properties_attributes: [{ id: IDS.meta, name: 'title', group: 'web', value: 'A!' }]
+		]
 	};
 }
 
@@ -167,7 +166,7 @@ async function save(sendBody) {
 
 describe('structureValueFields', () => {
 	it('keys every value by its PATH, so a refusal names the block', () => {
-		const values = structureValueFields(body());
+		const values = structureValueFields({ ...body(), meta_properties_attributes: [{ id: IDS.meta, name: 'title', group: 'web', value: 'A!' }] });
 		assert.equal(
 			values['blocks_attributes[0].blockable_attributes.content_html'],
 			'<p>A, edited</p>'
@@ -296,6 +295,6 @@ describe('the structure save runs the write boundary', () => {
 			'clean markup is byte-identical'
 		);
 		assert.equal(sent.title, 'A');
-		assert.equal(sent.meta_properties_attributes[0].value, 'A!');
+		assert.equal('meta_properties_attributes' in sent, false);
 	});
 });

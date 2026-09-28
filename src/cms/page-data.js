@@ -1,3 +1,4 @@
+import { pageMetaValue } from './page-meta.js';
 /**
  * The read model for CMS pages: which pages route, in what order their sections
  * render, and what the renderer is handed.
@@ -207,21 +208,19 @@ export function projectBlocks(page, media) {
 /**
  * @param {unknown} page
  * @param {{ siteTitle?: string }} [options]
- * @returns {{ title: string, description: string }}
+ * @returns {{ title: string, description: string, keywords?: string }}
  */
 export function cmsPageMeta(page, options = {}) {
 	const record = /** @type {Record<string, any>} */ (page ?? {});
 	const properties = Array.isArray(record.meta_properties) ? record.meta_properties : [];
 	/** @param {string} name */
-	const value = (name) => {
-		const found = properties.find((property) => property?.name === name)?.value;
-		return typeof found === 'string' ? found.trim() : '';
-	};
+	const value = (name) => pageMetaValue(properties, name).trim();
 
 	const description = value('description') || (record.summary ?? '');
 	return {
 		title: value('title') || record.title || options.siteTitle || '',
-		description: plainTextForAttribute(typeof description === 'string' ? description : '')
+		description: plainTextForAttribute(typeof description === 'string' ? description : ''),
+		...(value('keywords') ? { keywords: plainTextForAttribute(value('keywords')) } : {})
 	};
 }
 

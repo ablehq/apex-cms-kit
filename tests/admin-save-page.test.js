@@ -370,7 +370,7 @@ describe('a duplicated section — the fields the editor seeded on a temp entity
 		assert.equal(result.ok, false);
 		assert.equal(result.stage, 'new-block-fields');
 		assert.equal(result.status, 422);
-		assert.match(result.message, /The new section was added, but its fields could not be saved/u);
+		assert.match(result.message, /Reload the latest page before saving again/u);
 		assert.ok(!client.calls.some((c) => c[0] === 'changePageStatus'), 'no publish after a failure');
 	});
 });

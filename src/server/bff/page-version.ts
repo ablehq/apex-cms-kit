@@ -43,6 +43,7 @@ interface BlockLike {
 }
 
 interface PageLike {
+	meta_properties?: unknown;
 	id?: unknown;
 	status?: unknown;
 	updated_at?: unknown;
@@ -101,6 +102,17 @@ export function projectPageForVersion(page: PageLike): unknown {
 		id: page?.id ?? null,
 		status: page?.status ?? null,
 		updated_at: page?.updated_at ?? null,
+		meta: (Array.isArray(page?.meta_properties) ? page.meta_properties : [])
+			.filter((row) => row && typeof row === 'object' && !Array.isArray(row))
+			.map((row) => ({
+				id: row.id ?? null,
+				group: row.group ?? null,
+				name: row.name ?? null,
+				value: row.value ?? null
+			}))
+			.sort((a, b) =>
+				JSON.stringify(canonicalize(a)).localeCompare(JSON.stringify(canonicalize(b)))
+			),
 		blocks: projectedBlocks
 	};
 }

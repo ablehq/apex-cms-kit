@@ -41,6 +41,7 @@ export interface RichTextValue {
 
 /** One `meta_properties` entry on a page. The SEO tab shows the `web` group. */
 export interface AdminPageMetaProperty {
+	id?: string | null;
 	name?: string | null;
 	group?: string | null;
 	value?: string | null;
@@ -117,6 +118,8 @@ export interface AdminPageLoad {
 
 /** The local page-draft the editor mutates (`page-draft.js`). */
 export interface AdminPageDraft {
+	recoveryRequired?: boolean;
+	metaEdits: Partial<Record<'title' | 'description' | 'keywords', string>>;
 	pageId: string;
 	baselineVersion: string;
 	page: AdminPage;
@@ -379,6 +382,10 @@ export interface BffClient {
 	 * is the blank-slug one — `save-page.js` names both.
 	 */
 	savePageStructure(pageId: string, payload: unknown): Promise<BffMutationResult>;
+	updatePageSeo(
+		pageId: string,
+		meta: Partial<Record<'title' | 'description' | 'keywords', string>>
+	): Promise<BffMutationResult>;
 	changePageStatus(pageId: string, statusEvent: AdminStatusEvent): Promise<BffMutationResult>;
 	/**
 	 * Named payloads, not `unknown`: the bodies changed shape when the item moved to
@@ -420,4 +427,11 @@ export interface SiteStatus {
 /** What `savePage()` resolves to (`save-page.js`). */
 export type SavePageResult =
 	| { ok: true; refreshed: boolean }
-	| { ok: false; stale?: boolean; stage?: string; status?: number; message: string };
+	| {
+			ok: false;
+			stale?: boolean;
+			recoveryRequired?: boolean;
+			stage?: string;
+			status?: number;
+			message: string;
+	  };

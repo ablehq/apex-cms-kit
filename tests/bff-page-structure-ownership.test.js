@@ -110,8 +110,7 @@ function honestBody() {
 				},
 				_destroy: false
 			}
-		],
-		meta_properties_attributes: [{ id: A.meta, name: 'title', group: 'web', value: 'A!' }]
+		]
 	};
 }
 
@@ -301,13 +300,6 @@ describe('PATCH /pages/:id/structure — only this page’s rows', () => {
 			mutate: (body) => {
 				body.blocks_attributes.push({ id: B.block, _destroy: true });
 			}
-		},
-		{
-			name: "another page's meta property",
-			key: 'id',
-			mutate: (body) => {
-				body.meta_properties_attributes[0].id = B.block;
-			}
 		}
 	];
 
@@ -321,6 +313,15 @@ describe('PATCH /pages/:id/structure — only this page’s rows', () => {
 			assert.equal(patches.length, 0, 'nothing reached Apex');
 		});
 	}
+
+	it('refuses even owned metadata at the structure boundary before writes', async () => {
+		const body = honestBody();
+		body.meta_properties_attributes = [{ id: A.meta, name: 'title', group: 'web', value: 'Bypass' }];
+		const { res, patches } = await save(body);
+		assert.equal(res.status, 400);
+		assert.deepEqual(await res.json(), { error: 'invalid body' });
+		assert.equal(patches.length, 0);
+	});
 
 	it('the review-only walk still runs first', async () => {
 		const body = honestBody();
