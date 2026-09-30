@@ -1,4 +1,4 @@
-import { bffError } from './boundary';
+import { bffError, noStoreJson } from './boundary';
 import { auditRejection } from './audit';
 import { resolveSession } from './guard';
 import { oversizedFieldNames, residualReferenceFieldNames } from '../../sanitize/write-boundary';
@@ -38,7 +38,9 @@ export async function rejectMutation(
 	meta: RejectMeta,
 	status: number,
 	code: string,
-	reason: string
+	reason: string,
+	/** Extra response-body keys beside `error`, for a refusal the client can act on. */
+	body?: Record<string, unknown>
 ): Promise<Response> {
 	if (ctx.db) {
 		try {
@@ -60,7 +62,7 @@ export async function rejectMutation(
 			// swallow — auditing a rejection must not change the rejection's outcome
 		}
 	}
-	return bffError(status, code);
+	return body ? noStoreJson({ ...body, error: code }, status) : bffError(status, code);
 }
 
 /**

@@ -483,7 +483,10 @@ export interface BffClient {
 	 */
 	savePageStructure(pageId: string, payload: unknown): Promise<BffMutationResult>;
 	/** Poovayya's smaller client type (src/lib/admin/types.d.ts:75) omits page methods. */
-	updatePageSeo?(pageId: string, meta: { description?: string }): Promise<BffMutationResult>;
+	updatePageSeo?(
+		pageId: string,
+		meta: Partial<Record<'title' | 'description' | 'keywords', string>>
+	): Promise<BffMutationResult>;
 	changePageStatus(pageId: string, statusEvent: AdminStatusEvent): Promise<BffMutationResult>;
 	/**
 	 * Named payloads, not `unknown`: the bodies changed shape when the item moved to
