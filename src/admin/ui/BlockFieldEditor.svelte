@@ -331,10 +331,20 @@
 									>
 										{mediaIdOf(fieldsData, def.field_name) ? 'Replace' : 'Upload'}
 									</button>
+									<!--
+										ALSO gated on `onPickMedia`, like Replace above it.
+
+										Without a picker this button was the only live control on a
+										media field: it writes the delete marker, Apex empties the
+										field, and the editor has no way to put an image back. A
+										caller that cannot offer Choose cannot offer Remove either —
+										the pair is the whole interaction, and half of it is a
+										one-way door.
+									-->
 									<button
 										class="btn btn-sm btn-quiet danger"
 										type="button"
-										disabled={disabled || !mediaIdOf(fieldsData, def.field_name)}
+										disabled={disabled || !onPickMedia || !mediaIdOf(fieldsData, def.field_name)}
 										on:click={() => onChange(def.field_name, emptyValue)}
 									>
 										Remove

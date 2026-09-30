@@ -80,6 +80,42 @@ export interface BffContext {
 	 * operations refuse rather than guess when it is absent.
 	 */
 	contract?: ContentContract;
+	/**
+	 * Resolve the CHILD ROWS every `array_ref` field on a page points at, for the
+	 * editor to draw — `blockId` → `fieldName` → `[{ id, fields }]`.
+	 *
+	 * Optional and site-supplied, because which fields are `array_ref` and which
+	 * entity type each one repeats lives in the SITE's field contract, not in
+	 * anything the kit carries. A site with no such field omits it and `handleGetPage`
+	 * makes no extra request.
+	 *
+	 * Returning `null` means the read FAILED and must not be confused with "no rows":
+	 * an empty list is a legal state, so a failure rendered as one would invite an
+	 * editor to re-add rows that already exist. `handleGetPage` answers 502 on `null`.
+	 *
+	 * It is handed the EDITOR'S Apex client — the one the guard just built from their
+	 * token — and never builds its own. A resolver that minted a client would read
+	 * child rows with different authority than the page they belong to.
+	 */
+	resolvePageChildRows?: (
+		apex: ApexAdminClient,
+		page: Record<string, unknown>
+	) => Promise<Record<
+		string,
+		Record<string, { id: string; fields: Record<string, unknown> }[]>
+	> | null>;
+	/**
+	 * Entity types that may ONLY be created as a bundle's child, never free-standing.
+	 *
+	 * The account-wide `allowedEntityTypes` has to contain every child type the site
+	 * mints, so on its own it permits a `card` with no owner at all — a row nothing
+	 * references and nothing cleans up. Naming a type here makes the per-request
+	 * owner guard mandatory for it rather than optional.
+	 *
+	 * Absent means "none", which is the correct default: a site with no bundles has
+	 * no such type.
+	 */
+	bundleOnlyEntityTypes?: readonly string[];
 	/** The site's public asset prefix, for composing media URLs the admin shows. */
 	assetsPrefix?: string;
 	/** The site's projection of raw Apex collections into what its loaders read (plan §2.3). */

@@ -146,15 +146,41 @@ export function createBffClient({ fetchImpl = fetch, csrfToken, extend } = {}) {
 		 * widened the type segment from a uuid to a SLUG, which is the shape a caller
 		 * is most likely to build from something it read.
 		 */
-		patchEntityFields(entityTypeId, entityId, fieldsData) {
+		patchEntityFields(entityTypeId, entityId, fieldsData, position) {
 			const type = encodeURIComponent(entityTypeId);
 			const id = encodeURIComponent(entityId);
-			return mutate(`/api/admin/entities/${type}/${id}`, 'PATCH', {
-				fields_data: fieldsData
-			});
+			// `position` travels WITH `fields_data`, never alone: the entities route
+			// assigns both in one call and `fields_data` is mandatory there — a bare
+			// `{position}` body reaches `assign_attributes(nil)` and is a 500.
+			const body = { fields_data: fieldsData };
+			if (Number.isInteger(position)) body.position = position;
+			return mutate(`/api/admin/entities/${type}/${id}`, 'PATCH', body);
+		},
+		/**
+		 * Mint one content-library entity — a child row of a list or a bundle.
+		 *
+		 * `owner` is the bundle case: the entities route takes fields, owner AND
+		 * position in one call, which is why a bundle child is created here rather than
+		 * through the page PATCH (where `entities_attributes` mints an empty row and
+		 * permits no position). `page_id` is read by the BFF to prove the owner is a
+		 * bundle on that page, and is never forwarded to Apex.
+		 */
+		createEntity(entityType, fieldsData, owner) {
+			const type = encodeURIComponent(entityType);
+			const body = { fields_data: fieldsData };
+			if (owner?.owner_type && owner?.owner_id) {
+				body.owner_type = owner.owner_type;
+				body.owner_id = owner.owner_id;
+				if (owner.page_id) body.page_id = owner.page_id;
+				if (Number.isInteger(owner.position)) body.position = owner.position;
+			}
+			return mutate(`/api/admin/entities/${type}`, 'POST', body);
 		},
 		savePageStructure(pageId, payload) {
 			return mutate(`/api/admin/pages/${pageId}/structure`, 'PATCH', payload);
+		},
+		updatePageSeo(pageId, meta) {
+			return mutate(`/api/admin/pages/${encodeURIComponent(pageId)}/seo`, 'PATCH', { meta });
 		},
 		changePageStatus(pageId, statusEvent) {
 			return mutate(`/api/admin/pages/${pageId}/status`, 'PATCH', { status_event: statusEvent });

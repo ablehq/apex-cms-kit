@@ -55,7 +55,19 @@ const fieldNameSchema = z.string().regex(/^[a-z][a-z0-9_]*$/u);
 
 export const entityFieldsBodySchema = z
 	.object({
-		fields_data: z.record(fieldNameSchema, z.unknown())
+		fields_data: z.record(fieldNameSchema, z.unknown()),
+		/**
+		 * A row's order within the block that owns it.
+		 *
+		 * `position` ONLY. This route deliberately gains no `owner_type`/`owner_id`:
+		 * it is the one entity route with NO type allow-list — correctly, because block
+		 * entities are arbitrary types — so an owner key here would let any authenticated
+		 * editor re-parent any entity in the account onto a bundle. Apex will not stop
+		 * it: `ContentLibrary::Entity#validate_ownership` delegates only to owners that
+		 * define `validate_entity_ownership`, and the only definer is `ArchetypeItem`.
+		 * The owner is set at CREATE and never changed here.
+		 */
+		position: z.number().int().min(0).optional()
 	})
 	.strict();
 
@@ -119,7 +131,12 @@ export async function handlePatchEntityFields(
 		fieldsData[name] = sanitizeFieldValue(value);
 	}
 
-	const apexResponse = await guard.apex.updateEntityFields(typeId.data, entityId.data, fieldsData);
+	const apexResponse = await guard.apex.updateEntityFields(
+		typeId.data,
+		entityId.data,
+		fieldsData,
+		parsed.data.position
+	);
 	const outcome = apexResponse.ok ? 'accepted' : 'apex_error';
 
 	await auditOutcome(ctx, meta, guard.actor, {
