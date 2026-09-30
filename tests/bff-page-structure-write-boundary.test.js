@@ -96,8 +96,7 @@ function body(overrides = {}) {
 					}
 				}
 			}
-		],
-		meta_properties_attributes: [{ id: IDS.meta, name: 'title', group: 'web', value: 'A!' }]
+		]
 	};
 }
 
@@ -172,7 +171,6 @@ describe('structureValueFields', () => {
 			values['blocks_attributes[0].blockable_attributes.content_html'],
 			'<p>A, edited</p>'
 		);
-		assert.equal(values['meta_properties_attributes[0].value'], 'A!');
 	});
 
 	it('measures a field bag ENTRY BY ENTRY, so a structured field value is measured whole', () => {
@@ -296,6 +294,5 @@ describe('the structure save runs the write boundary', () => {
 			'clean markup is byte-identical'
 		);
 		assert.equal(sent.title, 'A');
-		assert.equal(sent.meta_properties_attributes[0].value, 'A!');
 	});
 });

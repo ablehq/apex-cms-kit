@@ -110,8 +110,7 @@ function honestBody() {
 				},
 				_destroy: false
 			}
-		],
-		meta_properties_attributes: [{ id: A.meta, name: 'title', group: 'web', value: 'A!' }]
+		]
 	};
 }
 
@@ -240,6 +239,22 @@ describe('collectPageIds / findForeignId', () => {
 });
 
 describe('PATCH /pages/:id/structure — only this page’s rows', () => {
+	/** save-page-structure.ts:365 must refuse meta writes so only the id-keyed SEO route can write them. */
+	it('refuses id-less, destructive, and id-keyed meta rows without writing', async () => {
+		for (const rows of [
+			[{ name: 'title', group: 'web', value: 'X' }],
+			[{ id: A.meta, _destroy: true }],
+			[{ id: A.meta, value: 'X' }]
+		]) {
+			const body = honestBody();
+			body.meta_properties_attributes = rows;
+			const { res, patches } = await save(body);
+			assert.equal(res.status, 400, JSON.stringify(rows));
+			assert.deepEqual(await res.json(), { error: 'invalid body' });
+			assert.equal(patches.length, 0);
+		}
+	});
+
 	it('an honest reorder / edit / add / remove passes, after ONE fresh read', async () => {
 		const { res, calls, patches } = await save(honestBody());
 		assert.equal(res.status, 200, await res.clone().text());
@@ -300,13 +315,6 @@ describe('PATCH /pages/:id/structure — only this page’s rows', () => {
 			key: 'id',
 			mutate: (body) => {
 				body.blocks_attributes.push({ id: B.block, _destroy: true });
-			}
-		},
-		{
-			name: "another page's meta property",
-			key: 'id',
-			mutate: (body) => {
-				body.meta_properties_attributes[0].id = B.block;
 			}
 		}
 	];
