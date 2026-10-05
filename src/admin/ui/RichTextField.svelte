@@ -27,6 +27,12 @@
 	change (a save's reconcile, a reload) rewrites the surface while the editor's own
 	keystrokes never do. Nothing is written back into a focused element.
 
+	The bar follows the caret (`rich-text-bar.js`): B, I, H2 and List show pressed when
+	the selection already has them, and pressing one again undoes it — H2 included,
+	which turns a heading back into a paragraph. Enter after a heading starts a `<p>`,
+	not the `<div>` Chrome starts by default: every value here is paragraphs, and a
+	site's stylesheet styles `p`.
+
 	Paste is forced to plain text: it keeps a paste from Word out of the page. The Link
 	button refuses anything that is not `http` / `https` / `mailto` / `tel` or a path
 	on this site — a courtesy to the person typing, not a boundary. The boundary is
@@ -36,6 +42,7 @@
 -->
 <script>
 	import { plainToRichText, richTextHtml } from '../rich-text.js';
+	import { BAR_IDLE, barState, headingBlock } from '../rich-text-bar.js';
 
 	/**
 	 * The stored field value: the tiptap-shaped `{ editor, html, content }`, a bare
@@ -71,6 +78,8 @@
 	let el;
 	/** @type {string | null} */
 	let applied = null;
+	/** Which of the bar's toggles the selection already has. */
+	let bar = BAR_IDLE;
 
 	// `richTextHtml` answers a typed result rather than a string, so a shape this
 	// control cannot read is VISIBLE here instead of arriving as `''`.
@@ -111,6 +120,31 @@
 			document.execCommand(command, false, argument);
 		}
 		emit();
+		// A command can change the formatting without moving the selection (B on a
+		// collapsed caret), and then no `selectionchange` arrives to say so.
+		refreshBar();
+	}
+
+	function refreshBar() {
+		if (!el || typeof document === 'undefined') return;
+		bar = barState(document.getSelection(), el, (command) => document.queryCommandState(command));
+	}
+
+	function heading() {
+		if (disabled || !el) return;
+		// Read now rather than from `bar`, which is only as fresh as the last
+		// `selectionchange`, and that event is queued.
+		const now = barState(document.getSelection(), el, (command) =>
+			document.queryCommandState(command)
+		);
+		exec('formatBlock', headingBlock(now.heading));
+	}
+
+	function onFocus() {
+		// Document-wide in the browser, and every surface on the page wants it.
+		if (typeof document.execCommand === 'function') {
+			document.execCommand('defaultParagraphSeparator', false, 'p');
+		}
 	}
 
 	/**
@@ -167,14 +201,23 @@
 	}
 </script>
 
+<svelte:document on:selectionchange={refreshBar} />
+
 <div class="rich">
 	<div class="rich-bar">
-		<button type="button" title="Bold" {disabled} on:mousedown|preventDefault={() => exec('bold')}>
+		<button
+			type="button"
+			title="Bold"
+			aria-pressed={bar.bold}
+			{disabled}
+			on:mousedown|preventDefault={() => exec('bold')}
+		>
 			<b>B</b>
 		</button>
 		<button
 			type="button"
 			title="Italic"
+			aria-pressed={bar.italic}
 			{disabled}
 			on:mousedown|preventDefault={() => exec('italic')}
 		>
@@ -182,9 +225,10 @@
 		</button>
 		<button
 			type="button"
-			title="Heading"
+			title={bar.heading ? 'Back to a paragraph' : 'Heading'}
+			aria-pressed={bar.heading}
 			{disabled}
-			on:mousedown|preventDefault={() => exec('formatBlock', '<h2>')}
+			on:mousedown|preventDefault={heading}
 		>
 			H2
 		</button>
@@ -192,6 +236,7 @@
 		<button
 			type="button"
 			title="Bulleted list"
+			aria-pressed={bar.list}
 			{disabled}
 			on:mousedown|preventDefault={() => exec('insertUnorderedList')}
 		>
@@ -206,6 +251,7 @@
 		aria-multiline="true"
 		aria-label={ariaLabel}
 		spellcheck="false"
+		on:focus={onFocus}
 		on:input={emit}
 		on:paste={onPaste}
 	></div>

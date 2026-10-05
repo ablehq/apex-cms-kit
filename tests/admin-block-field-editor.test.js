@@ -93,10 +93,15 @@ describe('BlockFieldEditor save lock', () => {
 			const richTextCode = compile(richTextSource, {
 				filename: richTextPath,
 				generate: 'server'
-			}).js.code.replace(
-				"'../rich-text.js'",
-				JSON.stringify(pathToFileURL(resolve('src/admin/rich-text.js')).href)
-			);
+			})
+				.js.code.replace(
+					"'../rich-text.js'",
+					JSON.stringify(pathToFileURL(resolve('src/admin/rich-text.js')).href)
+				)
+				.replace(
+					"'../rich-text-bar.js'",
+					JSON.stringify(pathToFileURL(resolve('src/admin/rich-text-bar.js')).href)
+				);
 			await writeFile(join(tempDir, 'RichTextField.js'), richTextCode);
 
 			const source = await readFile(path, 'utf8');
