@@ -246,7 +246,8 @@ async function request(ctx, signed = true) {
  * A minimal site adapter. Its "public projection" is what a post page draws from
  * joins: title, body length, the cover's caption, the author's name and photo key,
  * the partner's title — each resolved by id through the collections, the way a
- * site's loader does. It records what it was handed.
+ * site's loader does. Like a site's route, it finds the saved post by its slug.
+ * It records what it was handed.
  */
 function adapter(seen = {}) {
 	const project = (collections, post) => {
@@ -276,7 +277,7 @@ function adapter(seen = {}) {
 				imagesCollection: 'images',
 				referenceCollections: { author: 'authors', partner: 'partners' }
 			});
-			const post = collections.updates.find((p) => p.id === input.saved.post.id);
+			const post = collections.updates.find((p) => p.slug === input.saved.post.slug);
 			const value = project(collections, post);
 			return { ok: true, payload: { post: value }, comparable: value };
 		},
@@ -457,6 +458,32 @@ describe('loadSitePostPreview — a draft', () => {
 		}
 	});
 
+	it('draws the draft, not a renamed post the snapshot still holds at its slug', async () => {
+		// Another post was published at this slug, then renamed in Apex; this draft
+		// took the freed slug before the site was published again.
+		const { ctx } = harness({
+			collections: {
+				updates: [
+					postView({
+						id: OTHER_POST,
+						title: 'Announcing Tomorrow Makers',
+						status: 'published',
+						document: { id: 'stale-doc' }
+					})
+				],
+				documents: [],
+				archetypes: [],
+				images: []
+			}
+		});
+		const result = await loadSitePostPreview(await request(ctx), ctx, params, adapter());
+		assert.equal(result.ok, true);
+		assert.equal(result.preview.postId, POST);
+		assert.equal(result.preview.payload.post.title, 'A partnership');
+		assert.equal(result.preview.payload.post.blocks, 2);
+		assert.equal(result.preview.onSite, 'absent');
+	});
+
 	it("hands the adapter copies, so a splice cannot reach the public site's snapshot", async () => {
 		const { ctx } = harness();
 		const mutating = {
@@ -588,7 +615,7 @@ describe('collectionsWithSavedPost', () => {
 			imagesCollection: 'images',
 			referenceCollections: { author: 'authors', partner: 'partners' }
 		});
-		// Replaced in place; a draft would be appended.
+		// The saved post first, its published copy dropped.
 		assert.deepEqual(
 			next.updates.map((p) => p.title),
 			['A partnership', 'Another']
@@ -611,6 +638,40 @@ describe('collectionsWithSavedPost', () => {
 		assert.deepEqual(next.tags, base.tags);
 		// The snapshot copy is not changed: the published comparison reads it.
 		assert.deepEqual(input.collections, base);
+	});
+
+	it('puts the saved records ahead of stale rows a site could match first', () => {
+		// A post renamed since the publish still holds this slug in the snapshot, and
+		// an older archetype still points at this post. The published copy of the
+		// post sits after them.
+		const collections = {
+			updates: [
+				{ id: OTHER_POST, slug: 'a-partnership', title: 'Announcing Tomorrow Makers' },
+				postView({ title: 'Published' })
+			],
+			archetypes: [{ id: 'stale-arch', target_model_id: POST }],
+			documents: [documentRow({ blocks: [] })]
+		};
+		const input = {
+			schema: 'update',
+			saved,
+			referenceTargets: {},
+			galleryItems: [],
+			collections: structuredClone(collections),
+			apex: null
+		};
+		const next = collectionsWithSavedPost(input, {
+			postsCollection: 'updates',
+			imagesCollection: 'images'
+		});
+		assert.equal(next.updates.find((p) => p.slug === 'a-partnership').id, POST);
+		assert.deepEqual(
+			next.updates.map((p) => p.title),
+			['A partnership', 'Announcing Tomorrow Makers']
+		);
+		assert.equal(next.archetypes.find((a) => a.target_model_id === POST).id, ARCH);
+		assert.deepEqual(next.documents, [saved.document]);
+		assert.deepEqual(input.collections, collections);
 	});
 
 	it('creates collections the snapshot does not have', () => {
