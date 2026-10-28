@@ -2,8 +2,10 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import {
+	GALLERY_ITEM_FIELD,
 	collectionsWithSavedPost,
 	loadSitePostPreview,
+	mediaFieldIds,
 	publishedPostRow,
 	referencedGalleryItemIds
 } from '../src/server/bff/operations/preview-post.ts';
@@ -20,24 +22,55 @@ const OTHER_POST = 'abababab-1111-2222-3333-444444444444';
 const COVER_NEW = '33333333-1111-2222-3333-444444444444';
 const COVER_OLD = '44444444-1111-2222-3333-444444444444';
 const BODY_IMG = '55555555-1111-2222-3333-444444444444';
+const AUTHOR = '66666666-1111-2222-3333-444444444444';
+const AUTHOR_IMG = '77777777-1111-2222-3333-444444444444';
+const PARTNER = '88888888-1111-2222-3333-444444444444';
+const RELATED_STORY = '99999999-1111-2222-3333-444444444444';
 const GALLERY = 'Cms::DocumentBlock::GalleryItem';
 const RICH = 'Cms::DocumentBlock::RichText';
+const PLATFORM = '/api/platform/v1';
 
+/**
+ * Two post schemas. An update references an author (whose photo is a media field),
+ * partners, and — to prove only content-library targets are read — a story.
+ */
 const contract = {
 	schema: (slug) =>
-		['story', 'update', 'author'].includes(slug)
+		['story', 'update', 'author', 'partner'].includes(slug)
 			? {
 					slug,
 					display_name: slug,
-					target_model: slug === 'author' ? null : 'Cms::Post',
+					target_model: slug === 'story' || slug === 'update' ? 'Cms::Post' : null,
 					id: null,
 					items: []
 				}
 			: null,
-	isContentLibrarySlug: (slug) => slug === 'author',
-	primitiveFieldDefs: () => [],
-	referenceItems: () => []
+	isContentLibrarySlug: (slug) => slug === 'author' || slug === 'partner',
+	primitiveFieldDefs: (slug) =>
+		slug === 'author'
+			? [
+					{ field_name: 'name', validator_kind: null },
+					{ field_name: 'image', validator_kind: GALLERY_ITEM_FIELD }
+				]
+			: [],
+	referenceItems: (slug) =>
+		slug === 'update'
+			? [
+					{ name: 'author', kind: 'reference', target_schema: 'author' },
+					{ name: 'partner', kind: 'reference', target_schema: 'partner' },
+					{ name: 'related', kind: 'reference', target_schema: 'story' }
+				]
+			: []
 };
+
+function referenceItem(name, targetId) {
+	return {
+		id: `ai-${name}-${targetId.slice(0, 4)}`,
+		relatable_type: 'Specification::Archetype',
+		archetype_schema_item: { name },
+		fields_data: { [name]: targetId }
+	};
+}
 
 function postView(changes = {}) {
 	return {
@@ -59,7 +92,11 @@ function archetype(changes = {}) {
 		id: ARCH,
 		target_model_id: POST,
 		updated_at: '2026-10-28T09:30:00.000Z',
-		archetype_items: [],
+		archetype_items: [
+			referenceItem('author', AUTHOR),
+			referenceItem('partner', PARTNER),
+			referenceItem('related', RELATED_STORY)
+		],
 		taggings: [],
 		...changes
 	};
@@ -77,27 +114,45 @@ function documentRow(changes = {}) {
 	};
 }
 
-function image(id) {
-	return {
-		id,
-		caption: `img ${id.slice(0, 4)}`,
-		medium: { file: { key: `key-${id.slice(0, 4)}` } }
-	};
+function image(id, caption = `img ${id.slice(0, 4)}`) {
+	return { id, caption, medium: { file: { key: `key-${id.slice(0, 4)}` } } };
 }
 
-/**
- * A recording Apex stub answering the four reads the operation makes, plus the
- * snapshot in KV. `apex` overrides any answer.
- */
-function harness({ collections, published = true, apex = {}, contractValue = contract } = {}) {
-	resetContentMemo();
-	const calls = [];
-	const answers = {
+function author(name = 'Aarefa', photo = AUTHOR_IMG) {
+	return { id: AUTHOR, primitives: { name, image: photo } };
+}
+
+function partner(title = 'Agami') {
+	return { id: PARTNER, primitives: { title } };
+}
+
+/** What Apex holds now, by default: every image and target, current. */
+function liveAnswers() {
+	return {
 		listPosts: { ok: true, status: 200, body: { data: [postView()] } },
 		getPostArchetype: { ok: true, status: 200, body: { data: archetype() } },
 		documents: { ok: true, status: 200, body: { data: [documentRow()] } },
-		galleryItems: { ok: true, status: 200, body: { data: [image(COVER_NEW), image(BODY_IMG)] } },
-		...apex
+		galleryItems: {
+			ok: true,
+			status: 200,
+			body: { data: [image(COVER_NEW), image(BODY_IMG), image(AUTHOR_IMG)] }
+		},
+		targets: {
+			author: { ok: true, status: 200, body: { data: [author()] } },
+			partner: { ok: true, status: 200, body: { data: [partner()] } }
+		}
+	};
+}
+
+/** A recording Apex stub, plus the snapshot in KV. `apex` overrides any answer. */
+function harness({ collections, published = true, apex = {}, contractValue = contract } = {}) {
+	resetContentMemo();
+	const calls = [];
+	const base = liveAnswers();
+	const answers = { ...base, ...apex, targets: { ...base.targets, ...(apex.targets ?? {}) } };
+	const answer = (value) => {
+		if (value instanceof Error) throw value;
+		return value;
 	};
 	const client = {
 		async listPosts(slug, query) {
@@ -110,11 +165,11 @@ function harness({ collections, published = true, apex = {}, contractValue = con
 		},
 		async get(path, query) {
 			calls.push(['get', path, query]);
-			if (path.endsWith('/cms/documents/search_and_filter')) return answers.documents;
-			if (path.endsWith('/cms/gallery_items/search_and_filter')) {
-				if (answers.galleryItems instanceof Error) throw answers.galleryItems;
-				return answers.galleryItems;
-			}
+			if (path === `${PLATFORM}/cms/documents/search_and_filter`) return answers.documents;
+			if (path === `${PLATFORM}/cms/gallery_items/search_and_filter`)
+				return answer(answers.galleryItems);
+			if (path === `${PLATFORM}/specification/archetypes/search_and_filter`)
+				return answer(answers.targets[query.q.archetype_schema_slug_eq]);
 			throw new Error(`unexpected read ${path}`);
 		}
 	};
@@ -122,6 +177,8 @@ function harness({ collections, published = true, apex = {}, contractValue = con
 		updates: [],
 		documents: [],
 		archetypes: [],
+		authors: [],
+		partners: [],
 		images: [image(COVER_OLD)]
 	};
 	const snapshot = {
@@ -186,23 +243,38 @@ async function request(ctx, signed = true) {
 }
 
 /**
- * A minimal site adapter: the "public projection" is title + body block count +
- * cover caption, resolved through the images collection the way a site's loader
- * would. It records what it was handed.
+ * A minimal site adapter. Its "public projection" is what a post page draws from
+ * joins: title, body length, the cover's caption, the author's name and photo key,
+ * the partner's title — each resolved by id through the collections, the way a
+ * site's loader does. It records what it was handed.
  */
 function adapter(seen = {}) {
 	const project = (collections, post) => {
-		const doc = (collections.documents ?? []).find((d) => d.id === post.document?.id);
+		const byId = (name, id) => (collections[name] ?? []).find((row) => row.id === id);
+		const doc = byId('documents', post.document?.id);
+		const arch = (collections.archetypes ?? []).find((a) => a.target_model_id === post.id);
+		const ref = (name) =>
+			arch?.archetype_items?.find((i) => i.archetype_schema_item?.name === name)?.fields_data?.[
+				name
+			];
 		const coverId = post.shared_gallery_items?.find((r) => r.kind === 'cover')?.gallery_item_id;
-		const cover = (collections.images ?? []).find((i) => i.id === coverId);
-		return { title: post.title, blocks: doc?.blocks?.length ?? 0, cover: cover?.caption ?? null };
+		const authorRow = byId('authors', ref('author'));
+		return {
+			title: post.title,
+			blocks: doc?.blocks?.length ?? 0,
+			cover: byId('images', coverId)?.caption ?? null,
+			author: authorRow?.primitives?.name ?? 'Default byline',
+			authorPhoto: byId('images', authorRow?.primitives?.image)?.medium?.file?.key ?? null,
+			partner: byId('partners', ref('partner'))?.primitives?.title ?? null
+		};
 	};
 	return {
 		async projectSaved(input) {
 			seen.input = input;
 			const collections = collectionsWithSavedPost(input, {
 				postsCollection: 'updates',
-				imagesCollection: 'images'
+				imagesCollection: 'images',
+				referenceCollections: { author: 'authors', partner: 'partners' }
 			});
 			const post = collections.updates.find((p) => p.id === input.saved.post.id);
 			const value = project(collections, post);
@@ -218,6 +290,8 @@ function adapter(seen = {}) {
 }
 
 const params = { schema: 'update', postId: POST };
+
+const reads = (calls, path) => calls.filter(([kind, p]) => kind === 'get' && p === path);
 
 describe('loadSitePostPreview — refusals', () => {
 	it('refuses a signed-out request before Apex is read', async () => {
@@ -311,7 +385,7 @@ describe('loadSitePostPreview — refusals', () => {
 });
 
 describe('loadSitePostPreview — a draft', () => {
-	it('renders the saved draft, with its new cover read live, and reports it absent from the site', async () => {
+	it('draws the saved draft with everything it shows read live, and reports it absent from the site', async () => {
 		const seen = {};
 		const { ctx, calls } = harness();
 		const result = await loadSitePostPreview(await request(ctx), ctx, params, adapter(seen));
@@ -320,7 +394,17 @@ describe('loadSitePostPreview — a draft', () => {
 			preview: {
 				schema: 'update',
 				postId: POST,
-				payload: { post: { title: 'A partnership', blocks: 2, cover: 'img 3333' } },
+				payload: {
+					post: {
+						title: 'A partnership',
+						blocks: 2,
+						cover: 'img 3333',
+						// Neither the author nor the partner is in the snapshot.
+						author: 'Aarefa',
+						authorPhoto: 'key-7777',
+						partner: 'Agami'
+					}
+				},
 				status: 'draft',
 				routable: false,
 				publicPath: null,
@@ -329,52 +413,47 @@ describe('loadSitePostPreview — a draft', () => {
 				onSite: 'absent'
 			}
 		});
-		// The cover and the body image, neither in the snapshot, in one read.
-		const galleryRead = calls.find(([, path]) => `${path}`.includes('gallery_items'));
-		assert.deepEqual(galleryRead, [
-			'get',
-			'/api/platform/v1/cms/gallery_items/search_and_filter',
-			{ q: { id_in: [COVER_NEW, BODY_IMG] }, per_page: 2 }
-		]);
 		// The document is read where the publish reads documents.
-		assert.ok(
-			calls.some(
-				([kind, path, query]) =>
-					kind === 'get' &&
-					path === '/api/platform/v1/cms/documents/search_and_filter' &&
-					query.q.id_eq === DOC
-			)
+		assert.equal(reads(calls, `${PLATFORM}/cms/documents/search_and_filter`)[0][2].q.id_eq, DOC);
+		// One read per content-library target schema, where the publish lists them.
+		// The `related` story is a post, not a content-library record, and is not read.
+		assert.deepEqual(
+			reads(calls, `${PLATFORM}/specification/archetypes/search_and_filter`).map(([, , q]) => q),
+			[
+				{ q: { archetype_schema_slug_eq: 'author', id_in: [AUTHOR] }, per_page: 1 },
+				{ q: { archetype_schema_slug_eq: 'partner', id_in: [PARTNER] }, per_page: 1 }
+			]
 		);
+		// ONE gallery read: the cover, the body image, and the live author's photo.
+		assert.deepEqual(
+			reads(calls, `${PLATFORM}/cms/gallery_items/search_and_filter`).map(([, , q]) => q),
+			[{ q: { id_in: [COVER_NEW, BODY_IMG, AUTHOR_IMG] }, per_page: 3 }]
+		);
+		assert.deepEqual(Object.keys(seen.input.referenceTargets).sort(), ['author', 'partner']);
 		assert.deepEqual(
 			seen.input.galleryItems.map((i) => i.id),
-			[COVER_NEW, BODY_IMG]
+			[COVER_NEW, BODY_IMG, AUTHOR_IMG]
 		);
 	});
 
-	it('does not read images the snapshot already holds', async () => {
-		const { ctx, calls } = harness({
-			collections: {
-				updates: [],
-				documents: [],
-				archetypes: [],
-				images: [image(COVER_NEW), image(BODY_IMG)]
-			}
-		});
-		const result = await loadSitePostPreview(await request(ctx), ctx, params, adapter());
-		assert.equal(result.ok, true);
-		assert.equal(result.preview.payload.post.cover, 'img 3333');
-		assert.ok(!calls.some(([, path]) => `${path}`.includes('gallery_items')));
-	});
-
-	it('still renders when the image read fails — the cover is just unresolved', async () => {
-		for (const galleryItems of [
-			{ ok: false, status: 500, body: null },
-			new Error('network down')
-		]) {
-			const { ctx } = harness({ apex: { galleryItems } });
+	it('falls back to the snapshot, and still draws, when the live reads fail', async () => {
+		for (const failure of [{ ok: false, status: 500, body: null }, new Error('network down')]) {
+			const { ctx } = harness({
+				apex: { galleryItems: failure, targets: { author: failure, partner: failure } },
+				collections: {
+					updates: [],
+					documents: [],
+					archetypes: [],
+					authors: [author('Published name')],
+					partners: [],
+					images: [image(COVER_NEW, 'Published caption')]
+				}
+			});
 			const result = await loadSitePostPreview(await request(ctx), ctx, params, adapter());
 			assert.equal(result.ok, true);
-			assert.equal(result.preview.payload.post.cover, null);
+			assert.equal(result.preview.payload.post.cover, 'Published caption');
+			assert.equal(result.preview.payload.post.author, 'Published name');
+			assert.equal(result.preview.payload.post.partner, null);
 		}
 	});
 
@@ -386,6 +465,7 @@ describe('loadSitePostPreview — a draft', () => {
 				input.collections.images.splice(0);
 				input.collections.updates.push({ id: 'junk' });
 				input.saved.post.title = 'changed';
+				input.referenceTargets.author.push({ id: 'junk' });
 				return { ok: true, payload: null, comparable: null };
 			}
 		};
@@ -397,37 +477,84 @@ describe('loadSitePostPreview — a draft', () => {
 });
 
 describe('loadSitePostPreview — a published post', () => {
-	function publishedHarness(snapshotPost) {
+	/** The snapshot as the last publish left it: this post, its cover, author and partner. */
+	function publishedHarness({ snapshot = {}, apex = {} } = {}) {
 		return harness({
 			apex: {
 				listPosts: {
 					ok: true,
 					status: 200,
 					body: { data: [postView({ status: 'published' })] }
-				}
+				},
+				...apex
 			},
 			collections: {
-				updates: [snapshotPost],
+				updates: [postView({ status: 'published' })],
 				documents: [documentRow()],
 				archetypes: [archetype()],
-				images: [image(COVER_NEW), image(BODY_IMG)]
+				authors: [author()],
+				partners: [partner()],
+				images: [image(COVER_NEW), image(BODY_IMG), image(AUTHOR_IMG)],
+				...snapshot
 			}
 		});
 	}
 
-	it('is identical when the snapshot holds the same projection', async () => {
-		const { ctx } = publishedHarness(postView({ status: 'published' }));
+	it('is identical when nothing has changed since the publish', async () => {
+		const { ctx } = publishedHarness();
 		const result = await loadSitePostPreview(await request(ctx), ctx, params, adapter());
 		assert.equal(result.preview.onSite, 'identical');
 		assert.equal(result.preview.routable, true);
 		assert.equal(result.preview.publicPath, '/blogs/a-partnership');
 	});
 
-	it('differs when the published copy is older', async () => {
-		const { ctx } = publishedHarness(postView({ status: 'published', title: 'Old title' }));
+	it('differs when the published copy of the post is older', async () => {
+		const { ctx } = publishedHarness({
+			snapshot: { updates: [postView({ status: 'published', title: 'Old title' })] }
+		});
 		const result = await loadSitePostPreview(await request(ctx), ctx, params, adapter());
 		assert.equal(result.preview.onSite, 'differs');
 		assert.equal(result.preview.payload.post.title, 'A partnership');
+	});
+
+	it('shows a corrected caption on an existing cover, and differs — the id did not change', async () => {
+		const { ctx, calls } = publishedHarness({
+			snapshot: { images: [image(COVER_NEW, 'Old caption'), image(BODY_IMG), image(AUTHOR_IMG)] },
+			apex: {
+				galleryItems: {
+					ok: true,
+					status: 200,
+					body: {
+						data: [image(COVER_NEW, 'Corrected caption'), image(BODY_IMG), image(AUTHOR_IMG)]
+					}
+				}
+			}
+		});
+		const result = await loadSitePostPreview(await request(ctx), ctx, params, adapter());
+		assert.equal(result.preview.payload.post.cover, 'Corrected caption');
+		assert.equal(result.preview.onSite, 'differs');
+		// Read although the snapshot holds every one of them.
+		assert.equal(reads(calls, `${PLATFORM}/cms/gallery_items/search_and_filter`).length, 1);
+	});
+
+	it('shows an edited author and their new photo, and differs', async () => {
+		const NEW_PHOTO = 'abcdabcd-1111-2222-3333-444444444444';
+		const { ctx } = publishedHarness({
+			apex: {
+				targets: {
+					author: { ok: true, status: 200, body: { data: [author('Aarefa K.', NEW_PHOTO)] } }
+				},
+				galleryItems: {
+					ok: true,
+					status: 200,
+					body: { data: [image(COVER_NEW), image(BODY_IMG), image(NEW_PHOTO)] }
+				}
+			}
+		});
+		const result = await loadSitePostPreview(await request(ctx), ctx, params, adapter());
+		assert.equal(result.preview.payload.post.author, 'Aarefa K.');
+		assert.equal(result.preview.payload.post.authorPhoto, 'key-abcd');
+		assert.equal(result.preview.onSite, 'differs');
 	});
 });
 
@@ -437,22 +564,31 @@ describe('collectionsWithSavedPost', () => {
 		updates: [postView({ title: 'Published' }), { id: OTHER_POST, title: 'Another' }],
 		documents: [documentRow({ blocks: [] })],
 		archetypes: [],
-		images: [image(COVER_NEW)],
+		authors: [author('Old name')],
+		partners: [],
+		images: [image(COVER_NEW, 'Old caption'), image(COVER_OLD)],
 		tags: [{ id: 't' }]
 	};
 
-	it('stands the saved records in for the published ones, and adds a draft that has none', () => {
+	it('stands the saved records and every live row in for the published ones', () => {
 		const input = {
 			schema: 'update',
 			saved,
-			galleryItems: [image(COVER_NEW), image(BODY_IMG)],
+			referenceTargets: {
+				author: [author('New name')],
+				partner: [partner()],
+				story: [{ id: RELATED_STORY }]
+			},
+			galleryItems: [image(COVER_NEW, 'New caption'), image(BODY_IMG)],
 			collections: structuredClone(base),
 			apex: null
 		};
 		const next = collectionsWithSavedPost(input, {
 			postsCollection: 'updates',
-			imagesCollection: 'images'
+			imagesCollection: 'images',
+			referenceCollections: { author: 'authors', partner: 'partners' }
 		});
+		// Replaced in place; a draft would be appended.
 		assert.deepEqual(
 			next.updates.map((p) => p.title),
 			['A partnership', 'Another']
@@ -460,19 +596,33 @@ describe('collectionsWithSavedPost', () => {
 		assert.equal(next.documents.length, 1);
 		assert.equal(next.documents[0].blocks.length, 2);
 		assert.deepEqual(next.archetypes, [saved.archetype]);
-		// Appended once: the snapshot's copy of COVER_NEW wins over the live one.
+		assert.deepEqual(next.authors, [author('New name')]);
+		assert.deepEqual(next.partners, [partner()]);
+		// No collection is named for `story`, so nothing is put anywhere for it.
+		assert.equal(next.stories, undefined);
 		assert.deepEqual(
-			next.images.map((i) => i.id),
-			[COVER_NEW, BODY_IMG]
+			next.images.map((i) => [i.id, i.caption]),
+			[
+				[COVER_NEW, 'New caption'],
+				[COVER_OLD, 'img 4444'],
+				[BODY_IMG, 'img 5555']
+			]
 		);
 		assert.deepEqual(next.tags, base.tags);
-		// The input is not changed.
+		// The snapshot copy is not changed: the published comparison reads it.
 		assert.deepEqual(input.collections, base);
 	});
 
 	it('creates collections the snapshot does not have', () => {
 		const next = collectionsWithSavedPost(
-			{ schema: 'story', saved, galleryItems: [], collections: {}, apex: null },
+			{
+				schema: 'story',
+				saved,
+				referenceTargets: {},
+				galleryItems: [],
+				collections: {},
+				apex: null
+			},
 			{ postsCollection: 'stories', imagesCollection: 'images' }
 		);
 		assert.deepEqual(next.stories, [saved.post]);
@@ -512,5 +662,27 @@ describe('referencedGalleryItemIds', () => {
 		});
 		assert.deepEqual(referencedGalleryItemIds(post, document), [COVER_NEW, BODY_IMG]);
 		assert.deepEqual(referencedGalleryItemIds({}, {}), []);
+	});
+});
+
+describe('mediaFieldIds', () => {
+	it("reads the contract's media fields, from an item row or the primitives cache", () => {
+		assert.deepEqual(mediaFieldIds(contract, 'author', author()), [AUTHOR_IMG]);
+		const fromItem = {
+			id: AUTHOR,
+			archetype_items: [
+				{
+					relatable_type: 'PropertySet',
+					archetype_schema_item: { name: 'image' },
+					fields_data: { image: AUTHOR_IMG }
+				}
+			]
+		};
+		assert.deepEqual(mediaFieldIds(contract, 'author', fromItem), [AUTHOR_IMG]);
+	});
+
+	it('ignores other fields, empty values, and schemas with no media fields', () => {
+		assert.deepEqual(mediaFieldIds(contract, 'author', author('Name', '')), []);
+		assert.deepEqual(mediaFieldIds(contract, 'partner', { primitives: { logo: AUTHOR_IMG } }), []);
 	});
 });
