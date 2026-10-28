@@ -268,8 +268,11 @@ export async function loadSitePostPreview<Payload>(
  * A copy of the snapshot's collections as the NEXT publish would read them, for
  * this post: the step every site adapter's `projectSaved` starts with.
  *
- *   - the saved post, archetype and document replace the published copies (same
- *     id), or are added when the site has none (a draft);
+ *   - the saved post, archetype and document go FIRST in their collections, and
+ *     any published copy of them (same id) is dropped. Sites find a post by its
+ *     slug, and its archetype by the post it belongs to, taking the first match;
+ *     the snapshot can still hold another post at this slug (one renamed since the
+ *     last publish), and the saved post must win;
  *   - each live reference target replaces its snapshot row, or is added, in the
  *     collection `referenceCollections` names for its schema;
  *   - each live gallery item replaces its snapshot row, or is added, in
@@ -293,9 +296,9 @@ export function collectionsWithSavedPost(
 ): Record<string, unknown[]> {
 	const { saved } = input;
 	const next: Record<string, unknown[]> = { ...input.collections };
-	next[names.postsCollection] = upsert(next[names.postsCollection], [saved.post]);
-	next.archetypes = upsert(next.archetypes, [saved.archetype]);
-	next.documents = upsert(next.documents, [saved.document]);
+	next[names.postsCollection] = savedFirst(next[names.postsCollection], saved.post);
+	next.archetypes = savedFirst(next.archetypes, saved.archetype);
+	next.documents = savedFirst(next.documents, saved.document);
 	for (const [target, rows] of Object.entries(input.referenceTargets ?? {})) {
 		const name = names.referenceCollections?.[target];
 		if (name) next[name] = upsert(next[name], rows);
@@ -437,7 +440,19 @@ async function readGalleryItems(
 	}
 }
 
-/** Rows replaced in place by id, and new ones appended. The input is not modified. */
+/** The row first, then every other row with a different id. The input is not modified. */
+function savedFirst(
+	rows: unknown[] | undefined,
+	row: Readonly<Record<string, unknown>>
+): unknown[] {
+	const id = rowId(row);
+	return [row, ...(rows ?? []).filter((other) => !id || rowId(other) !== id)];
+}
+
+/**
+ * Rows replaced in place by id, and new ones appended, so the collection keeps the
+ * snapshot's order. These are looked up by id. The input is not modified.
+ */
 function upsert(
 	rows: unknown[] | undefined,
 	incoming: readonly Readonly<Record<string, unknown>>[]
