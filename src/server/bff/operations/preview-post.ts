@@ -55,6 +55,7 @@
  */
 
 import { stringifyCanonical } from '../../../cms/canonical-json.js';
+import { ARCHETYPES_BASE, DOCUMENTS_BASE, GALLERY_BASE } from '../apex-admin-client';
 import {
 	cleanString,
 	isRecord,
@@ -80,10 +81,10 @@ import type { OnSiteState } from './preview-page';
 
 export type { OnSiteState } from './preview-page';
 
-const PLATFORM = '/api/platform/v1';
-const DOCUMENTS_SEARCH = `${PLATFORM}/cms/documents/search_and_filter`;
-const GALLERY_ITEMS_SEARCH = `${PLATFORM}/cms/gallery_items/search_and_filter`;
-const ARCHETYPES_SEARCH = `${PLATFORM}/specification/archetypes/search_and_filter`;
+// The list endpoints the publish reads, so each row arrives in the snapshot's shape.
+const DOCUMENTS_SEARCH = `${DOCUMENTS_BASE}/search_and_filter`;
+const GALLERY_ITEMS_SEARCH = `${GALLERY_BASE}/search_and_filter`;
+const ARCHETYPES_SEARCH = `${ARCHETYPES_BASE}/search_and_filter`;
 
 /** The `validator_kind` of a field that stores a gallery-item id (`cms/media.js`). */
 export const GALLERY_ITEM_FIELD = 'ref/model/Cms::GalleryItem';
