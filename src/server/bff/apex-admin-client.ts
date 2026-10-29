@@ -498,6 +498,11 @@ export interface ApexAdminClient {
 	 * publish (`content/publish.ts`) reads every collection through this one method
 	 * instead of a fixed function per endpoint; the path must stay under
 	 * `/api/platform/v1/`.
+	 *
+	 * The post preview (`operations/preview-post.ts`) uses it too, for a post's body,
+	 * reference targets and images. It reads the publish's list endpoints so the rows
+	 * arrive in the snapshot's shape, and asks for several ids at once
+	 * (`q[id_in][]`), which the fixed functions' flat queries cannot express.
 	 */
 	get(path: string, query: Record<string, unknown>): Promise<ApexResponse>;
 	/** A raw call on the client's origin with its token — for a site's own extension methods. */
