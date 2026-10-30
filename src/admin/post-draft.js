@@ -10,7 +10,8 @@
 //
 //   fields      → PATCH …/posts/:schema/:id            title, slug, summary,
 //                                                      publishedDate, the SEO
-//                                                      triple, the cover
+//                                                      triple, the cover and
+//                                                      its focus point
 //   body        → PUT   …/posts/:schema/:id/body       the document blocks
 //   archetype   → PUT   …/posts/:schema/:id/archetype  primitives (kind) and
 //                                                      references
@@ -29,6 +30,7 @@
  * @typedef {{ id: string | null, kind: 'divider', dividerKind: 'small' | 'medium' | 'large' }} DividerBlock
  * @typedef {{ id: string | null, kind: 'image', galleryItemId: string | null }} ImageBlock
  * @typedef {RichTextBlock | QuoteBlock | DividerBlock | ImageBlock} PostBlock
+ * @typedef {{ x: number, y: number }} CoverFocus percentages from the top-left
  * @typedef {{
  *   id?: string,
  *   title?: string,
@@ -40,6 +42,7 @@
  *   references?: Record<string, { itemId: string, targetId: string }[]>,
  *   tags?: { id: string, tagId: string, tagName: string }[],
  *   coverId?: string | null,
+ *   coverFocus?: CoverFocus | null,
  *   meta?: { title?: string, description?: string, keywords?: string },
  *   blocks?: PostBlock[]
  * }} PostRecord
@@ -56,6 +59,9 @@
  *   coverId: string | null,
  *   baselineCoverId: string | null,
  *   coverDirty: boolean,
+ *   coverFocus: CoverFocus | null,
+ *   baselineCoverFocus: CoverFocus | null,
+ *   coverFocusDirty: boolean,
  *   archetypeFields: Record<string, any>,
  *   baselineArchetypeFields: Record<string, any>,
  *   dirtyArchetypeFields: Set<string>,
@@ -104,6 +110,26 @@ function clone(value) {
 	} catch {
 		return JSON.parse(JSON.stringify(value));
 	}
+}
+
+/**
+ * A focus as the route takes it — two whole percentages, 0 to 100 — or null.
+ * Anything that is not two finite numbers is null: the centre, never a guess.
+ * @param {unknown} value @returns {CoverFocus | null}
+ */
+function toFocus(value) {
+	if (!value || typeof value !== 'object') return null;
+	const { x, y } = /** @type {Record<string, unknown>} */ (value);
+	if (typeof x !== 'number' || typeof y !== 'number') return null;
+	if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+	const clamp = (/** @type {number} */ n) => Math.min(100, Math.max(0, Math.round(n)));
+	return { x: clamp(x), y: clamp(y) };
+}
+
+/** @param {CoverFocus | null} a @param {CoverFocus | null} b */
+function sameFocus(a, b) {
+	if (a === null || b === null) return a === b;
+	return a.x === b.x && a.y === b.y;
 }
 
 /** @param {string[]} a @param {string[]} b */
@@ -157,6 +183,7 @@ export function createPostDraft(schemaSlug, post, version, contract, bodyVersion
 	const tagIds = Array.isArray(post?.tags) ? post.tags.map((tag) => tag.tagId) : [];
 	const blocks = Array.isArray(post?.blocks) ? clone(post.blocks) : [];
 	const coverId = post?.coverId ?? null;
+	const coverFocus = toFocus(post?.coverFocus);
 
 	return {
 		schemaSlug,
@@ -174,6 +201,9 @@ export function createPostDraft(schemaSlug, post, version, contract, bodyVersion
 		coverId,
 		baselineCoverId: coverId,
 		coverDirty: false,
+		coverFocus,
+		baselineCoverFocus: coverFocus,
+		coverFocusDirty: false,
 		archetypeFields,
 		baselineArchetypeFields: clone(archetypeFields),
 		dirtyArchetypeFields: new Set(),
@@ -209,8 +239,27 @@ export function setPostField(draft, name, value) {
  * @param {PostDraft} draft @param {string | null} coverId
  */
 export function setPostCover(draft, coverId) {
-	draft.coverId = coverId || null;
+	const next = coverId || null;
+	// A focus point belongs to ONE picture: a new cover starts on its centre, and
+	// going back to the saved cover brings its saved focus back with it. Choosing
+	// the cover that is already there changes nothing, so an unsaved focus on it
+	// survives the picker being opened and closed on the same image.
+	if (next !== draft.coverId) {
+		setPostCoverFocus(draft, next === draft.baselineCoverId ? draft.baselineCoverFocus : null);
+	}
+	draft.coverId = next;
 	draft.coverDirty = draft.coverId !== draft.baselineCoverId;
+}
+
+/**
+ * Set the spot in the cover that has to stay in view when a page crops it, as
+ * percentages from the top-left, or `null` for the centre. Values are rounded and
+ * clamped to 0–100, the only thing the route accepts.
+ * @param {PostDraft} draft @param {CoverFocus | null} focus
+ */
+export function setPostCoverFocus(draft, focus) {
+	draft.coverFocus = toFocus(focus);
+	draft.coverFocusDirty = !sameFocus(draft.coverFocus, draft.baselineCoverFocus);
 }
 
 /**
@@ -279,6 +328,7 @@ export function isPostDirty(draft) {
 		Boolean(draft) &&
 		(draft.dirtyFields.size > 0 ||
 			draft.coverDirty ||
+			draft.coverFocusDirty ||
 			draft.dirtyArchetypeFields.size > 0 ||
 			draft.dirtyReferences.size > 0 ||
 			draft.tagsDirty ||
@@ -289,7 +339,7 @@ export function isPostDirty(draft) {
 /**
  * The `PATCH …/posts/:schema/:id` body — only what changed. `meta` appears only
  * when an SEO field moved, and then carries only the moved ones; `coverId` only
- * when the cover moved.
+ * when the cover moved, and `coverFocus` only when the focus did (`null` = centre).
  * @param {PostDraft} draft
  * @returns {Record<string, unknown>}
  */
@@ -307,6 +357,7 @@ export function postFieldsPatch(draft) {
 	if (draft.dirtyFields.has('metaKeywords')) meta.keywords = text(draft.fields.metaKeywords);
 	if (Object.keys(meta).length > 0) patch.meta = meta;
 	if (draft.coverDirty) patch.coverId = draft.coverId;
+	if (draft.coverFocusDirty) patch.coverFocus = draft.coverFocus;
 	return patch;
 }
 
@@ -368,6 +419,9 @@ export function reconcilePost(draft, post, version, bodyVersion) {
 	draft.coverId = fresh.coverId;
 	draft.baselineCoverId = fresh.baselineCoverId;
 	draft.coverDirty = false;
+	draft.coverFocus = fresh.coverFocus;
+	draft.baselineCoverFocus = fresh.baselineCoverFocus;
+	draft.coverFocusDirty = false;
 	draft.archetypeFields = fresh.archetypeFields;
 	draft.baselineArchetypeFields = fresh.baselineArchetypeFields;
 	draft.dirtyArchetypeFields = new Set();
@@ -432,6 +486,12 @@ export function carryPendingStages(freshDraft, oldDraft) {
 	if (oldDraft.coverDirty) {
 		setPostCover(freshDraft, oldDraft.coverId);
 		if (freshDraft.coverDirty) carried.push('cover');
+	}
+	// After the cover, because setting the cover resets the focus. Reported as the
+	// cover: to an editor the focus is part of it.
+	if (oldDraft.coverFocusDirty) {
+		setPostCoverFocus(freshDraft, oldDraft.coverFocus);
+		if (freshDraft.coverFocusDirty && !carried.includes('cover')) carried.push('cover');
 	}
 	return carried;
 }
