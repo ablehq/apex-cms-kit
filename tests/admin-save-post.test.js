@@ -184,6 +184,28 @@ describe('post-draft — six stages, tracked independently', () => {
 		assert.equal(isPostDirty(draft), false);
 	});
 
+	it('choosing the cover that is already there keeps an unsaved focus on it', () => {
+		// Review on #16: the picker lets an editor choose the current image again, and
+		// that used to put the saved focus back and drop the unsaved one.
+		const draft = createPostDraft(
+			'story',
+			{ ...post, coverId: IMG, coverFocus: { x: 50, y: 25 } },
+			'v1',
+			contract
+		);
+		setPostCoverFocus(draft, { x: 20, y: 10 });
+		setPostCover(draft, IMG);
+		assert.deepEqual(draft.coverFocus, { x: 20, y: 10 });
+		assert.equal(isPostDirty(draft), true);
+		assert.deepEqual(postFieldsPatch(draft), { coverFocus: { x: 20, y: 10 } });
+
+		// The same on a cover that is not the saved one.
+		setPostCover(draft, AUTHOR);
+		setPostCoverFocus(draft, { x: 80, y: 60 });
+		setPostCover(draft, AUTHOR);
+		assert.deepEqual(draft.coverFocus, { x: 80, y: 60 });
+	});
+
 	it('the archetype patch carries dirty primitives and changed reference sets, in the record shape', () => {
 		const draft = createPostDraft('story', post, 'v1', contract);
 		assert.equal(hasPostArchetypeChanges(draft), false);
