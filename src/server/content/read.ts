@@ -20,7 +20,7 @@ export interface ContentManifest {
 	version: string;
 	publishedAt: string;
 	publishedBy: string;
-	accountId: string;
+	accountId: string | null;
 	counts: Record<string, number>;
 	warnings: string[];
 }
