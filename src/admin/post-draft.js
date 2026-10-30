@@ -241,9 +241,12 @@ export function setPostField(draft, name, value) {
 export function setPostCover(draft, coverId) {
 	const next = coverId || null;
 	// A focus point belongs to ONE picture: a new cover starts on its centre, and
-	// going back to the saved cover brings its saved focus back with it.
-	if (next === draft.baselineCoverId) setPostCoverFocus(draft, draft.baselineCoverFocus);
-	else if (next !== draft.coverId) setPostCoverFocus(draft, null);
+	// going back to the saved cover brings its saved focus back with it. Choosing
+	// the cover that is already there changes nothing, so an unsaved focus on it
+	// survives the picker being opened and closed on the same image.
+	if (next !== draft.coverId) {
+		setPostCoverFocus(draft, next === draft.baselineCoverId ? draft.baselineCoverFocus : null);
+	}
 	draft.coverId = next;
 	draft.coverDirty = draft.coverId !== draft.baselineCoverId;
 }
