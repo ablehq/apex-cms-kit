@@ -16,9 +16,14 @@ import type { BffContext } from '../context';
  * Apex reads carry that editor's token, so Apex's audit names them too.
  *
  * The request runs as long as the fetch takes (tens of seconds; Workers has no
- * wall-clock limit while the client waits). A refusal — no account pin, the wrong
- * account, a collection that emptied — is a 409 with a named code and a sentence;
- * an Apex failure is a 502; nothing is written in either case.
+ * wall-clock limit while the client waits). A refusal — a collection that
+ * emptied, or another publish that landed first — is a 409 with a named code and
+ * a sentence; an Apex failure is a 502; nothing is written in either case.
+ *
+ * The account published is the one the editor's token belongs to; nothing here
+ * checks it. So the site must sign editors in through its own store's app: a
+ * platform-admin app signs in staff from any store, and their publish would put
+ * their store on this site.
  */
 export async function handlePublishSite(request: Request, ctx: BffContext): Promise<Response> {
 	const meta = {
