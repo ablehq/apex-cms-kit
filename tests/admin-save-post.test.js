@@ -14,6 +14,7 @@ import {
 	setPostArchetypeField,
 	setPostBlocks,
 	setPostCover,
+	setPostCoverFocus,
 	setPostField,
 	setPostReference,
 	setPostTags
@@ -151,6 +152,38 @@ describe('post-draft — six stages, tracked independently', () => {
 		assert.deepEqual(postFieldsPatch(draft), { coverId: null });
 	});
 
+	it('the focus is its own edit: rounded, clamped, sent only when it moved, null for the centre', () => {
+		const draft = createPostDraft('story', { ...post, coverId: IMG }, 'v1', contract);
+		assert.equal(draft.coverFocus, null);
+		setPostCoverFocus(draft, { x: 30.4, y: 140 });
+		assert.deepEqual(draft.coverFocus, { x: 30, y: 100 });
+		assert.equal(isPostDirty(draft), true);
+		assert.deepEqual(postFieldsPatch(draft), { coverFocus: { x: 30, y: 100 } });
+		setPostCoverFocus(draft, null);
+		assert.equal(isPostDirty(draft), false, 'back to the baseline centre');
+		setPostCoverFocus(draft, { x: Number.NaN, y: 1 });
+		assert.equal(draft.coverFocus, null, 'junk is the centre, never a guess');
+	});
+
+	it('a new cover starts on its centre; going back to the saved cover brings its focus back', () => {
+		const draft = createPostDraft(
+			'story',
+			{ ...post, coverId: IMG, coverFocus: { x: 30, y: 20 } },
+			'v1',
+			contract
+		);
+		assert.deepEqual(draft.coverFocus, { x: 30, y: 20 });
+		setPostCover(draft, AUTHOR);
+		assert.equal(draft.coverFocus, null);
+		assert.deepEqual(postFieldsPatch(draft), { coverId: AUTHOR, coverFocus: null });
+		setPostCoverFocus(draft, { x: 70, y: 40 });
+		setPostCover(draft, AUTHOR);
+		assert.deepEqual(draft.coverFocus, { x: 70, y: 40 }, 'the same cover again keeps it');
+		setPostCover(draft, IMG);
+		assert.deepEqual(draft.coverFocus, { x: 30, y: 20 });
+		assert.equal(isPostDirty(draft), false);
+	});
+
 	it('the archetype patch carries dirty primitives and changed reference sets, in the record shape', () => {
 		const draft = createPostDraft('story', post, 'v1', contract);
 		assert.equal(hasPostArchetypeChanges(draft), false);
@@ -183,10 +216,16 @@ describe('post-draft — six stages, tracked independently', () => {
 		const draft = createPostDraft('story', post, 'v1', contract);
 		dirtyEverything(draft);
 		assert.equal(isPostDirty(draft), true);
-		reconcilePost(draft, { ...post, status: 'published', coverId: IMG }, 'v2');
+		reconcilePost(
+			draft,
+			{ ...post, status: 'published', coverId: IMG, coverFocus: { x: 10, y: 90 } },
+			'v2'
+		);
 		assert.equal(isPostDirty(draft), false);
 		assert.equal(draft.baselineVersion, 'v2');
 		assert.equal(draft.coverId, IMG);
+		assert.deepEqual(draft.coverFocus, { x: 10, y: 90 });
+		assert.equal(draft.coverFocusDirty, false);
 		assert.equal(draft.post.status, 'published');
 	});
 });
@@ -477,6 +516,25 @@ describe('carryPendingStages — a Reload that does not throw away unwritten wor
 		assert.equal(fresh.bodyVersion, 'bv2');
 		assert.equal(hasPostArchetypeChanges(fresh), true);
 		assert.equal(hasPostFieldChanges(fresh), true, 'the cover rides the fields patch');
+	});
+
+	it('carries a focus edit after the cover, reported as the cover', () => {
+		const old = createPostDraft('story', { ...post, coverId: IMG }, 'v1', contract, 'bv1');
+		setPostCoverFocus(old, { x: 30, y: 20 });
+		const fresh = createPostDraft('story', { ...post, coverId: IMG }, 'v2', contract, 'bv2');
+		assert.deepEqual(carryPendingStages(fresh, old), ['cover']);
+		assert.deepEqual(fresh.coverFocus, { x: 30, y: 20 });
+		assert.deepEqual(postFieldsPatch(fresh), { coverFocus: { x: 30, y: 20 } });
+
+		// A new cover AND a focus on it: the cover is set first, so its reset does
+		// not wipe the focus that was chosen for it.
+		const both = createPostDraft('story', post, 'v1', contract, 'bv1');
+		setPostCover(both, IMG);
+		setPostCoverFocus(both, { x: 70, y: 10 });
+		const reloaded = createPostDraft('story', post, 'v2', contract, 'bv2');
+		assert.deepEqual(carryPendingStages(reloaded, both), ['cover']);
+		assert.equal(reloaded.coverId, IMG);
+		assert.deepEqual(reloaded.coverFocus, { x: 70, y: 10 });
 	});
 
 	it('carries NOTHING when the old draft had nothing pending, and never invents dirt', () => {

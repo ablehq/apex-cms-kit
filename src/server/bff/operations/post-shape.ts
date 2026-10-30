@@ -2,6 +2,13 @@ import { z } from 'zod';
 import { bffError, noStoreJson } from '../boundary';
 import { canonicalize } from '../../../cms/canonical-json.js';
 import { sanitizeHtml } from '../../../sanitize/html.js';
+import {
+	COVER_FOCUS_GROUP,
+	COVER_FOCUS_NAME,
+	formatCoverFocus,
+	isCoverFocusRow,
+	readCoverFocus
+} from '../../../cms/cover-focus.js';
 import { MAX_FIELD_VALUE_CHARS } from '../../../sanitize/write-boundary';
 import {
 	archetypeIdSchema,
@@ -238,6 +245,8 @@ export interface AdminPost {
 	tags: ArchetypeTagging[];
 	/** The cover's gallery item id, or null. */
 	coverId: string | null;
+	/** Where the cover stays anchored when a page crops it; null is the centre. */
+	coverFocus: CoverFocus | null;
 	meta: AdminPostMeta;
 	blocks: AdminPostBlock[];
 }
@@ -439,6 +448,68 @@ export function coverAttributes(
 		}
 	} else {
 		attributes.push({ gallery_item_id: coverId, kind: COVER_KIND });
+	}
+	return attributes.length > 0 ? attributes : null;
+}
+
+/**
+ * The cover's FOCUS POINT (`cms/cover-focus.js`): the spot in the picture that has
+ * to stay in view when a page crops the cover. Percentages from the top-left, the
+ * numbers CSS `object-position` takes; a post with no focus row draws the centre.
+ *
+ * It is a META PROPERTY in its own group, `display`, not a schema field, which
+ * keeps it away from `readMeta` and `metaAttributes`, which own `web`.
+ */
+export interface CoverFocus {
+	x: number;
+	y: number;
+}
+
+const focusAxis = z.number().int().min(0).max(100);
+
+/** The focus on the update route: two whole percentages, nothing else. */
+export const coverFocusSchema = z.object({ x: focusAxis, y: focusAxis }).strict();
+
+/** The focus rows Apex holds, in Apex's (creation) order — only rows with an id can be written. */
+function readCoverFocusRows(view: Record<string, unknown>): { id: string; value: string }[] {
+	const rows = Array.isArray(view.meta_properties) ? view.meta_properties : [];
+	const found: { id: string; value: string }[] = [];
+	for (const row of rows) {
+		if (!isRecord(row) || !isCoverFocusRow(row)) continue;
+		const id = cleanString(row.id);
+		if (id) found.push({ id, value: cleanString(row.value) });
+	}
+	return found;
+}
+
+/**
+ * `meta_properties_attributes` for "the focus is now this point, or the default".
+ *
+ * The SEO rows' id-or-append hazard applies (an entry without an id creates a
+ * second row), but unlike SEO there is no row until an editor first sets a focus,
+ * so this one DOES create: once, when no focus row exists. After that the first row
+ * is updated in place by its id, extra rows are destroyed, and `null` destroys the
+ * row, which is how a post goes back to the centre. `null` means "nothing to send".
+ */
+export function coverFocusAttributes(
+	view: Record<string, unknown>,
+	focus: CoverFocus | null
+): Record<string, unknown>[] | null {
+	const [first, ...extras] = readCoverFocusRows(view);
+	const attributes: Record<string, unknown>[] = [];
+	for (const row of extras) attributes.push({ id: row.id, _destroy: true });
+	const row = (value: string) => ({
+		name: COVER_FOCUS_NAME,
+		group: COVER_FOCUS_GROUP,
+		value_type: 'string',
+		value
+	});
+	if (focus === null) {
+		if (first) attributes.push({ id: first.id, _destroy: true });
+	} else {
+		const value = formatCoverFocus(focus);
+		if (!first) attributes.push(row(value));
+		else if (first.value !== value) attributes.push({ id: first.id, ...row(value) });
 	}
 	return attributes.length > 0 ? attributes : null;
 }
@@ -843,6 +914,7 @@ export function summarizePost(
 		references,
 		tags: archetype ? readTaggings(archetype) : [],
 		coverId: readCoverId(view),
+		coverFocus: readCoverFocus(view),
 		meta: readMeta(view),
 		blocks
 	};
@@ -887,7 +959,11 @@ export async function computePostVersion(
 			summary: summary.summary,
 			published_date: summary.publishedDate,
 			meta: summary.meta,
-			coverId: summary.coverId
+			coverId: summary.coverId,
+			// Only when set, so every post without a focus keeps the token it had
+			// before the focus existed, and an editor's open tab is not made stale by
+			// the deploy that added it.
+			...(summary.coverFocus ? { coverFocus: summary.coverFocus } : {})
 		},
 		archetype: {
 			id: summary.archetypeId,
