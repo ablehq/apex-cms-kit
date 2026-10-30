@@ -10,6 +10,7 @@ import {
 	computeBodyVersion,
 	computePostVersion,
 	coverAttributes,
+	coverFocusAttributes,
 	isCalendarDate,
 	listAllPages,
 	metaAttributes,
@@ -20,6 +21,12 @@ import {
 	savePostBodySchema,
 	summarizePost
 } from '../src/server/bff/operations/post-shape.ts';
+import {
+	coverObjectPosition,
+	formatCoverFocus,
+	parseCoverFocus,
+	readCoverFocus
+} from '../src/cms/cover-focus.js';
 import { handleSavePostBody } from '../src/server/bff/operations/save-post-body.ts';
 import { createPostDraft, setPostBlocks } from '../src/admin/post-draft.js';
 import { createPostBodySchema } from '../src/server/bff/operations/create-post.ts';
@@ -704,6 +711,113 @@ describe('SEO and the cover — written by id, never appended', () => {
 	});
 });
 
+describe('the cover focus — its own meta row, created once, then written by id', () => {
+	const FOCUS_ROW = (id, value) => ({ id, name: 'cover_focus', group: 'display', value });
+	const withFocus = (...rows) => view({ meta_properties: [...view().meta_properties, ...rows] });
+
+	it('stores two whole percentages as `x% y%`, and reads nothing else', () => {
+		assert.equal(formatCoverFocus({ x: 30, y: 20 }), '30% 20%');
+		assert.deepEqual(parseCoverFocus('30% 20%'), { x: 30, y: 20 });
+		assert.deepEqual(parseCoverFocus('0% 100%'), { x: 0, y: 100 });
+		for (const junk of ['', '30 20', '30%20%', '101% 0%', '1.5% 2%', '-1% 0%', 'top', '50% 50%;x'])
+			assert.equal(parseCoverFocus(junk), null, junk);
+	});
+
+	it('creates the row only when none exists — there is none until a focus is first set', () => {
+		assert.deepEqual(coverFocusAttributes(view(), { x: 30, y: 20 }), [
+			{ name: 'cover_focus', group: 'display', value_type: 'string', value: '30% 20%' }
+		]);
+		assert.equal(coverFocusAttributes(view(), null), null, 'already on the centre');
+	});
+
+	it('updates the existing row IN PLACE by its id, and says nothing when it is unchanged', () => {
+		const v = withFocus(FOCUS_ROW(uuid(6), '30% 20%'));
+		assert.deepEqual(coverFocusAttributes(v, { x: 60, y: 10 }), [
+			{ id: uuid(6), name: 'cover_focus', group: 'display', value_type: 'string', value: '60% 10%' }
+		]);
+		assert.equal(coverFocusAttributes(v, { x: 30, y: 20 }), null);
+		assert.deepEqual(readCoverFocus(v), { x: 30, y: 20 });
+	});
+
+	it('destroys the row on null, and heals a duplicate an append left behind', () => {
+		const v = withFocus(FOCUS_ROW(uuid(6), '30% 20%'), FOCUS_ROW(uuid(7), '90% 90%'));
+		assert.deepEqual(readCoverFocus(v), { x: 30, y: 20 }, 'the first row wins');
+		assert.deepEqual(coverFocusAttributes(v, null), [
+			{ id: uuid(7), _destroy: true },
+			{ id: uuid(6), _destroy: true }
+		]);
+		assert.deepEqual(coverFocusAttributes(v, { x: 30, y: 20 }), [{ id: uuid(7), _destroy: true }]);
+	});
+
+	it('lives beside the SEO rows without either touching the other', () => {
+		const v = withFocus(FOCUS_ROW(uuid(6), '30% 20%'));
+		assert.deepEqual(readMeta(v), { title: 'M', description: 'D', keywords: 'K' });
+		assert.deepEqual(metaAttributes(v, { title: 'New' }), [
+			{ id: uuid(1), name: 'title', group: 'web', value_type: 'string', value: 'New' }
+		]);
+		// A `cover_focus` in the SEO group is not the focus.
+		assert.equal(
+			readCoverFocus(
+				view({ meta_properties: [{ ...FOCUS_ROW(uuid(6), '30% 20%'), group: 'web' }] })
+			),
+			null
+		);
+	});
+
+	it('an unreadable stored value reads as the centre', () => {
+		assert.equal(readCoverFocus(withFocus(FOCUS_ROW(uuid(6), 'center top'))), null);
+	});
+
+	it('gives a page the CSS object-position, and nothing at all for the centre', () => {
+		assert.equal(coverObjectPosition(withFocus(FOCUS_ROW(uuid(6), '30% 20%'))), '30% 20%');
+		assert.equal(coverObjectPosition(view()), '', 'no focus row');
+		assert.equal(coverObjectPosition(null), '');
+		assert.equal(coverObjectPosition({ meta_properties: 'junk' }), '');
+		assert.equal(
+			coverObjectPosition(withFocus(FOCUS_ROW(uuid(6), '30% 20%; background: red'))),
+			'',
+			'a value that is not two percentages never reaches a style attribute'
+		);
+		// A published row as a snapshot holds it: padded strings, no id needed to read.
+		assert.equal(
+			coverObjectPosition({
+				meta_properties: [{ group: ' display ', name: 'cover_focus ', value: ' 5% 95% ' }]
+			}),
+			'5% 95%'
+		);
+	});
+
+	it('is on the summary, and moves the stale-guard token only when one is set', async () => {
+		const set = withFocus(FOCUS_ROW(uuid(6), '30% 20%'));
+		assert.deepEqual(summarizePost(contract, 'story', set, archetype(), []).coverFocus, {
+			x: 30,
+			y: 20
+		});
+		assert.equal(summarizePost(contract, 'story', view(), archetype(), []).coverFocus, null);
+		const base = await computePostVersion(view(), archetype(), [], contract, 'story');
+		const moved = await computePostVersion(set, archetype(), [], contract, 'story');
+		const elsewhere = await computePostVersion(
+			withFocus(FOCUS_ROW(uuid(6), '60% 20%')),
+			archetype(),
+			[],
+			contract,
+			'story'
+		);
+		assert.notEqual(base, moved);
+		assert.notEqual(moved, elsewhere);
+		// A post with no focus hashes exactly as it did before the focus existed —
+		// the key is absent, not `null` — so an open tab survives the deploy.
+		const unreadable = await computePostVersion(
+			withFocus(FOCUS_ROW(uuid(6), 'junk')),
+			archetype(),
+			[],
+			contract,
+			'story'
+		);
+		assert.equal(unreadable, base);
+	});
+});
+
 describe('the post summary and the stale-guard token', () => {
 	it('reads primitives, references, tags and the cover off the two records', () => {
 		const post = summarizePost(
@@ -807,6 +921,17 @@ describe('the route schemas are closed', () => {
 		assert.ok(!updatePostBodySchema.safeParse({ status: 'published' }).success);
 		assert.ok(!updatePostBodySchema.safeParse({ kind: 'video' }).success);
 		assert.ok(!updatePostBodySchema.safeParse({ title: null }).success);
+		assert.ok(updatePostBodySchema.safeParse({ coverFocus: { x: 0, y: 100 } }).success);
+		assert.ok(updatePostBodySchema.safeParse({ coverFocus: null }).success, 'back to the centre');
+		for (const bad of [
+			{ x: 101, y: 0 },
+			{ x: -1, y: 0 },
+			{ x: 1.5, y: 0 },
+			{ x: 50 },
+			{ x: 50, y: 50, z: 1 },
+			'50% 50%'
+		])
+			assert.ok(!updatePostBodySchema.safeParse({ coverFocus: bad }).success, JSON.stringify(bad));
 	});
 
 	it('status: exactly two events, and our wire name is `statusEvent`', () => {
@@ -1210,6 +1335,46 @@ describe('create and update — what reaches Apex', () => {
 			],
 			shared_gallery_items_attributes: [{ id: uuid(4), gallery_item_id: IMG2, kind: 'cover' }]
 		});
+	});
+
+	it('update writes the focus in the SAME meta list as the SEO, creating it once', async () => {
+		const calls = [];
+		const ctx = ctxWith(calls);
+		const session = await signIn(ctx);
+		const res = await handleUpdatePost(
+			request(
+				`/api/admin/posts/story/${POST}`,
+				'PATCH',
+				{ meta: { title: 'New' }, coverFocus: { x: 30, y: 20 } },
+				session
+			),
+			ctx,
+			{ schema: 'story', postId: POST }
+		);
+		assert.equal(res.status, 200, await res.clone().text());
+		const write = calls.find(([name]) => name === 'updatePostFields');
+		assert.deepEqual(write[2], {
+			meta_properties_attributes: [
+				{ id: uuid(1), name: 'title', group: 'web', value_type: 'string', value: 'New' },
+				{ name: 'cover_focus', group: 'display', value_type: 'string', value: '30% 20%' }
+			]
+		});
+	});
+
+	it('update accepts `null` on the focus, and a focus already on the centre writes nothing', async () => {
+		const calls = [];
+		const ctx = ctxWith(calls);
+		const session = await signIn(ctx);
+		const res = await handleUpdatePost(
+			request(`/api/admin/posts/story/${POST}`, 'PATCH', { coverFocus: null }, session),
+			ctx,
+			{ schema: 'story', postId: POST }
+		);
+		assert.equal(res.status, 200, await res.clone().text());
+		assert.equal(
+			calls.some(([name]) => name === 'updatePostFields'),
+			false
+		);
 	});
 
 	it('update refuses `null` on a primitive but accepts it on the cover', async () => {

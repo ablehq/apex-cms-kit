@@ -9,6 +9,8 @@ import { loadGalleryMemberIds } from './list-gallery-images';
 import {
 	buildPostLoad,
 	coverAttributes,
+	coverFocusAttributes,
+	coverFocusSchema,
 	loadPostView,
 	metaAttributes,
 	postIdSchema,
@@ -24,7 +26,7 @@ import type { BffContext } from '../context';
 
 /**
  * PATCH /api/admin/posts/[schema]/[postId] — the post's OWN fields: title, slug,
- * summary, published date, the SEO triple and the cover.
+ * summary, published date, the SEO triple, the cover and the cover's focus point.
  *
  * The endpoint is `PATCH /cms/posts/:postId`, and that is not a preference.
  * Routing a post's fields through `archetype_models` answers **422 `Slug has
@@ -36,9 +38,11 @@ import type { BffContext } from '../context';
  * an entry without an id creates a SECOND row (measured for both), so the ids
  * come from the record read in this request, never from the browser.
  *
- * `coverId` is the one key here where `null` is CORRECT — it is a reference to a
- * gallery item, and `null` destroys the cover row, which is exactly "this post has
- * no cover". Every other key is a `Cms::Post` column where a clear is `''`.
+ * `coverId` and `coverFocus` are the two keys here where `null` is CORRECT.
+ * `coverId` is a reference to a gallery item, and `null` destroys the cover row,
+ * which is exactly "this post has no cover". `coverFocus` is a meta row of its own
+ * (`coverFocusAttributes`), and `null` destroys it, which puts the cover back on
+ * its centre. Every other key is a `Cms::Post` column where a clear is `''`.
  *
  * A NON-NULL COVER IS CHECKED AGAINST THE IMAGES GALLERY BEFORE THE WRITE.
  * `Cms::SharedGalleryItem` is five lines with no gallery scoping, so a VIDEO item
@@ -73,7 +77,8 @@ export const updatePostBodySchema = z
 			})
 			.strict()
 			.optional(),
-		coverId: postIdSchema.nullable().optional()
+		coverId: postIdSchema.nullable().optional(),
+		coverFocus: coverFocusSchema.nullable().optional()
 	})
 	.strict();
 
@@ -103,11 +108,11 @@ export async function handleUpdatePost(
 		return rejectMutation(ctx, actor, 400, 'invalid json', 'invalid json');
 	}
 
-	// The shared null guard, told that `coverId` is the one reference-shaped key.
+	// The shared null guard, told which two keys take a meaningful `null`.
 	if (
 		bodyJson &&
 		typeof bodyJson === 'object' &&
-		containsNullPrimitive(bodyJson as Record<string, unknown>, ['coverId'])
+		containsNullPrimitive(bodyJson as Record<string, unknown>, ['coverId', 'coverFocus'])
 	) {
 		return rejectMutation(ctx, actor, 400, 'null-field', 'null primitive');
 	}
@@ -135,10 +140,14 @@ export async function handleUpdatePost(
 	if (parsed.data.slug !== undefined) fields.slug = parsed.data.slug;
 	if (parsed.data.summary !== undefined) fields.summary = parsed.data.summary;
 	if (parsed.data.publishedDate !== undefined) fields.published_date = parsed.data.publishedDate;
-	if (parsed.data.meta) {
-		const attributes = metaAttributes(view, parsed.data.meta);
-		if (attributes.length > 0) fields.meta_properties_attributes = attributes;
+	// The SEO rows and the focus row are both `meta_properties`, so they share the
+	// one nested-attributes list.
+	const metaRows: Record<string, unknown>[] = [];
+	if (parsed.data.meta) metaRows.push(...metaAttributes(view, parsed.data.meta));
+	if (parsed.data.coverFocus !== undefined) {
+		metaRows.push(...(coverFocusAttributes(view, parsed.data.coverFocus) ?? []));
 	}
+	if (metaRows.length > 0) fields.meta_properties_attributes = metaRows;
 	if (parsed.data.coverId !== undefined) {
 		const attributes = coverAttributes(view, parsed.data.coverId);
 		if (attributes) fields.shared_gallery_items_attributes = attributes;
