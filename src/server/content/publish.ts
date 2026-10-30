@@ -29,10 +29,8 @@ interface CollectionSpec {
 }
 
 interface CmsConfig {
-	posts?: Array<{ archetype_schema: { slug: string; plural_name: string; account_id?: string } }>;
-	content_library?: Array<{
-		archetype_schema: { slug: string; plural_name: string; account_id?: string };
-	}>;
+	posts?: Array<{ archetype_schema: { slug: string; plural_name: string } }>;
+	content_library?: Array<{ archetype_schema: { slug: string; plural_name: string } }>;
 	asset_library?: Array<{ gallery: { id: string; name: string } }>;
 }
 
@@ -59,8 +57,8 @@ export interface PublishOptions {
 	apex: ApexAdminClient;
 	kv: ContentStore;
 	project?: SiteProjection;
-	/** The Apex account this deployment is pinned to; the publish refuses any other. */
-	accountId: string | undefined;
+	/** A label for the snapshot and its audit trail; the credentials already choose the account. */
+	accountId?: string;
 	publishedBy: string;
 	/** A collection that was non-empty and comes back empty is refused unless this is set. */
 	allowEmpty?: boolean;
@@ -77,12 +75,7 @@ export type PublishResult =
 	  }
 	| {
 			ok: false;
-			error:
-				| 'account_unpinned'
-				| 'account_mismatch'
-				| 'empty_collection'
-				| 'too_large'
-				| 'concurrent_publish';
+			error: 'empty_collection' | 'too_large' | 'concurrent_publish';
 			detail: string;
 	  };
 
@@ -97,13 +90,6 @@ export class ContentPublishError extends Error {
 
 export async function publishContent(options: PublishOptions): Promise<PublishResult> {
 	const { apex, kv } = options;
-	if (!options.accountId) {
-		return {
-			ok: false,
-			error: 'account_unpinned',
-			detail: 'PRIVATE_APEX_ACCOUNT_ID is not set; a publish must be pinned to one Apex account.'
-		};
-	}
 
 	/**
 	 * THE VERSION THE STORE HELD WHEN THIS PUBLISH STARTED — the left half of the
@@ -145,14 +131,6 @@ export async function publishContent(options: PublishOptions): Promise<PublishRe
 	if (!configResponse.ok)
 		throw new ContentPublishError(`cms_config: Apex ${configResponse.status}`);
 	const config = unwrapCmsConfig(configResponse.body);
-	const accountId = accountIdOf(config);
-	if (accountId !== options.accountId) {
-		return {
-			ok: false,
-			error: 'account_mismatch',
-			detail: `cms_config belongs to account ${accountId ?? 'unknown'}, not ${options.accountId}.`
-		};
-	}
 
 	const specs = collectionSpecs(config);
 	const raw: RawCollection[] = await inBatches(specs, 5, async (spec) => ({
@@ -235,7 +213,7 @@ export async function publishContent(options: PublishOptions): Promise<PublishRe
 		version,
 		publishedAt: now.toISOString(),
 		publishedBy: options.publishedBy,
-		accountId,
+		accountId: options.accountId ?? null,
 		counts,
 		warnings,
 		collections: Object.fromEntries(files.map((file) => [file.name, file.records as unknown[]]))
@@ -274,15 +252,6 @@ function unwrapCmsConfig(body: unknown): CmsConfig {
 	if (!data || typeof data !== 'object')
 		throw new ContentPublishError('cms_config: unexpected shape');
 	return data as CmsConfig;
-}
-
-function accountIdOf(config: CmsConfig): string | null {
-	const ids = new Set(
-		[...(config.posts ?? []), ...(config.content_library ?? [])]
-			.map((item) => item.archetype_schema?.account_id)
-			.filter((id): id is string => typeof id === 'string' && id.length > 0)
-	);
-	return ids.size === 1 ? [...ids][0] : null;
 }
 
 /** Mirrors the build pipeline's `getCMSitems`: posts, content library, galleries, then the fixed three. */
