@@ -123,23 +123,49 @@ describe('publishContent', () => {
 		assert.equal(posts.query.page, 1);
 	});
 
-	it('refuses without an account pin, and refuses another account, writing nothing', async () => {
+	it('publishes without an account label, and records none', async () => {
 		const kv = memoryStore();
-		const unpinned = await publishContent({
+		const result = await publishContent({ apex: stubApex(), kv, publishedBy: 'e' });
+		assert.equal(result.ok, true);
+		assert.equal(JSON.parse(kv.map.get(CONTENT_KEY)).accountId, null);
+	});
+
+	it('publishes whichever account the schemas name, recording the label as given', async () => {
+		const kv = memoryStore();
+		const result = await publishContent({
 			apex: stubApex(),
 			kv,
-			accountId: undefined,
+			accountId: 'not-the-schemas-account',
 			publishedBy: 'e'
 		});
-		assert.deepEqual([unpinned.ok, unpinned.error], [false, 'account_unpinned']);
-		const other = await publishContent({
-			apex: stubApex(),
+		assert.equal(result.ok, true);
+		assert.equal(JSON.parse(kv.map.get(CONTENT_KEY)).accountId, 'not-the-schemas-account');
+	});
+
+	it('publishes a store with no schemas — pages and a gallery, no account id anywhere', async () => {
+		const kv = memoryStore();
+		const fresh = {
+			data: {
+				asset_library: [{ gallery: { id: 'gal-1', name: 'images' } }],
+				page_schema: { page_blocks: [{ slug: 'hero', entity_type: { slug: 'hero' } }] }
+			}
+		};
+		const result = await publishContent({
+			apex: stubApex({}, fresh),
 			kv,
-			accountId: 'someone-else',
+			accountId: ACCOUNT,
 			publishedBy: 'e'
 		});
-		assert.deepEqual([other.ok, other.error], [false, 'account_mismatch']);
-		assert.equal(kv.map.size, 0);
+		assert.equal(result.ok, true);
+		const stored = JSON.parse(kv.map.get(CONTENT_KEY));
+		assert.equal(stored.accountId, ACCOUNT);
+		assert.deepEqual(Object.keys(stored.collections).sort(), [
+			'archetypes',
+			'documents',
+			'images',
+			'pages',
+			'tags'
+		]);
 	});
 
 	it('refuses a collection that was non-empty and comes back empty, unless allowEmpty', async () => {
